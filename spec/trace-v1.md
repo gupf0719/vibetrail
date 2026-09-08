@@ -87,17 +87,64 @@ git log -1 --format='%(trailers:key=Claude-Session,valueonly)' <sha>            
 
 ### 3.1 `diverge.kind` 取值
 
-这是本格式**唯一没有先例可抄**的部分（调研过的工具无一记录人机分歧）。首批四个：
+本格式**唯一没有先例可抄**的部分。三个实现读下来：SpecStory 只认 interrupt
+（一行前缀匹配），git-ai 与 claude-story 一个都不认——**字符串匹配就是这里的现有水平，
+没有结构化字段可用**。
 
-| kind | 判据 | 说明 |
+每条记录带 `human` 布尔：`true` 才计入人机分歧，`false` 是机器/基础设施行为。
+混在一起统计会让「人拒了多少次」被分类器和链路故障污染。
+
+| kind | human | 判据 |
 |---|---|---|
-| `interrupt` | transcript 出现 `Request interrupted by user` | 人打断了 agent |
-| `user_edited_after_agent` | Edit 的 `toolUseResult.userModified == true` | **最硬的信号**：模型改完，人又手改 |
-| `permission_denied` | 权限请求被拒 | 人不同意某个操作 |
-| `correction` | 用户消息命中纠正话术 | ⚠️ 启发式，会误判，见 §7 |
+| `interrupt` | ✅ | user 消息的 text 块或字符串正文，去前导空白后 `startswith("[Request interrupted by user")` |
+| `permission_denied` | ✅ | `is_error` 块正文 `^Permission to use .* has been denied`（带 `m` 标志）或 `^The user doesn't want to proceed with this tool use` |
+| `classifier_blocked` | ❌ | 正文含 `denied by the Claude Code auto mode classifier` —— auto mode 分类器拒的，不是人 |
+| `permission_infra_fail` | ❌ | 正文含 `Tool permission request failed` / `stream closed` —— 链路故障，不是任何人的决定 |
 
-前三个是**机器可判**的（读字段即可，无歧义）。第四个是启发式，**必须单独标注**，
-不要和前三个混在一起统计——否则准确率会被它拖着走而没人知道。
+判据全部**只读 JSON 字段**，不 grep 整行原文；`tool_result` 块一律排除。原因见 §3.3。
+
+#### 已删除的 kind
+
+- **`user_edited_after_agent`** —— 曾被本文档称作「最硬的信号」，**该说法已被实测推翻**。
+  全语料 **3507 次 `userModified` 取值全为 `false`**（2128 次 Edit，755 个会话）。
+  这个字段在本工作流下从不为真，作为信号是死的。它究竟在什么条件下会置真尚未查明，
+  查明前不重新引入。
+- **`correction`**（用户纠正话术的启发式）—— 未实现。三个硬信号已有可用准确率，
+  先把启发式挡在门外；要加须先有独立的准确率实测，且必须与硬信号分开统计。
+
+### 3.2 准确率实测（2026-09-08，755 个会话 / 674MB）
+
+| kind | 命中 | 精确率 | 召回率 |
+|---|---:|---|---|
+| `interrupt` | 277 | **100%**（277/277） | 100%，无遗漏 |
+| `permission_denied` | 90 | 100%（人工逐条核对候选集） | **100%**（90/90，修复后） |
+| `classifier_blocked` | 1 | — | — |
+| `permission_infra_fail` | 6 | — | — |
+
+对照：**裸 grep 原文在对抗样本上精确率仅 10.5%**。以本项目的调研会话为靶
+（它在命令输出里反复打印过 `Request interrupted` 字面量）：裸 grep 命中 19 条，
+本规则命中 2 条，人工核对真实中断正是 2 次。
+
+三个曾经出错、修复后才达到上表数字的点，都记在 §3.3。
+
+### 3.3 实现这套判据时踩过的坑
+
+写提取器的人必须知道这四条，否则数字会**静默错**（不报错、只是不对）：
+
+1. **只读字段，绝不 grep 原文。** 会话自身会讨论这些标记（本项目的调研会话就是），
+   grep 原文把「讨论」当成「发生」。同理必须排除 `tool_result` 块。
+2. **锚定，不要用无锚子串。** 无锚子串会误收 `<task-notification>` 这类正文里恰好
+   提到该短语的记录（实测 278 命中里 1 条假阳）。SpecStory 的前缀故意不带右括号，
+   正好同时覆盖 `[Request interrupted by user]` 与 `[...for tool use]` 两种变体。
+3. **jq 的正则标志与 PCRE 相反**：dotall 是 `m` 不是 `s`（`s` 在这里是单行模式）。
+   按 PCRE 习惯写 `s` 会**静默匹配失败**。权限拒绝的真实消息把多行命令嵌在中间
+   （`Permission to use Bash with command <多行> has been denied.`），不加 `m` 会漏
+   全部多行命令的拒绝——实测漏 2/90。
+4. **取 `.toolUseResult` 子字段前先判 `type=="object"`。** 它有时是 array 或 string，
+   直接索引会抛错，而 jq 抛错会丢掉**整条记录**，连带该记录上其他规则的命中一起消失。
+   实测这一条曾让 1200 条记录被静默跳过。
+
+判据依赖英文消息串，Claude Code 改文案即失效——**这是已知脆弱点**，见 §7。
 
 ## 4. 审计记录 `audits/<patchId>.jsonl`
 
@@ -173,8 +220,11 @@ git-ai 标准里 `overriden_lines` 少了一个 d，shipped 之后成了既成�
 
 - **squash 合流**下 §2 的 trailer 关联失效（`merge --squash` 完全解析不到，
   `rebase -i` squash 只留最后一个）。本仓工作流是 rebase + ff-only，暂不受影响。
-- **`correction` 的判据是启发式**，会误判。首版把它与三个硬信号分开标注，
-  准确率待实测后再定去留。
+- **判据依赖英文消息串**，Claude Code 改文案即静默失效。没有结构化字段可替代
+  （三个实现都这样做）。缓解只能是：判据集中在一处、配正负例回归、
+  数字突变时当作信号而非当作事实。
+- **`userModified` 为何恒为 `false` 未查明**。它在什么条件下会置真、是否只在
+  IDE 并行编辑场景下有效，都还不知道。查明前不重新引入该 kind。
 - **transcript 丢失后**指针（`turn` uuid）全部悬空。这是 D2 的既定代价。
 - **同一 patch 出现在多个分支**（cherry-pick）时共用一条审计记录。
   这多半是对的（同一改动同一审计），但没有实测。

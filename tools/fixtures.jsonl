@@ -1,0 +1,19 @@
+{"_expect":"interrupt","type":"user","uuid":"t1","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}
+{"_expect":"interrupt","type":"user","uuid":"t2","message":{"content":[{"type":"text","text":"  [Request interrupted by user for tool use]"}]}}
+{"_expect":"interrupt","type":"user","uuid":"t3","message":{"content":"[Request interrupted by user]"}}
+{"_expect":"permission_denied","type":"user","uuid":"t4","message":{"content":[{"is_error":true,"content":"Permission to use Bash has been denied. IMPORTANT: ..."}]}}
+{"_expect":"permission_denied","type":"user","uuid":"t5","message":{"content":[{"is_error":true,"content":"Permission to use Bash with command tail -3\n# 注释\ngit push 2>&1 has been denied."}]}}
+{"_expect":"permission_denied","type":"user","uuid":"t6","message":{"content":[{"is_error":true,"content":"The user doesn't want to proceed with this tool use. The tool use was rejected"}]}}
+{"_expect":"classifier_blocked","type":"user","uuid":"t7","message":{"content":[{"is_error":true,"content":"Permission for this action was denied by the Claude Code auto mode classifier. Reason: Blocked by classifier."}]}}
+{"_expect":"permission_infra_fail","type":"user","uuid":"t8","message":{"content":[{"is_error":true,"content":"Tool permission request failed: Error: Tool permission stream closed before response received"}]}}
+{"_expect":"","type":"user","uuid":"n1","message":{"content":[{"type":"tool_result","content":"grep 输出里含 [Request interrupted by user] 字样"}]}}
+{"_expect":"","type":"user","uuid":"n2","message":{"content":[{"type":"text","text":"我想聊聊 [Request interrupted by user] 这个标记"}]}}
+{"_expect":"","type":"user","uuid":"n3","message":{"content":"<task-notification>\n后台任务里提到 Request interrupted 字样"}}
+{"_expect":"","type":"user","uuid":"n4","message":{"content":[{"is_error":true,"content":"git push --force: permission denied (publickey)"}]}}
+{"_expect":"","type":"user","uuid":"n5","message":{"content":[{"is_error":true,"content":"Exit code 1"}]}}
+{"_expect":"","type":"user","uuid":"n6","toolUseResult":{"userModified":false}}
+{"_expect":"","type":"user","uuid":"n7","toolUseResult":["array","形态"]}
+{"_expect":"","type":"user","uuid":"n8","toolUseResult":"字符串形态"}
+{"_expect":"","type":"assistant","uuid":"n9","message":{"content":[{"type":"text","text":"[Request interrupted by user] 我在引用它"}]}}
+{"_expect":"interrupt","type":"user","uuid":"t9","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]},"toolUseResult":["array","形态"]}
+{"_expect":"interrupt","type":"user","uuid":"t10","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]},"toolUseResult":"字符串形态"}
