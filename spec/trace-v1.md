@@ -39,6 +39,37 @@ commit 侧写 trailer：
 Claude-Session: 0bf59c3d-59dc-416c-b21d-9137feef79af
 ```
 
+### 2.0 谁写、什么时候写
+
+`.githooks/prepare-commit-msg`，判据是**环境变量**：
+
+```bash
+#!/bin/bash
+[ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || exit 0   # 人工提交：变量不存在，直接跳过
+grep -q "^Claude-Session:" "$1" && exit 0        # 幂等：amend / rebase 不重复追加
+printf '\nClaude-Session: %s\n' "$CLAUDE_CODE_SESSION_ID" >> "$1"
+```
+
+`CLAUDE_CODE_SESSION_ID` 实测**逐字等于 transcript 文件名**，Claude Code 注入在每个
+Bash 调用的环境里。选它而不是状态文件，是因为环境变量是**进程级**的：
+
+| 场景 | 状态文件 | 环境变量 |
+|---|---|---|
+| 多 worktree 并发会话 | ❌ 串号 | ✅ 各进程各自的值 |
+| 人工手动 `git commit` | ❌ 误记成 agent 的 | ✅ 变量不存在，不注入 |
+
+⚠️ **两个部署要点，漏了会静默失效**：
+
+1. **`.githooks/` 必须提交进仓**。`core.hooksPath` 用相对路径时按**各 worktree 的根**解析，
+   目录不入仓则 worktree 里根本没有这个文件——实测 worktree 提交时 hook 不触发、
+   trailer 为空、**不报错**。
+2. **`core.hooksPath` 是本地配置、不入仓**，每人 clone 后要跑一次
+   `git config core.hooksPath .githooks`（git 出于安全故意不让仓库自动装 hook）。
+   worktree 不必重复设——config 走 common dir 共享（实测）。
+
+实测矩阵：agent 提交自动带 ✅ / 人工提交不带 ✅ / `--amend` 幂等 ✅ /
+worktree 生效 ✅（前提是要点 1）/ 并发两个 session 不串 ✅。
+
 **trace 文件里不存 commit SHA 做关联**，哪怕那样查起来更快。理由是 SHA 在 rebase 后就变了，
 而 trailer 跟着 message 走——留两份就是留一份必然漂移的拷贝。查询靠：
 
@@ -70,9 +101,9 @@ git log -1 --format='%(trailers:key=Claude-Session,valueonly)' <sha>            
 ```
 
 ```json
-{"t":"diverge","kind":"interrupt","at":"…","turn":"<uuid>"}
-{"t":"diverge","kind":"user_edited_after_agent","at":"…","turn":"<uuid>","path":"src/foo.go"}
-{"t":"diverge","kind":"permission_denied","at":"…","turn":"<uuid>","tool":"Bash"}
+{"t":"diverge","kind":"interrupt","at":"…","turn":"<uuid>","human":true}
+{"t":"diverge","kind":"classifier_blocked","at":"…","turn":"<uuid>","human":false}
+{"t":"diverge","kind":"permission_denied","at":"…","turn":"<uuid>","human":true,"tool":"Bash"}
 ```
 
 ```json
@@ -109,6 +140,40 @@ git log -1 --format='%(trailers:key=Claude-Session,valueonly)' <sha>            
   全语料 **3507 次 `userModified` 取值全为 `false`**（755 个会话）。判据见 §3.4。
 - **`correction`**（用户纠正话术的启发式）—— 未实现。三个硬信号已有可用准确率，
   先把启发式挡在门外；要加须先有独立的准确率实测，且必须与硬信号分开统计。
+
+### 3.2 准确率实测（2026-09-08，755 个会话 / 674MB）
+
+| kind | 命中 | 精确率 | 召回率 |
+|---|---:|---|---|
+| `interrupt` | 277 | **100%**（277/277） | 100%，无遗漏 |
+| `permission_denied` | 90 | 100%（人工逐条核对候选集） | **100%**（90/90，修复后） |
+| `classifier_blocked` | 1 | — | — |
+| `permission_infra_fail` | 6 | — | — |
+
+对照：**裸 grep 原文在对抗样本上精确率仅 10.5%**。以本项目的调研会话为靶
+（它在命令输出里反复打印过 `Request interrupted` 字面量）：裸 grep 命中 19 条，
+本规则命中 2 条，人工核对真实中断正是 2 次。
+
+三个曾经出错、修复后才达到上表数字的点，都记在 §3.3。
+
+### 3.3 实现这套判据时踩过的坑
+
+写提取器的人必须知道这四条，否则数字会**静默错**（不报错、只是不对）：
+
+1. **只读字段，绝不 grep 原文。** 会话自身会讨论这些标记（本项目的调研会话就是），
+   grep 原文把「讨论」当成「发生」。同理必须排除 `tool_result` 块。
+2. **锚定，不要用无锚子串。** 无锚子串会误收 `<task-notification>` 这类正文里恰好
+   提到该短语的记录（实测 278 命中里 1 条假阳）。SpecStory 的前缀故意不带右括号，
+   正好同时覆盖 `[Request interrupted by user]` 与 `[...for tool use]` 两种变体。
+3. **jq 的正则标志与 PCRE 相反**：dotall 是 `m` 不是 `s`（`s` 在这里是单行模式）。
+   按 PCRE 习惯写 `s` 会**静默匹配失败**。权限拒绝的真实消息把多行命令嵌在中间
+   （`Permission to use Bash with command <多行> has been denied.`），不加 `m` 会漏
+   全部多行命令的拒绝——实测漏 2/90。
+4. **取 `.toolUseResult` 子字段前先判 `type=="object"`。** 它有时是 array 或 string，
+   直接索引会抛错，而 jq 抛错会丢掉**整条记录**，连带该记录上其他规则的命中一起消失。
+   实测这一条曾让 1200 条记录被静默跳过。
+
+判据依赖英文消息串，Claude Code 改文案即失效——**这是已知脆弱点**，见 §7。
 
 ### 3.4 `userModified` 与 `staleRecovered`：查清了什么
 
@@ -163,40 +228,6 @@ userModified:   false     ← 不是它
 **对本格式的结论**：两个字段都不能用作人机分歧信号。这不是字段的问题，是这个工作流
 的形状——**人不碰文件，所以分歧不落在文件上，只落在对话上**（打断、拒绝工具调用）。
 现有三个 kind 恰好覆盖的就是对话侧，这个负结果反过来支持了当前设计。
-
-### 3.2 准确率实测（2026-09-08，755 个会话 / 674MB）
-
-| kind | 命中 | 精确率 | 召回率 |
-|---|---:|---|---|
-| `interrupt` | 277 | **100%**（277/277） | 100%，无遗漏 |
-| `permission_denied` | 90 | 100%（人工逐条核对候选集） | **100%**（90/90，修复后） |
-| `classifier_blocked` | 1 | — | — |
-| `permission_infra_fail` | 6 | — | — |
-
-对照：**裸 grep 原文在对抗样本上精确率仅 10.5%**。以本项目的调研会话为靶
-（它在命令输出里反复打印过 `Request interrupted` 字面量）：裸 grep 命中 19 条，
-本规则命中 2 条，人工核对真实中断正是 2 次。
-
-三个曾经出错、修复后才达到上表数字的点，都记在 §3.3。
-
-### 3.3 实现这套判据时踩过的坑
-
-写提取器的人必须知道这四条，否则数字会**静默错**（不报错、只是不对）：
-
-1. **只读字段，绝不 grep 原文。** 会话自身会讨论这些标记（本项目的调研会话就是），
-   grep 原文把「讨论」当成「发生」。同理必须排除 `tool_result` 块。
-2. **锚定，不要用无锚子串。** 无锚子串会误收 `<task-notification>` 这类正文里恰好
-   提到该短语的记录（实测 278 命中里 1 条假阳）。SpecStory 的前缀故意不带右括号，
-   正好同时覆盖 `[Request interrupted by user]` 与 `[...for tool use]` 两种变体。
-3. **jq 的正则标志与 PCRE 相反**：dotall 是 `m` 不是 `s`（`s` 在这里是单行模式）。
-   按 PCRE 习惯写 `s` 会**静默匹配失败**。权限拒绝的真实消息把多行命令嵌在中间
-   （`Permission to use Bash with command <多行> has been denied.`），不加 `m` 会漏
-   全部多行命令的拒绝——实测漏 2/90。
-4. **取 `.toolUseResult` 子字段前先判 `type=="object"`。** 它有时是 array 或 string，
-   直接索引会抛错，而 jq 抛错会丢掉**整条记录**，连带该记录上其他规则的命中一起消失。
-   实测这一条曾让 1200 条记录被静默跳过。
-
-判据依赖英文消息串，Claude Code 改文案即失效——**这是已知脆弱点**，见 §7。
 
 ## 4. 审计记录 `audits/<patchId>.jsonl`
 
@@ -261,7 +292,8 @@ O(1) 查询保留：Stop hook 仍是一次 `[ -f audits/<patchId>.jsonl ]`，只
 
 ## 6. 版本
 
-`v` 是整数，只在**破坏性变更**时递增（删字段、改字段语义、改目录布局）。
+`v` 出现在**每个文件的首条记录**上（`session` / `audit`），是**文件级**版本，
+后续行不重复携带。它是整数，只在**破坏性变更**时递增（删字段、改字段语义、改目录布局）。
 新增可选字段不升版本。消费方读到更高的 `v` 应当拒绝解析而不是猜。
 
 字段名一旦发布就**不再改拼写**——哪怕拼错了。（这条是抄来的教训：

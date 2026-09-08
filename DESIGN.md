@@ -1,6 +1,7 @@
 # 开发过程留痕与审计方案
 
-> **状态**：方案设计中，未实施。本文记录问题定义、实测结论与已定决策。
+> **状态**：L3 已实现（提取器 + 755 会话实测），L1 机制已实测待落地，L2 待实现。
+> 本文记录问题定义、实测结论与已定决策；落盘格式见 [spec/trace-v1.md](spec/trace-v1.md)。
 > **目标**：任何一个 commit 都能追回「它是怎么来的」；复盘时能定位人机在哪一步对不上。
 >
 > **两样东西，两个去处——别混**：
@@ -14,18 +15,19 @@
 
 ## 1. 问题：不是没记，是三处断链
 
-Claude Code 已经在写完整流水，无需自建采集层。实测（2026-09-08，本仓）：
+Claude Code 已经在写完整流水，无需自建采集层。以下实测数据均取自**首个观测对象 agentDock**
+（2026-09-08），不是本项目自身：
 
 | 记录 | 位置 / 字段 |
 |---|---|
 | 每轮对话 | `~/.claude/projects/<cwd-slug>/<sessionId>.jsonl`；`uuid` + `parentUuid`（DAG）、`timestamp`、`gitBranch`、`cwd`、`permissionMode`、`model`、`usage`、`requestId` |
 | 模型思考 | `thinking` block 全文 |
-| 文件改动 | `structuredPatch` + `oldString` / `newString` / `originalFile` + **`userModified`** |
+| 文件改动 | `structuredPatch` + `oldString` / `newString` / `originalFile`（另有 `userModified` / `staleRecovered`，见 §2.4 —— 都不可用）|
 | 命令执行 | `stdout` / `stderr` / `interrupted` / `returnCodeInterpretation` |
 | 子 agent | `<sessionId>/subagents/agent-*.jsonl` 独立完整 transcript + `.meta.json`（`agentType` / `description` / `toolUseId`） |
 | 人的动作 | `queue-operation`（排队、中断）、`Request interrupted by user`、`origin.kind` |
 
-体量：本项目 406MB，单 session 最大 106MB / 49341 行。
+体量：agentDock 的 transcript 已累积 406MB，单 session 最大 106MB / 49341 行。
 
 **断链一：commit ↔ session 无关联。** 实测全仓 0 个 session trailer
 （`git log --all --format=%B | grep -cE "^(Claude-Session|Session-Id|Transcript):"` → 0）。
@@ -38,9 +40,11 @@ Claude Code 已经在写完整流水，无需自建采集层。实测（2026-09-
 只是发生在 audit 维度——CLAUDE.md 自己已写「marker 不带理由，假标记比没标记更坏」，
 问题被识别了但没被解决。
 
-**断链三：人机分歧点没索引。** 复盘要找的是「人在哪儿不同意机器」，
-而 `userModified: true`（模型改完文件、人又手改了）是**机器可判的硬信号**，
-埋在 106MB 里没有索引。
+**断链三：人机分歧点没索引。** 复盘要找的是「人在哪儿不同意机器」——打断、
+拒绝工具调用这些信号确实存在于 transcript 里，但埋在 106MB 中没有索引。
+
+> 本条最初写的是「`userModified: true` 是机器可判的硬信号」。**该说法已被实测推翻**，
+> 见 §2.4。分歧信号在这个工作流里落在**对话侧**而非文件侧，L3 据此实现。
 
 （次要：`.gitignore:9` 排除 `.claude/projects/`，换机器即丢。）
 
@@ -86,21 +90,51 @@ ID 空间**，实测一例对不上。但 hook 直接给路径，绕开了这个
 
 1. **阈值问题**：改几行算 AI 写的，没有原则性答案（行级归属假设了实际不存在的干净边界）。
 2. **审计过程本身的留痕**：所有工具审的是**代码**，没人审**审计过程**。断链二无现成方案。
-3. **人机分歧的硬信号无人使用**：`userModified` 翻遍这些工具无一采用。
+3. **对话侧的人机分歧无人索引**：SpecStory 只认中断（一行前缀匹配），
+   git-ai 与 claude-story 一个都不认。权限拒绝、机器/人的区分无人做。
 
-## 3. 分层方案（未实施）
+### 2.4 两个曾被寄予厚望的字段，都不可用
 
-| # | 内容 | 依赖 |
+- **`userModified`**：全语料 3507 次取值**全为 `false`**。交互实测定论——desktop 客户端的
+  审批面板只有 `Deny` / `Allow once`，**没有「修改提案」这个动作**，所以它不可能为真。
+- **`staleRecovered`**：真会触发（21 次），语义是「Read 之后文件被改过」。但逐条回溯，
+  **无一例是人改的**——16 例直接对上 Claude 自己的 `sed`/`python3`，其余 5 例放宽到
+  全会话范围后同样有 Bash 碰过。根因是这个工作流里**人不碰文件**：人指挥、Claude 动手。
+
+详见 [spec/trace-v1.md §3.4](spec/trace-v1.md)。
+
+### 2.5 git-ai 实装评估：已否决
+
+Q5 曾倾向采纳。**实际安装后否决**，理由是代价结构不适合推广给全体开发者：
+
+| 实测 | 数值 |
+|---|---|
+| 本地库占盘 | **833MB**，持续增长 |
+| `metrics-db` 内容 | 206509 行，**全部 `delivered_ts IS NULL`**（排队待上传），含**完整 prompt 正文** |
+| `prompt_storage` 默认值 | `default` —— 源码注释原话 *"prompts uploaded via CAS API"* |
+| 触发条件 | **光跑一次二进制**（`git-ai status`）就建库、起守护进程、开吞历史；不是 `install-hooks` 干的 |
+| 额外改动 | 装了 Cursor hooks + 扩展 `git-ai.git-ai-vscode`（未要求）|
+| 网络 | 守护进程当前**零对外连接**（未登录，发不出去）|
+
+我们只需要它的一件事——commit ↔ session 关联——而那件事 12 行 `prepare-commit-msg`
+就能做（§3 L1）。放弃的行级归属与 `overriden_lines` 对应的是文件侧分歧，而 §2.4 已证明
+该维度在本工作流接近空。**为接近空的维度付 833MB 常驻，推广不成立。**
+
+已完整卸载并逐项核对还原（hooks / 二进制 / 本地库 / 全局 settings / Cursor 侧）。
+
+## 3. 分层方案
+
+| # | 内容 | 状态 |
 |---|---|---|
-| L1 | commit ↔ session 接链：hook 落 sessionId，commit 带 trailer | 无 |
-| L2 | audit marker 内容化：`mark-audit.sh` 从 `touch` 改为写 JSON（审了哪些 commit、spawn 了哪些 agent、finding 数、cross-verify 真假判定与理由） | 无 |
-| L3 | 人机分歧提取器：扫 transcript 出 `userModified` / 中断 / permission deny / 纠正话术 | 无 |
-| L4 | 可视化 / trace 导出 | L1-L3 有数据后 |
+| L1 | commit ↔ session 接链：`.githooks/prepare-commit-msg` 读 `CLAUDE_CODE_SESSION_ID` 注入 trailer | **机制已实测，待落地** |
+| L2 | audit marker 内容化：`mark-audit.sh` 从 `touch` 改为写结构化记录 | 待实现 |
+| L3 | 人机分歧提取器：`tools/extract-diverge.jq` | **已完成**（755 会话实测，精确率 100%）|
+| L4 | 可视化 / trace 导出 | 暂缓，见 Q4 |
 
 落盘格式见 [spec/trace-v1.md](spec/trace-v1.md)。
 
-L1、L2 解决断链一与断链二，改动小。L3 是业内空白、需自建。
-L1 的行级部分可能被 git-ai 直接覆盖，采纳与否见 Q5。
+L1、L2 解决断链一与断链二，改动小。L3 是业内空白，已自建。
+行级归属曾考虑交给 git-ai，**已否决**，见 §2.5。
 
 ## 4. FAQ / 决策记录
 
@@ -154,32 +188,17 @@ L1 的行级部分可能被 git-ai 直接覆盖，采纳与否见 Q5。
 
 ### Q5 — git-ai 采纳与否？
 
-**未定**（见 O1）。实测支持采纳：机制与 desktop 兼容、notes 跨 worktree 共享且能活过
-rebase + ff 合流（正是本仓流程）、可逆。
+**已否决**（2026-09-08，实装后）。完整实测数据与理由见 §2.5。
 
-阻碍是安装副作用：`install.sh` 会改 `~/.claude/settings.json` **和所有检测到的 shell rc**
-（后者由 `--env` 造成，仅为把 git-ai 加进 PATH）。这是全局配置变更，需本人执行与确认。
+一句话：我们只需要它的 commit ↔ session 关联，而那件事 12 行 hook 就能做；
+它带来的 833MB 常驻本地库（含完整 prompt 正文、按待上传形状排队）对
+「推广给全体开发者」这个前提不成立。
 
-**更正**：先前记为「可能拉起登录」，不准确。`git-ai login` 仅在 `INSTALL_NONCE` 与
-`API_BASE` 两个环境变量**同时存在且 nonce 兑换失败**时触发，而这两者只有从官网 / 团队
-dashboard 复制安装命令时才带。裸跑 `install.sh` 时 `NEED_LOGIN` 恒 false，登录不会执行。
+保留的判断（若将来场景变化可复用）：机制上它与 desktop 完全兼容，notes 跨 worktree 共享、
+能活过全部历史重写操作，`uninstall-hooks` 可逆且实测卸载干净。技术上没问题，是代价问题。
 
-**更轻的替代路径**（已验证可行）：手工下载 `git-ai-macos-arm64`（checksum 已对，
-`49c2beee…97ea`）放进 PATH，再跑 `git-ai install-hooks`（**不带 `--env`**）——
-只装 Claude hook，不碰 shell rc。撤销走 `uninstall-hooks`。
-
-### Q5.1 — git-ai 会把我们的代码或 prompt 发出去吗？
-
-不会，但有一个默认开启项需要手动关。据 `data-privacy.md`：
-
-- **OSS 模式且不登录**：代码、prompt、agent 使用数据**一概不外发**，
-  归属写本地 git notes，prompt 写本地 SQLite。
-- **例外**：error & exception telemetry **默认开启**，
-  需 `git-ai config set telemetry_oss off` 关闭（或重定向到自有 endpoint）。
-- 登录后的 Cloud / Teams 模式才会上传 prompt 与逐工具调用遥测——**不登录即不触发**。
-
-**行动项**：若采纳，装完立即关 `telemetry_oss`。对含专有代码与内部路径的仓库，
-这不是理论风险。
+⚠️ 评估同类工具的教训：**它的本地库不是 `install.sh` 建的，是「跑一次二进制」就建的**。
+只读安装脚本会低估成本，必须实际跑一次再量占盘与进程。
 
 ### Q6 — 为什么不强制开发者在 CLI 与 desktop 间二选一？
 
@@ -188,8 +207,16 @@ dashboard 复制安装命令时才带。裸跑 `install.sh` 时 `NEED_LOGIN` 恒
 
 ## 5. 未决项
 
-- **O1**：git-ai 是否采纳。阻碍见 Q5，需本人执行安装。
-- **O2**：是否保留 SpecStory 作为人类可读副本与索引并存（Q3）。
+- ~~**O1**：git-ai 是否采纳~~ —— **已否决**，见 §2.5 / Q5。
+- **O2**：是否保留 SpecStory 作为人类可读副本与索引并存（Q3）。倾向不保留——
+  粒度两头不着，且它 184K/session 的体量在「推广给全体开发者」下同样要算账。
 - ~~**O3**：`.claude/trace/` 的具体 schema~~ —— **已定**，见 [spec/trace-v1.md](spec/trace-v1.md)。
-- **O4**：`brew trust specstoryai/tap` 的供应链信任决定——仅在 O2 取「采纳」时才需要。
-- **O5**：若采纳 git-ai，是否把 `telemetry_oss off` 写进团队统一配置而非依赖各人手动关。
+- ~~**O4**：`brew trust specstoryai/tap`~~ —— 仅在 O2 取「采纳」时才需要，随 O2 倾向搁置。
+- ~~**O5**：git-ai 的 `telemetry_oss off` 是否进团队配置~~ —— 随 O1 否决而消失。
+- **O6**：**L2 迁移** —— agentDock 现有 637 个 0 字节 marker 怎么办？
+  - (a) 不迁移，新旧并存 —— 查询要兼容两种格式；
+  - (b) 补一次迁移，读 git log 给老 commit 生成最小记录 —— 干净，但迁移出的记录
+    只有 SHA 与时间、**没有 finding 内容**（那些信息已随对话丢失，补不回来）。
+  未定。
+- **O7**：`core.hooksPath` 需每人 clone 后手动设一次（git 不允许仓库自动装 hook）。
+  用什么方式保证不漏——bootstrap 脚本 / `make setup` / CI 检查？未定。
