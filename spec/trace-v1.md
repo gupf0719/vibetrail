@@ -28,8 +28,11 @@ transcript 没了就只剩摘要——这是**有意的取舍**，不是缺陷�
 └── audits/<patchId>.jsonl          # 审计记录
 ```
 
-每个 session 只写**自己那个文件**，所以并发会话之间不会冲突，也不需要读-改-写。
-JSONL 而非单个 JSON 对象：追加即写，崩溃不会留下半个文件，git 合并 append 也更干净。
+`sessions/` 下每个 session 只写**自己那个文件**，并发会话之间不会冲突，也不需要读-改-写。
+`audits/` 按 patch 分文件，两个分支各审一次同一个 patch 再合并时，两侧各追加一行**必然冲突**
+（实测 `CONFLICT (content)`）。被观测仓的 `.gitattributes` 须声明
+`.claude/trace/**/*.jsonl merge=union`，声明后三行齐全、无冲突（实测）。
+JSONL 而非单个 JSON 对象：追加即写，崩溃不会留下半个文件，配合 `merge=union` 并发追加可无冲突合并。
 
 ## 2. commit ↔ session：只用 trailer，不留第二份
 
@@ -39,19 +42,52 @@ commit 侧写 trailer：
 Claude-Session: 0bf59c3d-59dc-416c-b21d-9137feef79af
 ```
 
+它的语义是**「哪个会话执行了这次 `git commit`」**，不是「这次改动出自哪个会话」。
+两者在「agent 改完当场提交」的工作流里重合，其他情况的缺口见 §7。
+
 ### 2.0 谁写、什么时候写
 
 `.githooks/prepare-commit-msg`，判据是**环境变量**：
 
 ```bash
 #!/bin/bash
-[ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || exit 0   # 人工提交：变量不存在，直接跳过
-grep -q "^Claude-Session:" "$1" && exit 0        # 幂等：amend / rebase 不重复追加
-printf '\nClaude-Session: %s\n' "$CLAUDE_CODE_SESSION_ID" >> "$1"
+[ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || exit 0     # 人工提交：变量不存在，直接跳过
+g=$(git rev-parse --git-dir)                       # 重放别人的 commit（rebase / cherry-pick）不改归属
+{ [ -d "$g/rebase-merge" ] || [ -d "$g/rebase-apply" ] || [ -f "$g/CHERRY_PICK_HEAD" ]; } && exit 0
+sed '/^# -* >8 -*$/,$d' "$1" | grep -q -v -e '^[[:space:]]*$' -e '^#' || exit 0   # 截掉 scissors 后为空：让 git 照常拒绝
+[ -n "$(tail -c1 "$1")" ] && echo >> "$1"          # 非编辑器路径的 merge（--no-edit / -m）没有末尾换行
+git interpret-trailers --in-place --no-divider --if-exists doNothing \
+    --trailer "Claude-Session=$CLAUDE_CODE_SESSION_ID" "$1"   # 并入已有 trailer 块；已有则不动（幂等）
 ```
 
+最初的版本只有 4 行（`grep` 幂等守卫 + `printf` 追加）。2026-09-08 的三轮审计在四处抓到它**静默出错**，
+以下全部实测（git 2.39）：
+
+- **agent 执行 `rebase` / `cherry-pick` 会把人的 commit 记成 agent 的。** merge 后端的 rebase
+  对每个重放的 commit 都跑本 hook，`$2` 恒为 `message`，与 `commit -m` 不可区分；人的 commit
+  没有 trailer，幂等守卫不生效，于是被注入当前会话。agentDock 的 rebase + ff-only 工作流天天踩：
+  agent 一次 `git rebase main` 就把分支上所有人工 commit 全改成「agent 的」。修法是重放期间
+  （`rebase-merge` / `rebase-apply` 目录或 `CHERRY_PICK_HEAD` 存在）一律不动；`--apply` 后端本就
+  不跑此 hook，那一项属防御。代价：agent 在 rebase 中途新造的 commit 也不带 trailer，可接受。
+- **非编辑器路径的 merge（`--no-edit` / `-m`）下 trailer 粘进 subject。** 这条路径把消息末尾换行
+  剥掉再交给 hook，直接追加会让 trailer 与 subject 落在同一段：`%(trailers:)` 解析为空，
+  `%s` 变成 `Merge branch 'x' Claude-Session: …`。修法是先补末尾换行。
+- **另起一段追加会把已有 trailer 挤出 trailer 区。** git 只把消息**最后一段**当 trailer 块；原版
+  无条件先空一行再追加，于是上一段的 `Co-Authored-By:`（Claude Code 默认就写）、`Signed-off-by:`
+  （DCO 项目的 `-s`）、`--trailer` 加的键全部不再被 `%(trailers:)` 识别。改用
+  `git interpret-trailers` 并入现有块；`--if-exists doNothing` 顺带替代了 grep 幂等守卫，
+  `--no-divider` 让正文里的 `---` 行不被当分隔符。
+- **`-m ''` 与留空的 `commit -v` 会绕过 git 的空消息拒绝。** hook 填入 trailer 后消息非空，subject
+  变成 `Claude-Session: …`。修法：先截掉 scissors 线及其后的 diff，再判「去掉空行与注释后为空」，
+  为空就退出（假设 `core.commentChar` 为默认的 `#`）。副作用是**编辑器路径一律不注入**——
+  `git commit` 不带 `-m` 时 hook 运行在编辑器之前，消息尚空。agent 从不开编辑器；人在带变量的
+  shell 里手工提交因此不会被记成 agent 的，方向正确。带模板（`-t` / `commit.template`）或
+  `--amend` 时消息非空，照常注入。
+
 `CLAUDE_CODE_SESSION_ID` 实测**逐字等于 transcript 文件名**，Claude Code 注入在每个
-Bash 调用的环境里。选它而不是状态文件，是因为环境变量是**进程级**的：
+Bash 调用的环境里；子 agent 的 Bash 里拿到的也是**父会话的 id**（与子 agent transcript 内的
+`sessionId` 一致），所以子 agent 提交同样归到父会话。选它而不是状态文件，是因为环境变量是
+**进程级**的：
 
 | 场景 | 状态文件 | 环境变量 |
 |---|---|---|
@@ -68,7 +104,11 @@ Bash 调用的环境里。选它而不是状态文件，是因为环境变量是
    worktree 不必重复设——config 走 common dir 共享（实测）。
 
 实测矩阵：agent 提交自动带 ✅ / 人工提交不带 ✅ / `--amend` 幂等 ✅ /
-worktree 生效 ✅（前提是要点 1）/ 并发两个 session 不串 ✅。
+worktree 生效 ✅（前提是要点 1）/ 并发两个 session 不串 ✅ /
+agent `rebase` 人工 commit 不沾 ✅ / agent `cherry-pick` 人工 commit 不沾 ✅ /
+`merge --no-ff` 的 `--no-edit` 与 `-m` 路径 trailer 可解析、subject 干净 ✅ /
+已有 `Co-Authored-By` / `Signed-off-by` / `--trailer` 保留 ✅ / `-m ''` 与留空的 `commit -v` 仍被 git 拒绝 ✅ /
+编辑器路径不注入、不污染 subject ✅（前五条为最初实测，其余为三轮审计补测，最初的 4 行版全错）。
 
 **trace 文件里不存 commit SHA 做关联**，哪怕那样查起来更快。理由是 SHA 在 rebase 后就变了，
 而 trailer 跟着 message 走——留两份就是留一份必然漂移的拷贝。查询靠：
@@ -82,13 +122,14 @@ git log -1 --format='%(trailers:key=Claude-Session,valueonly)' <sha>            
 
 | 操作 | 结果 |
 |---|---|
-| `rebase` | ✅ SHA 变、trailer 原样 |
-| `cherry-pick` | ✅ |
+| `rebase` | ✅ SHA 变、trailer 原样；没有 trailer 的人工 commit 被 agent 重放时**保持没有**（靠 §2.0 的重放判定；`--apply` 后端本就不跑此 hook） |
+| `cherry-pick` | ✅ 同上 |
 | `merge --ff-only` | ✅（不造新 commit） |
-| `rebase -i` squash | ⚠️ **只留最后一个** session |
-| `merge --squash` | ❌ 原 message 缩进进 body，`%(trailers:)` **解析不到** |
+| `merge --no-ff` | ✅ 新 merge commit 记执行合并的会话（非编辑器路径 `--no-edit` / `-m` 靠 §2.0 的补换行，否则 trailer 粘进 subject） |
+| `rebase -i` squash | ⚠️ 只留**最后一个被 squash 的 commit** 的 trailer：末尾是人工 commit 则全丢；`fixup` 反之留第一个（实测） |
+| `merge --squash` | ❌ 原会话的 trailer 缩进进 body，`%(trailers:)` **解析不到**；执行 squash 的会话反而被记上——**错误归属** |
 
-前三行覆盖 rebase + ff-only 的工作流。**用 squash 合流的项目不适用本方案的 §2**，
+前三行覆盖 rebase + ff-only 的工作流，第四行覆盖 no-ff 合入。**用 squash 合流的项目不适用本方案的 §2**，
 需要另找锚（未解，见 §7）。
 
 ## 3. 会话流水 `sessions/<sessionId>.jsonl`
@@ -101,10 +142,14 @@ git log -1 --format='%(trailers:key=Claude-Session,valueonly)' <sha>            
 ```
 
 ```json
-{"t":"diverge","kind":"interrupt","at":"…","turn":"<uuid>","human":true}
-{"t":"diverge","kind":"classifier_blocked","at":"…","turn":"<uuid>","human":false}
-{"t":"diverge","kind":"permission_denied","at":"…","turn":"<uuid>","human":true,"tool":"Bash"}
+{"t":"diverge","kind":"interrupt","at":"…","turn":"<uuid>","human":true,"branch":"main"}
+{"t":"diverge","kind":"classifier_blocked","at":"…","turn":"<uuid>","human":false,"branch":"main"}
+{"t":"diverge","kind":"permission_denied","at":"…","turn":"<uuid>","human":true,"branch":"main"}
 ```
+
+`branch` 是事件发生时的 `gitBranch`，可选。提取器 `tools/extract-diverge.jq` 的原始输出
+另带 `sid`（所属 `sessionId`），那是写入方决定落到哪个文件的路由键，落盘后可省略。
+`tool`（被拒的工具名）**尚未产出**；将来加上时按 §5 属于可选字段，不升版本。
 
 ```json
 {"t":"end","at":"…","turns":{"user":8,"assistant":94,"tool":67},
@@ -129,16 +174,25 @@ git log -1 --format='%(trailers:key=Claude-Session,valueonly)' <sha>            
 |---|---|---|
 | `interrupt` | ✅ | user 消息的 text 块或字符串正文，去前导空白后 `startswith("[Request interrupted by user")` |
 | `permission_denied` | ✅ | `is_error` 块正文 `^Permission to use .* has been denied`（带 `m` 标志）或 `^The user doesn't want to proceed with this tool use` |
-| `classifier_blocked` | ❌ | 正文含 `denied by the Claude Code auto mode classifier` —— auto mode 分类器拒的，不是人 |
-| `permission_infra_fail` | ❌ | 正文含 `Tool permission request failed` / `stream closed` —— 链路故障，不是任何人的决定 |
+| `classifier_blocked` | ❌ | 正文含 `denied by the Claude Code auto mode classifier` 或 `Blocked by classifier` —— auto mode 分类器拒的，不是人 |
+| `permission_infra_fail` | ❌ | 正文含 `Tool permission request failed` 或 `Tool permission stream closed` —— 链路故障，不是任何人的决定 |
 
-判据全部**只读 JSON 字段**，不 grep 整行原文；`tool_result` 块一律排除。原因见 §3.3。
+判据全部**只读 JSON 字段**，不 grep 整行原文。`interrupt` 只认 user 消息的 text 块或字符串正文，
+**不认** `tool_result` 块；其余三类**只认** `is_error == true` 的块正文（Claude Code 里只有 `tool_result`
+块带 `is_error`，判据不另查 `type`）。原因见 §3.3。
+
+`permission_denied` 的**排除子句**与规则 3 / 4 共用同一对谓词（`isClassifier` / `isInfra`）：
+正文命中分类器或链路故障判据时不计为人拒，只落到对应的机器类 kind。防的是机器消息以
+`Permission to use … has been denied` 开头的变体——语料里未见，属防御；fixtures t12 / t14 / t15
+覆盖，保证同一条不会既算人拒又算机器拒。（第三轮审计前排除子句用的短语与规则 3 不同，
+`…denied by the Claude Code auto mode classifier.` 不带 `Reason:` 时会双计，已修。）
 
 #### 已删除的 kind
 
 - **`user_edited_after_agent`** —— 曾被本文档称作「最硬的信号」，**该说法已被实测推翻**。
-  全语料 **3507 次 `userModified` 取值全为 `false`**（755 个会话）。判据见 §3.4。
-- **`correction`**（用户纠正话术的启发式）—— 未实现。三个硬信号已有可用准确率，
+  全语料 **3507 次 `userModified` 取值全为 `false`**（755 个会话）。实测见 §3.4。
+  提取器里对应的规则已于 2026-09-08 移除（此前文档说删了、代码没删，三处不一致）。
+- **`correction`**（用户纠正话术的启发式）—— 未实现。现有四个 kind 都是硬信号、已有可用准确率，
   先把启发式挡在门外；要加须先有独立的准确率实测，且必须与硬信号分开统计。
 
 ### 3.2 准确率实测（2026-09-08，755 个会话 / 674MB）
@@ -150,18 +204,25 @@ git log -1 --format='%(trailers:key=Claude-Session,valueonly)' <sha>            
 | `classifier_blocked` | 1 | — | — |
 | `permission_infra_fail` | 6 | — | — |
 
+召回率的基线是**无锚子串候选集**（`interrupt` 为 278 条），含义是「相对裸 grep 不漏」，
+不是绝对召回——不含该子串的中断形态（若存在）测不到。
+
+277 是**逐条命中数**。其中 13 条是子 agent 与父会话的传播重复（同一次打断记进两边），
+作为事件数多报 4.7%；去重方案见 [CAPABILITIES §3.3](../CAPABILITIES.md)。
+
 对照：**裸 grep 原文在对抗样本上精确率仅 10.5%**。以本项目的调研会话为靶
 （它在命令输出里反复打印过 `Request interrupted` 字面量）：裸 grep 命中 19 条，
 本规则命中 2 条，人工核对真实中断正是 2 次。
 
-三个曾经出错、修复后才达到上表数字的点，都记在 §3.3。
+上表数字是修完 §3.3 里的坑之后才得到的。
 
 ### 3.3 实现这套判据时踩过的坑
 
-写提取器的人必须知道这四条，否则数字会**静默错**（不报错、只是不对）：
+写提取器的人必须知道这五条，否则数字会**静默错**（不报错、只是不对）：
 
 1. **只读字段，绝不 grep 原文。** 会话自身会讨论这些标记（本项目的调研会话就是），
-   grep 原文把「讨论」当成「发生」。同理必须排除 `tool_result` 块。
+   grep 原文把「讨论」当成「发生」。同理 `interrupt` 判据必须排除 `tool_result` 块
+   （其余三类读的就是 `is_error` 的 tool_result 块，靠锚定而非靠排除）。
 2. **锚定，不要用无锚子串。** 无锚子串会误收 `<task-notification>` 这类正文里恰好
    提到该短语的记录（实测 278 命中里 1 条假阳）。SpecStory 的前缀故意不带右括号，
    正好同时覆盖 `[Request interrupted by user]` 与 `[...for tool use]` 两种变体。
@@ -169,9 +230,17 @@ git log -1 --format='%(trailers:key=Claude-Session,valueonly)' <sha>            
    按 PCRE 习惯写 `s` 会**静默匹配失败**。权限拒绝的真实消息把多行命令嵌在中间
    （`Permission to use Bash with command <多行> has been denied.`），不加 `m` 会漏
    全部多行命令的拒绝——实测漏 2/90。
-4. **取 `.toolUseResult` 子字段前先判 `type=="object"`。** 它有时是 array 或 string，
-   直接索引会抛错，而 jq 抛错会丢掉**整条记录**，连带该记录上其他规则的命中一起消失。
-   实测这一条曾让 1200 条记录被静默跳过。
+4. **取 `.toolUseResult` 这类多态字段的子字段前先判 `type=="object"`。** 它有时是 array 或
+   string，直接索引会抛错。jq 抛错时该条记录**抛错点之后的规则**全部不再求值，之前已输出的
+   命中保留，然后继续处理下一条输入；退出码只反映**最后一条**输入是否出错，中间的错误只留在
+   stderr（实测）。实测曾有 1200 条记录触发此错误；
+   因为出错的规则排在末尾，其他规则的命中实际没丢（去掉守卫重跑 fixtures，输出条数不变），
+   但规则顺序一变、或在前面加一条读多态字段的规则，排在它后面的规则就会整条丢失。
+   现在提取器已不读 `.toolUseResult`，这条留给将来加规则的人。同理 `message.content[]` 的元素
+   先过 `objects`，`.text` 缺失时用 `// ""` 兜底——数组里混入裸字符串或缺字段的块同样会抛错。
+5. **`is_error` 块的 `content` 可能是数组**（`[{"type":"text","text":…}]`）。直接 `tostring`
+   会以 `[` 开头，而 jq 的 `^` 在任何标志下都只匹配串首，锚定判据永远不命中。提取器先把数组
+   展开成各段 text 再匹配。抽样里 content 全是字符串，语料里有无数组形态未量。
 
 判据依赖英文消息串，Claude Code 改文案即失效——**这是已知脆弱点**，见 §7。
 
@@ -213,7 +282,7 @@ userModified:   false     ← 不是它
 **hook 返回的 `ask` 能穿透 `acceptEdits`。** 所以语料里 3507 次全为 `false` 的原因
 **不是**「模式压掉了弹窗」，而是没有任何 hook 强制 ask，而这两档模式本身就自动接受编辑。
 
-三次弹出的审批面板**一律只有 `Deny` 与 `Allow once` 两个按钮**，附一段 diff 预览，
+弹出的审批面板**一律只有 `Deny` 与 `Allow once` 两个按钮**，附一段 diff 预览，
 **没有任何修改提案的操作面**。
 
 > ⚠️ 这张表的前两行曾写成「被模式盖过、不弹窗」，是错的。错因不是判据写错，
@@ -227,7 +296,7 @@ userModified:   false     ← 不是它
 
 **对本格式的结论**：两个字段都不能用作人机分歧信号。这不是字段的问题，是这个工作流
 的形状——**人不碰文件，所以分歧不落在文件上，只落在对话上**（打断、拒绝工具调用）。
-现有三个 kind 恰好覆盖的就是对话侧，这个负结果反过来支持了当前设计。
+现有四个 kind 恰好覆盖的就是对话侧，这个负结果反过来支持了当前设计。
 
 ## 4. 审计记录 `audits/<patchId>.jsonl`
 
@@ -243,9 +312,18 @@ git diff-tree -p --root <sha> | git patch-id --stable | awk '{print $1}'
 | `--root` | 根 commit **静默返回空串**（不报错），整条记录锚在空 id 上 |
 | `-p` | 没有 patch 正文，`patch-id` 无输入 |
 
-写成 `<sha>^ <sha>` 也能work，但在根 commit 上 `fatal: ambiguous argument`。
+写成 `<sha>^ <sha>` 也能用，但在根 commit 上 `fatal: ambiguous argument`。
 `--root` 在普通 commit 上与之结果**逐字相同**（实测），所以无条件加它即可，
 不需要分支判断。
+
+⚠️ **merge commit 未定义。** `diff-tree -p` 对多父 commit 默认不输出 patch（要 `-m` / `-c`），
+于是 `patch-id` 同样**静默得空串**，与 `--root` 那个坑是同一种失效；加 `-m` 则每个**有非空 diff 的**
+父各出一个 id（实测：单侧变更的 `--no-ff` 合入只出一个）。`--allow-empty` 的空 commit 同样得空串。
+本格式不为 merge commit 与空 commit 定义锚。**patchId 为空串时**：写方跳过并告警；读方（Stop 闸门）
+**告警并放行**——它们本就无可审内容（merge 的 diff 属于被合入的各 commit），拦住只会把 agent 卡死在
+`merge --no-ff` 之后；读方绝不能拿 `audits/.jsonl` 当命中（否则谁写过一次，所有 merge / 空 commit
+就永远静默通过）。
+rebase + ff-only 的工作流里不会出现 merge，但 `merge --no-ff` 一次就会踩到。
 
 ```json
 {"t":"audit","v":1,"patchId":"7ecde6a6…","kind":"audit","sessionId":"0bf59c3d-…",
@@ -268,11 +346,12 @@ git diff-tree -p --root <sha> | git patch-id --stable | awk '{print $1}'
 1. **它是 0 字节**。294 个 marker 总字节数 0——只记「审过」，不记「审了什么、
    报了几个、几真几假」。于是「命中率 33-43%」这类数字只能人肉从对话里数，
    而对话会被压缩掉。改成有内容后，这些数字是**算出来的**。
-2. **SHA 锚会腐烂**。实测本仓 294 个 marker 中 **4 个的 SHA 已不存在**（98.6% 存活）。
+2. **SHA 锚会腐烂**。实测 agentDock 294 个 marker 中 **4 个的 SHA 已不存在**（98.6% 存活）。
    rebase + ff 的流程让腐烂很慢，但它是静默的——marker 还在，指向的 commit 没了。
    `patch-id` 实测跨 rebase 稳定（SHA 变、patch-id 不变）。
 
-O(1) 查询保留：Stop hook 仍是一次 `[ -f audits/<patchId>.jsonl ]`，只是多一步算 patch-id。
+O(1) 查询保留：Stop hook 仍是一次 `[ -f audits/<patchId>.jsonl ]`，只是多一步算 patch-id，
+且 patchId 为空串时告警放行、不查文件（§4）。
 
 ## 5. 稳定面
 
@@ -303,9 +382,19 @@ git-ai 标准里 `overriden_lines` 少了一个 d，shipped 之后成了既成�
 ## 7. 已知不解决
 
 - **squash 合流**下 §2 的 trailer 关联失效（`merge --squash` 完全解析不到，
-  `rebase -i` squash 只留最后一个）。本仓工作流是 rebase + ff-only，暂不受影响。
+  `rebase -i` squash 只留最后一个被 squash 的 commit 的 trailer）。agentDock 的工作流是 rebase + ff-only，
+  暂不受影响。
+- **merge commit 没有审计锚**（§4）。多父 commit 的 `patch-id` 为空串，写入方须跳过。
+- **trailer 记的是「谁执行了 commit」，不是「改动出自谁」**（§2）。人工提交 agent 写的代码
+  不带 trailer；一次 commit 含多个会话的改动时只记执行提交的那个。要追「这段改动出自哪个会话」
+  仍得回 transcript 按文件路径查。
+- **amend 的归属取「首次提交者」**：他人 amend agent 的 commit，trailer 保留原会话（幂等守卫）；
+  agent amend 人工 commit 则被记成 agent 的（原本没有 trailer，无从保留）。两者都实测；后者是否
+  合理未定——agent 确实改了这个 commit。
+- **`cherry-pick -n` 之后的 commit 与 `revert`** 按「谁执行了 commit」记（hook 运行时
+  `CHERRY_PICK_HEAD` / `REVERT_HEAD` 都不存在），与整个 cherry-pick「不沾」的行为不一致。实测、已知。
 - **判据依赖英文消息串**，Claude Code 改文案即静默失效。没有结构化字段可替代
-  （三个实现都这样做）。缓解只能是：判据集中在一处、配正负例回归、
+  （三个实现里唯一处理了中断的 SpecStory 也是字符串匹配）。缓解只能是：判据集中在一处、配正负例回归、
   数字突变时当作信号而非当作事实。
 - **`userModified` 在 desktop 客户端不可达**（见 §3.4，已交互实测定论）。
   它在别的客户端（提供「修改提案」能力的 IDE 扩展一类）会不会置真，超出本环境可验范围。

@@ -24,12 +24,12 @@ Claude Code 已经在写完整流水，无需自建采集层。以下实测数�
 | 模型思考 | `thinking` block 全文 |
 | 文件改动 | `structuredPatch` + `oldString` / `newString` / `originalFile`（另有 `userModified` / `staleRecovered`，见 §2.4 —— 都不可用）|
 | 命令执行 | `stdout` / `stderr` / `interrupted` / `returnCodeInterpretation` |
-| 子 agent | `<sessionId>/subagents/agent-*.jsonl` 独立完整 transcript + `.meta.json`（`agentType` / `description` / `toolUseId`） |
+| 子 agent | `<sessionId>/subagents/agent-*.jsonl` 独立完整 transcript + `.meta.json`（`agentType` / `description` / `toolUseId`；2.1.202 实测。2.1.85 的样本里只有前两项，2.1.260 另多 `spawnDepth`——字段集随版本变） |
 | 人的动作 | `queue-operation`（排队、中断）、`Request interrupted by user`、`origin.kind` |
 
 体量：agentDock 的 transcript 已累积 406MB，单 session 最大 106MB / 49341 行。
 
-**断链一：commit ↔ session 无关联。** 实测全仓 0 个 session trailer
+**断链一：commit ↔ session 无关联。** 实测 agentDock 全仓 0 个 session trailer
 （`git log --all --format=%B | grep -cE "^(Claude-Session|Session-Id|Transcript):"` → 0）。
 拿到一个 commit 无法反查产出它的对话。`git blame` 只到行，到不了意图。
 
@@ -46,7 +46,8 @@ Claude Code 已经在写完整流水，无需自建采集层。以下实测数�
 > 本条最初写的是「`userModified: true` 是机器可判的硬信号」。**该说法已被实测推翻**，
 > 见 §2.4。分歧信号在这个工作流里落在**对话侧**而非文件侧，L3 据此实现。
 
-（次要：`.gitignore:9` 排除 `.claude/projects/`，换机器即丢。）
+（次要：transcript 在 `~/.claude/projects/`，在任何仓库之外、不入 git，换机器即丢。
+此处原写「`.gitignore:9` 排除 `.claude/projects/`」——仓库的 .gitignore 管不到 home 目录，因果不成立，已删。）
 
 ## 2. 实测结论（2026-09-08，本机 + 本 worktree）
 
@@ -116,7 +117,7 @@ Q5 曾倾向采纳。**实际安装后否决**，理由是代价结构不适合�
 | 额外改动 | 装了 Cursor hooks + 扩展 `git-ai.git-ai-vscode`（未要求）|
 | 网络 | 守护进程当前**零对外连接**（未登录，发不出去）|
 
-我们只需要它的一件事——commit ↔ session 关联——而那件事 12 行 `prepare-commit-msg`
+我们只需要它的一件事——commit ↔ session 关联——而那件事一个不到十行的 `prepare-commit-msg`
 就能做（§3 L1）。放弃的行级归属与 `overriden_lines` 对应的是文件侧分歧，而 §2.4 已证明
 该维度在本工作流接近空。**为接近空的维度付 833MB 常驻，推广不成立。**
 
@@ -189,6 +190,16 @@ L1、L2 解决断链一与断链二，改动小。L3 是业内空白，已自建
 **570 处不带 sha、只有 18 处带**——脚本默认取 HEAD，所以绝大多数调用的命令原文里
 根本没有 sha 可抽。
 
+> ⚠️ **本节三组数字待在 agentDock 上重数**（2026-09-08 审计时发现；原始统计未留档，
+> 此处只标不改）：
+> - 570 + 18 = 588 > 402：「调用次数」与「带 / 不带 sha 的处数」口径不同，或有一处抄错；
+> - 上表四行合计 304 ≠ 294、百分比合计 103%：行与行不互斥（10 条强证据大概率同时落在
+>   mtime 匹配行里），或有一处抄错；
+> - marker 总数本文 §1 与 D3 标题写 637、上表与 spec §4.1 写 294，二者关系未记
+>   （目录下全部文件 vs `*.audit.done`？）。
+>
+> 结论（不迁移）不依赖这些数字的精确值：3% 量级的强证据怎么算都不够支撑迁移。
+
 **三个选项的实际代价**：
 
 - **(b) 迁成「SHA + 时间」= 零信息增量。** 文件名本身就是 SHA，mtime 本身就是时间。
@@ -225,7 +236,7 @@ CLAUDE.md 里的人工记述保留。这正是断链二要解决的问题本身�
 
 **已否决**（2026-09-08，实装后）。完整实测数据与理由见 §2.5。
 
-一句话：我们只需要它的 commit ↔ session 关联，而那件事 12 行 hook 就能做；
+一句话：我们只需要它的 commit ↔ session 关联，而那件事不到十行的 hook 就能做；
 它带来的 833MB 常驻本地库（含完整 prompt 正文、按待上传形状排队）对
 「推广给全体开发者」这个前提不成立。
 
@@ -242,11 +253,13 @@ CLAUDE.md 里的人工记述保留。这正是断链二要解决的问题本身�
 
 ## 5. 未决项
 
+审计遗留（待核数字、单方面定的决策、已知未修缺口）另记在 [OPEN-ISSUES.md](OPEN-ISSUES.md)，本节只记设计层。
+
 - ~~**O1**：git-ai 是否采纳~~ —— **已否决**，见 §2.5 / Q5。
 - **O2**：是否保留 SpecStory 作为人类可读副本与索引并存（Q3）。倾向不保留——
   粒度两头不着，且它 184K/session 的体量在「推广给全体开发者」下同样要算账。
 - ~~**O3**：`.claude/trace/` 的具体 schema~~ —— **已定**，见 [spec/trace-v1.md](spec/trace-v1.md)。
-- ~~**O4**：`brew trust specstoryai/tap`~~ —— 仅在 O2 取「采纳」时才需要，随 O2 倾向搁置。
+- **O4**：`brew trust specstoryai/tap` —— 仅在 O2 取「采纳」时才需要，随 O2 搁置；O2 定了它自动定。
 - ~~**O5**：git-ai 的 `telemetry_oss off` 是否进团队配置~~ —— 随 O1 否决而消失。
 - ~~**O6**：L2 迁移~~ —— **已定：不迁移**，见 D3。
 - **O7**：`core.hooksPath` 需每人 clone 后手动设一次（git 不允许仓库自动装 hook）。

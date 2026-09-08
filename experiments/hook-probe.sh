@@ -14,7 +14,8 @@
 #   3. 读同目录下的 hook-fired.log。
 #   4. 测完把 hooks 段删掉。
 #
-# 2026-09-08 在 Claude desktop app v2.1.202 实测通过，stdin 含：
+# 2026-09-08 在 Claude desktop app v2.1.202 实测通过，PostToolUse 的 stdin 含
+# （UserPromptSubmit 的字段集不同：没有 tool_* / duration_ms）：
 #   session_id / transcript_path / cwd / permission_mode / prompt_id /
 #   hook_event_name / tool_name / tool_input / tool_response / tool_use_id / duration_ms
 #

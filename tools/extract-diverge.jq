@@ -5,20 +5,35 @@
 # 铁律二：每条规则用 select(<布尔>) 而非 `X as $_ |`。后者因为 jq 中 `|` 优先级低于
 #         `,`，会让后续所有规则被吸进第一条的 body，前一条不命中则整程序静默返空。
 # 铁律三：条件里用 any(...) 而非 .[]? 展开，否则一条记录里多个块命中会 emit 多次。
-# 铁律四：取 .toolUseResult 的子字段前必须先判 type=="object"。它有时是 array 或 string，
-#         直接索引会抛错，而 jq 抛错会丢掉**整条记录**——连带该记录上其他规则的命中
-#         一起静默消失。实测这一条曾让 1200 条记录被丢弃。
+# 铁律四：取 .toolUseResult 这类多态字段的子字段前必须先判 type=="object"。它有时是 array
+#         或 string，直接索引会抛错。jq 抛错时该记录**抛错点之后的规则**全部不再求值（之前
+#         已输出的命中保留），然后继续下一条输入；退出码只反映最后一条输入。实测曾有 1200 条记录触发；
+#         当时出错规则排在末尾所以没丢命中，但规则顺序一变就会真丢。现在没有规则读
+#         .toolUseResult 了（user_edited_after_agent 已删，见 spec §3.1），这条留给加规则的人。
+# 铁律五：is_error 块的 content 可能是数组 [{"type":"text","text":…}]，直接 tostring 会以
+#         "[" 开头，而 jq 的 ^ 在任何标志下都只匹配串首——锚定判据永远不命中。必须先展开。
+# 铁律六：message.content[] 的元素先过 objects，.text 缺失时 // "" 兜底。数组里混入裸字符串
+#         或缺字段的块会让 .is_error / sub 抛错，后果同铁律四。
 
 def hit($kind; $human): {
+  t: "diverge",
   kind: $kind,
   human: $human,          # true = 人的决定；false = 机器/基础设施，不计入人机分歧
   at: .timestamp, turn: .uuid, sid: .sessionId, branch: .gitBranch
 };
 
+def errText:             # is_error 块的 content：字符串，或 text 块数组（铁律五）
+  if type == "array"
+  then [.[]? | if type == "string" then . else (.text? // empty) end | strings] | join("\n")
+  else tostring end;
+
 def errTexts:            # 本条记录里所有 is_error 块的正文
   if .type == "user" and (.message.content | type) == "array"
-  then [.message.content[]? | select(.is_error == true) | (.content | tostring)]
+  then [.message.content[]? | objects | select(.is_error == true) | (.content | errText)]
   else [] end;
+
+def isClassifier: test("denied by the Claude Code auto mode classifier") or test("Blocked by classifier");
+def isInfra:      test("Tool permission (request failed|stream closed)");
 
 def isHumanDenial:
   # 必须带 "m"：真实消息是
@@ -28,8 +43,7 @@ def isHumanDenial:
   #    按 PCRE 习惯写 "s" 会静默匹配失败，不报错。
   (test("^Permission to use .* has been denied"; "m") or
    test("^The user doesn't want to proceed with this tool use"))
-  and (test("Blocked by classifier") | not)
-  and (test("Tool permission (request failed|stream closed)") | not);
+  and (isClassifier | not) and (isInfra | not);   # 与规则 3/4 用同一对谓词，保证一条不会既算人拒又算机器拒
 
 # ---- 1. interrupt：人打断了 agent ----
 # 判据：去掉前导空白后**以标记开头**，而不是正文里含有该子串。
@@ -43,7 +57,7 @@ def isHumanDenial:
 def isInterruptText: (sub("^\\s+"; "")) | startswith("[Request interrupted by user");
 ( select(.type == "user" and (
     (((.message.content | type) == "array") and
-       any(.message.content[]?; .type == "text" and (.text | isInterruptText)))
+       any(.message.content[]? | objects; .type == "text" and ((.text // "") | isInterruptText)))
     or (((.message.content | type) == "string") and (.message.content | isInterruptText))
   )) | hit("interrupt"; true) ),
 
@@ -51,13 +65,10 @@ def isInterruptText: (sub("^\\s+"; "")) | startswith("[Request interrupted by us
 ( select(any(errTexts[]; isHumanDenial)) | hit("permission_denied"; true) ),
 
 # ---- 3. classifier_blocked：auto mode 分类器拒的，机器决定 ----
-( select(any(errTexts[]; test("denied by the Claude Code auto mode classifier")))
-  | hit("classifier_blocked"; false) ),
+( select(any(errTexts[]; isClassifier)) | hit("classifier_blocked"; false) ),
 
 # ---- 4. permission_infra_fail：权限链路本身失败，不是任何人的决定 ----
-( select(any(errTexts[]; test("Tool permission (request failed|stream closed)")))
-  | hit("permission_infra_fail"; false) ),
+( select(any(errTexts[]; isInfra)) | hit("permission_infra_fail"; false) )
 
-# ---- 5. user_edited_after_agent：模型改完，人又手改 ----
-( select((.toolUseResult | type) == "object" and .toolUseResult.userModified == true)
-  | hit("user_edited_after_agent"; true) )
+# （曾有第 5 条 user_edited_after_agent，读 .toolUseResult.userModified。已删：desktop 客户端里
+#   该字段不可能为真，见 spec §3.4。fixtures 里 n6-n8 / t9-t10 保留，继续守着「不读多态字段」。）
