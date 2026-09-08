@@ -97,6 +97,8 @@ ID 空间**，实测一例对不上。但 hook 直接给路径，绕开了这个
 | L3 | 人机分歧提取器：扫 transcript 出 `userModified` / 中断 / permission deny / 纠正话术 | 无 |
 | L4 | 可视化 / trace 导出 | L1-L3 有数据后 |
 
+落盘格式见 [spec/trace-v1.md](spec/trace-v1.md)。
+
 L1、L2 解决断链一与断链二，改动小。L3 是业内空白、需自建。
 L1 的行级部分可能被 git-ai 直接覆盖，采纳与否见 Q5。
 
@@ -188,6 +190,6 @@ dashboard 复制安装命令时才带。裸跑 `install.sh` 时 `NEED_LOGIN` 恒
 
 - **O1**：git-ai 是否采纳。阻碍见 Q5，需本人执行安装。
 - **O2**：是否保留 SpecStory 作为人类可读副本与索引并存（Q3）。
-- **O3**：`.claude/trace/` 的具体 schema（字段、文件切分、与 `.claude/audit/` 的关系）。
+- ~~**O3**：`.claude/trace/` 的具体 schema~~ —— **已定**，见 [spec/trace-v1.md](spec/trace-v1.md)。
 - **O4**：`brew trust specstoryai/tap` 的供应链信任决定——仅在 O2 取「采纳」时才需要。
 - **O5**：若采纳 git-ai，是否把 `telemetry_oss off` 写进团队统一配置而非依赖各人手动关。
