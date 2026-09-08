@@ -141,12 +141,20 @@ userModified:   false     ← 不是它
 
 | 权限模式 | 闸门返回 ask | 是否弹审批 | `userModified` |
 |---|---|---|---|
-| `auto` | ✅ | ❌ 被模式盖过 | false |
-| `acceptEdits` | ✅ | ❌ 被模式盖过 | false |
-| `default`（UI 名 Manual） | ✅ | ✅ 弹出 | false |
+| `acceptEdits` | ✅ | ✅ 弹出（截图确认） | false |
+| `default`（UI 名 Manual） | ✅ | ✅ 弹出（截图确认） | false |
+| `auto` | ✅ | 未确认 | false |
 
-弹出的审批面板**只有 `Deny` 与 `Allow once` 两个按钮**，附一段 diff 预览，
+**hook 返回的 `ask` 能穿透 `acceptEdits`。** 所以语料里 3507 次全为 `false` 的原因
+**不是**「模式压掉了弹窗」，而是没有任何 hook 强制 ask，而这两档模式本身就自动接受编辑。
+
+三次弹出的审批面板**一律只有 `Deny` 与 `Allow once` 两个按钮**，附一段 diff 预览，
 **没有任何修改提案的操作面**。
+
+> ⚠️ 这张表的前两行曾写成「被模式盖过、不弹窗」，是错的。错因不是判据写错，
+> 而是**拿「我没观察到弹窗」当成了「弹窗没出现」**——审批弹窗根本不出现在
+> agent 的工具结果里，agent 没有观察它的通道。凡是「某事没发生」的断言，
+> 先问一句「我有没有能观察到它发生的通道」。
 
 **结论：在 Claude desktop 客户端里 `userModified` 不可能为真**——不是没触发到条件，
 是这个客户端不提供「改动 Claude 提出的编辑」这个动作。该字段大概率服务于提供该能力的
