@@ -18,8 +18,9 @@ Claude Code 已经在写完整的会话流水（thinking 全文、每次 Edit �
 
 ## 状态
 
-**方案设计中，未实施。** 见 [DESIGN.md](DESIGN.md)：问题定义、实测结论、
-已定决策的 FAQ、未决项。
+见 [CAPABILITIES.md](CAPABILITIES.md)：有哪些功能、怎么实现的、还缺什么。
+见 [DESIGN.md](DESIGN.md)：问题定义、实测结论、已定决策的 FAQ、未决项。
+见 [spec/trace-v1.md](spec/trace-v1.md)：留痕数据的落盘格式。
 
 已经实测确立的地基（`experiments/` 可复现）：Claude Code 的 hook 在 **desktop app
 下正常触发且热加载**，stdin 直接给出 `transcript_path`。这决定了工具选型的硬约束——
