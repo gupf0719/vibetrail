@@ -291,7 +291,8 @@ teamai 只存聚合计数和脱敏摘要，**没有回跳锚点**——它的用
 然后 Claude 每次对话写代码的时候自动上报两路信息」。对方的做法在分析文档 §4.4
 （一次 `init` 写四个 harness hook、一个入口分发）和 §4.3（self 模式把 `.claude/settings.json`
 连 hooks 提交到 main，clone 即得）。现状、要动什么、以及「两路」待确认，都只记在
-[OPEN-ISSUES.md](../OPEN-ISSUES.md) 中心表 G7，此处不重复。
+[OPEN-ISSUES.md](../OPEN-ISSUES.md) 中心表 G7，此处不重复。同日追加的 G8（采集限定在指定项目）、
+G9（本地能看采集了什么、让开发放心）同样以 teamai 为参照，也只记在中心表。
 
 ### 6.1 脱敏（`redact()`）—— 建议列入待办
 
