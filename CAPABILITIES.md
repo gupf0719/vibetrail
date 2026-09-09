@@ -32,7 +32,8 @@
 一张图看五段：**接入**每个 clone 一次；**开发**时 Claude Code 自己写流水，并把会话 id 注入
 每次 Bash 调用的环境；**提交**时 hook 把这个 id 写进 commit message；**投影**把流水里跨会话
 仍有价值的部分固化进仓；**查询**按 sid 与 patch-id 把三处数据接回去。
-实线已实现，虚线未实现（中心表 G2 / L2）；圆柱是数据落点，三处里只有 transcript 不入仓。
+实线已实现；唯一一条虚线是还没接上的一段（查询端尚未读 sessions 文件）。
+圆柱是数据落点，三处里只有 transcript 不入仓。
 
 ```mermaid
 %%{init: {"flowchart": {"wrappingWidth": 320}}}%%
@@ -59,9 +60,9 @@ flowchart TB
     end
 
     subgraph S3["④ 投影 —— &lt;repo&gt;/.claude/trace/，入仓随代码走；只存指针（D2）"]
-        DV["diverge 事件<br/>时间戳 + turn uuid 指针<br/>human=true：interrupt · permission_denied<br/>human=false：classifier_blocked<br/>　　　　　　　permission_infra_fail"]
-        DV -.->|"写入者未定义（G2）"| SF[("sessions/&lt;sid&gt;.jsonl")]
-        MA["mark-audit.sh<br/>从 touch 改为写结构化记录<br/>锚 = git diff-tree -p --cc --root<br/>⇒ git patch-id --stable"] -.->|"未实现（L2）"| AF[("audits/&lt;patchId&gt;.jsonl")]
+        DV["diverge 事件<br/>时间戳 + turn uuid 指针<br/>human=true：interrupt<br/>　interrupt_for_tool_use · permission_denied<br/>human=false：classifier_blocked<br/>　permission_infra_fail"]
+        DV -->|"tools/vibetrail-sync 事后跑<br/>按 worktree 清单认领会话<br/>幂等，整份重生成"| SF[("sessions/&lt;sid&gt;.jsonl<br/>头 · 分歧 · end 汇总")]
+        MA["tools/vibetrail-audit record<br/>审完把 findings 与判定写成记录<br/>锚 = git diff-tree -p --cc --root<br/>⇒ git patch-id --stable"] -->|"替代 0 字节 marker"| AF[("audits/&lt;patchId&gt;.jsonl<br/>stats 直接算命中率")]
     end
 
     subgraph S4["⑤ 查询 / 复盘 —— tools/vibetrail；三处来源各自可缺、缺了降级"]
@@ -74,6 +75,7 @@ flowchart TB
     CM -->|"读 trailer 得 sid<br/>git log --all 按 sid<br/>反查同会话 commit"| Q
     DV -->|"同一个 jq 现算<br/>transcript 不在本机<br/>则只剩摘要"| Q
     AF -->|"按 patch-id 找文件"| Q
+    SF -.->|"查询端尚未读它"| Q
 
     IN ~~~ H
     DR ~~~ H
