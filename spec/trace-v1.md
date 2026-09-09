@@ -18,14 +18,14 @@ transcript 没了就只剩摘要——这是**有意的取舍**，不是缺陷�
 |---|---|---|
 | commit ↔ session 的关联 | **commit message trailer** | 见 §2 |
 | 会话流水 | `sessionId` | 会话是**不可变的历史事实**，永不需要迁移 |
-| 审计记录 | **`git patch-id --stable`** | 见 §4 |
+| 审计记录 | **`Vibetrail-Id` trailer** | 见 §4 |
 
 ### 1.1 目录
 
 ```
 <repo>/.claude/trace/
 ├── sessions/<sessionId>.jsonl      # 会话流水
-└── audits/<patchId>.jsonl          # 审计记录
+└── audits/<vibetrailId>.jsonl      # 审计记录
 ```
 
 `sessions/` 下每个 session 只写**自己那个文件**，并发会话之间不会冲突，也不需要读-改-写。
@@ -51,11 +51,27 @@ Claude-Session: 0bf59c3d-59dc-416c-b21d-9137feef79af
 
 ```bash
 #!/bin/bash
-[ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || exit 0     # 人工提交：变量不存在，直接跳过
+# 写两个 trailer，条件不同：
+#   Vibetrail-Id   —— 审计锚，**每个 commit 都要有**（人工提交也会被闸门要求审计）
+#   Claude-Session —— 归属，只有 agent 提交才有（人工提交没有会话）
+#
+# 为什么锚是 trailer 而不是从内容推导：内容推导的锚（patch-id）在 rebase 改动上下文时
+# 就会变，冲突 rebase 下必变——恰好是最需要它稳定的场景。trailer 在 message 里，
+# git 重放时原样搬运，于是「跨重写迁移」这件事根本不存在。
 g=$(git rev-parse --git-dir)                       # 重放别人的 commit（rebase / cherry-pick）不改归属
 { [ -d "$g/rebase-merge" ] || [ -d "$g/rebase-apply" ] || [ -f "$g/CHERRY_PICK_HEAD" ]; } && exit 0
 sed '/^# -* >8 -*$/,$d' "$1" | grep -q -v -e '^[[:space:]]*$' -e '^#' || exit 0   # 截掉 scissors 后为空：让 git 照常拒绝（见 §2.0 注）
 [ -n "$(tail -c1 "$1")" ] && echo >> "$1"          # 非编辑器路径的 merge（--no-edit / -m）没有末尾换行
+newid(){                                           # 可移植的 uuid
+    if command -v uuidgen >/dev/null 2>&1; then uuidgen | tr 'A-Z' 'a-z'
+    elif [ -r /proc/sys/kernel/random/uuid ]; then cat /proc/sys/kernel/random/uuid
+    else printf '%s%s%s' "$(date -u +%s)" "${RANDOM}" "$$" | shasum | cut -c1-32; fi
+}
+# --if-exists doNothing 保证幂等：已有 id 的 message 再过一次 hook 不会被换掉
+git interpret-trailers --in-place --no-divider --if-exists doNothing \
+    --trailer "Vibetrail-Id=$(newid)" "$1"
+
+[ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || exit 0     # 以下只对 agent 提交
 git interpret-trailers --in-place --no-divider --if-exists doNothing \
     --trailer "Claude-Session=$CLAUDE_CODE_SESSION_ID" "$1"   # 并入已有 trailer 块；已有则不动（幂等）
 ```
@@ -311,93 +327,73 @@ userModified:   false     ← 不是它
 的形状——**人不碰文件，所以分歧不落在文件上，只落在对话上**（打断、拒绝工具调用）。
 现有四个 kind 恰好覆盖的就是对话侧，这个负结果反过来支持了当前设计。
 
-## 4. 审计记录 `audits/<patchId>.jsonl`
+## 4. 审计记录 `audits/<vibetrailId>.jsonl`
+
+锚是 commit message 里的 trailer：
+
+```
+Vibetrail-Id: 8cfb718c-f3d2-4945-bf58-97e8b9acdd6b
+```
+
+由 `prepare-commit-msg` 写入（与 `Claude-Session` 同一个 hook），读取：
 
 ```bash
-git diff-tree -p --cc --root <sha> | git patch-id --stable | awk 'NR==1{print $1}'
+git log -1 --format='%(trailers:key=Vibetrail-Id,valueonly)' <sha>
 ```
 
-四个参数都是必需的，各挡一个坑（都实测过）：
+### 4.0 为什么锚在 message 里，而不是从内容算
 
-| 参数 | 去掉会怎样 |
-|---|---|
-| `--stable` | 结果在不同 git 版本间不保证一致 |
-| `--root` | 根 commit **静默返回空串**（不报错），整条记录锚在空 id 上 |
-| `-p` | 没有 patch 正文，`patch-id` 无输入 |
-| `--cc` | **有冲突解决的 merge 会返回空**，整个 merge 溜过审计闸门（见下表）|
+**「跨历史重写迁移」这件事被消掉了，而不是被解决了。** trailer 在 commit message 里，
+git 重放（rebase / amend / cherry-pick）时原样搬运，锚根本不变——没有「旧锚 → 新锚」
+的映射需要维护。
 
-### 4.0 五种 commit 的锚，以及空锚怎么办
+这一版之前用的是 `git patch-id`，换掉它的理由不是它有 bug，是**它在最需要稳定的场景
+必然失效**：
 
-| commit 类型 | 锚 | 读方（Stop 闸门） |
+| 场景 | patch-id | trailer |
 |---|---|---|
-| 根 commit | 有值 | 照常要求审计 |
-| 普通 commit | 有值 | 照常要求审计 |
-| 无冲突 merge | **空** | **放行** |
-| **有冲突解决的 merge** | **有值**（内容恰为冲突解决部分）| 照常要求审计 |
-| `--allow-empty` | **空** | **放行** |
+| 无冲突 rebase | 不变 | 不变 |
+| **上下文行被别人改过** | **变**（实测；`git-patch-id` 文档亦如此说）| 不变 |
+| **冲突 rebase** | **必变**（冲突一定伴随上下文变化）| **不变**（实测）|
+| merge commit | 需 `--cc`，而 `patch-id` 不认 combined diff 的 `@@@` 头，只把文件头三行喂进哈希 ⟹ 锚 = f(首个冲突文件路径)，两个内容毫不相干的解决算出同一个值（实测）| 一视同仁 |
 
-**加 `--cc` 对普通与根 commit 的结果逐字相同**（实测），所以无条件加即可，
-读方不需要按 commit 类型分支——**那正是「两处判据必须保持一致」的坑**。
+「跨 rebase 稳定」是当初选 patch-id 的**全部理由**，而它恰好在冲突 rebase 下不成立。
 
-**空锚 = 放行**，理由不是「拦不住就放」，而是**确实没有可归属的内容**。
-git-ai 标准 §2.2 对同一问题的规定是：无冲突的 merge commit *"MAY have an empty
-authorship log"*，而 merge 的归属 *"MUST only contain attributions for conflict
-resolution changes"*——两者一致。
+### 4.1 三个必须知道的代价
 
-⚠️ **一个被实测排除的备选**：曾考虑用 `diff-tree -m --first-parent` 给 merge 造退化锚。
-不可行——它算出的 patch-id **与被合入的那个 commit 的 patch-id 完全相同**，
-merge 与被合入 commit 会共用一条审计记录，审了一个等于标了另一个。
+| 代价 | 说明 |
+|---|---|
+| **cherry-pick 共用锚** | 复制 message ⟹ 两个 commit 同一个锚，审一个等于标了另一个。Gerrit 的 Change-Id 把这当**特性**（同一个逻辑变更），审计语义上也成立。哨兵 T13 钉住，防将来悄悄变 |
+| **`merge --squash` 丢锚** | 原 message 缩进进 body，`%(trailers:)` 解析不到。本仓 1760 个 commit 实测 **0 次 squash**；用 squash 合流的项目不适用本节 |
+| **不能追溯** | 装 hook 之前的 commit 没有锚。闸门按 fail-closed 拦住并提示装 hook（哨兵 T14），不当作「无需审计」放行 |
 
-写成 `<sha>^ <sha>` 也能用，但在根 commit 上 `fatal: ambiguous argument`。
-`--root` 在普通 commit 上与之结果**逐字相同**（实测），所以无条件加它即可，
-不需要分支判断。
+### 4.2 锚有两道独立防护
 
-⚠️ **merge commit 未定义。** `diff-tree -p` 对多父 commit 默认不输出 patch（要 `-m` / `-c`），
-于是 `patch-id` 同样**静默得空串**，与 `--root` 那个坑是同一种失效；加 `-m` 则每个**有非空 diff 的**
-父各出一个 id（实测：单侧变更的 `--no-ff` 合入只出一个）。`--allow-empty` 的空 commit 同样得空串。
-本格式不为 merge commit 与空 commit 定义锚。**patchId 为空串时**：写方跳过并告警；读方（Stop 闸门）
-**告警并放行**——它们本就无可审内容（merge 的 diff 属于被合入的各 commit），拦住只会把 agent 卡死在
-`merge --no-ff` 之后；读方绝不能拿 `audits/.jsonl` 当命中（否则谁写过一次，所有 merge / 空 commit
-就永远静默通过）。
-rebase + ff-only 的工作流里不会出现 merge，但 `merge --no-ff` 一次就会踩到。
+1. hook 在 rebase / cherry-pick 时**早退**，不碰重放的 message
+2. `git interpret-trailers --if-exists doNothing` **幂等**，已有 id 不覆写
 
-```json
-{"t":"audit","v":1,"patchId":"7ecde6a6…","kind":"audit","sessionId":"0bf59c3d-…",
- "at":"…","shaAtTime":"71427ba…","subject":"docs: 开发过程留痕方案",
- "agents":[{"type":"general-purpose","perspective":"并发共享态","findings":3}],
- "findings":[
-   {"id":"H1","severity":"HIGH","claim":"NewSharedChildSession 共享 values 但 mu 独立",
-    "verdict":"confirmed","fix":"<sha 或说明>"},
-   {"id":"H2","severity":"HIGH","claim":"Resume 未校验 GraphID",
-    "verdict":"false-positive","why":"上游已在 Run 入口 fail-fast"}]}
-```
+两道各自都能保住锚。代价是**单独破坏任何一道，测试都不会红**——sanity-revert 时
+必须两道同时破坏才见得到 T7/T13 转红（实测）。这是「双层防护遮蔽」的实例，
+改这段代码时留意。
 
-`shaAtTime` 是**写入当时**的 SHA，仅作人读线索，**rebase 后会失效，不要拿它做关联**。
-关联一律走 `patchId`。
+### 4.3 为什么不照抄 git-ai 的 SHA + `post-rewrite`
 
-### 4.1 为什么换掉现在的 `<sha>.audit.done`
+git-ai 锚在 commit SHA 上，靠 `post-rewrite` hook 拿 git 给的精确「旧 sha → 新 sha」
+映射（实测冲突 rebase 下映射准确）。那条路可行，但对我们多一层机制：要再装一个 hook、
+要写迁移逻辑、还留着「重写发生时 hook 没跑」的洞（另一个 clone、CI、`filter-branch`）。
 
-两个问题：
-
-1. **它是 0 字节**。294 个 marker 总字节数 0——只记「审过」，不记「审了什么、
-   报了几个、几真几假」。于是「命中率 33-43%」这类数字只能人肉从对话里数，
-   而对话会被压缩掉。改成有内容后，这些数字是**算出来的**。
-2. **SHA 锚会腐烂**。实测 agentDock 294 个 marker 中 **4 个的 SHA 已不存在**（98.6% 存活）。
-   rebase + ff 的流程让腐烂很慢，但它是静默的——marker 还在，指向的 commit 没了。
-   `patch-id` 实测跨 rebase 稳定（SHA 变、patch-id 不变）。
-
-O(1) 查询保留：Stop hook 仍是一次 `[ -f audits/<patchId>.jsonl ]`，只是多一步算 patch-id，
-且 patchId 为空串时告警放行、不查文件（§4）。
+trailer 这条路把这三样都省掉了。代价是上面 §4.1 那三条——我们的工作流（rebase + ff-only、
+0 次 squash）正好落在它的适用区间内。
 
 ## 5. 稳定面
 
 以下属于公开约定，**变更需要升 `v`**：
 
-- 目录布局：`sessions/<sessionId>.jsonl`、`audits/<patchId>.jsonl`
+- 目录布局：`sessions/<sessionId>.jsonl`、`audits/<vibetrailId>.jsonl`
 - 每行一个 JSON 对象，`t` 为类型判别字段
 - 已定义的 `t` 取值：`session` / `diverge` / `end` / `audit`
 - `Claude-Session` 这个 trailer 键名
-- patch-id 用 `git patch-id --stable` 计算
+- 审计锚取自 commit message 的 `Vibetrail-Id` trailer
 
 以下**不属于**稳定面，可随时增补而不升版本：
 
@@ -420,7 +416,9 @@ git-ai 标准里 `overriden_lines` 少了一个 d，shipped 之后成了既成�
 - **squash 合流**下 §2 的 trailer 关联失效（`merge --squash` 完全解析不到，
   `rebase -i` squash 只留最后一个被 squash 的 commit 的 trailer）。agentDock 的工作流是 rebase + ff-only，
   暂不受影响。
-- **merge commit 没有审计锚**（§4）。多父 commit 的 `patch-id` 为空串，写入方须跳过。
+- **没有锚的 commit 无法记录审计**（§4）：装 hook 之前的 commit、以及 message 被手改
+  删掉 trailer 的 commit。闸门对这类按 fail-closed 拦住并提示装 hook，不放行。
+  （merge commit 现在**有**锚——hook 对 merge 同样写 trailer，这与上一版相反。）
 - **trailer 记的是「谁执行了 commit」，不是「改动出自谁」**（§2）。人工提交 agent 写的代码
   不带 trailer；一次 commit 含多个会话的改动时只记执行提交的那个。要追「这段改动出自哪个会话」
   仍得回 transcript 按文件路径查。
