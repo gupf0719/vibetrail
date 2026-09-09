@@ -13,35 +13,16 @@ OUT=.claude/trace/audits
 
 # 与 spec §4 逐字一致的锚。--cc 让有冲突解决的 merge 也有锚；普通与根 commit 结果不变。
 anchor(){
-    # 返回 0 = 算出来了（值在 stdout）；非 0 = 算不出来。两者必须分开：
-    # 命令替换 $(anchor …) 会丢掉退出码，只看 stdout 的话，任何让管道输出为空的
-    # 故障（缺 awk、git 报错、对象不可读）都会退化成「空锚」，而空锚曾被当作放行
-    # —— 故障静默变成通过。pipefail 要在子 shell 内显式开，外层的管不到 $() 里面。
-    local out st np
-    np=$(git rev-list --parents -n1 "$1" 2>/dev/null | wc -w | tr -d ' ')   # 1 + 父数
-    if [ "${np:-0}" -gt 2 ] 2>/dev/null; then
-        # merge：git patch-id 的输入契约里没有 combined diff——它认的 hunk 头是
-        # @@ ... @@，而 --cc 出的是 @@@ ... @@@，匹配不上就当 patch 结束，于是只把
-        # 文件头三行喂进了哈希。结果锚 = f(首个冲突文件路径)，与冲突解决内容无关：
-        # 实测两个内容毫不相干的解决算出同一个值。改直接哈希 combined diff 正文。
-        # 代价：merge 的锚不抗 rebase——但冲突解决本来就不抗（重解出的 patch 真的不同）。
-        local body
-        body=$(git diff-tree -p --cc --no-commit-id --root "$1" 2>/dev/null) || return 1
-        # 无冲突的 merge：combined diff 为空，哈希会是个常量——那不是锚，是「没有锚」
-        [ -z "$body" ] && { printf ''; return 0; }
-        out=$(set -o pipefail
-              printf '%s' "$body" \
-                | { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } \
-                | awk '{print $1}' 2>/dev/null); st=$?
-        [ $st -ne 0 ] && return 1
-    else
-        out=$(set -o pipefail
-              git diff-tree -p --root "$1" 2>/dev/null \
-                | git patch-id --stable 2>/dev/null \
-                | awk 'NR==1{print $1}' 2>/dev/null); st=$?
-        [ $st -ne 0 ] && return 1
-    fi
-    printf '%s' "$out"
+    # 锚 = commit message 里的 Vibetrail-Id trailer。
+    # 返回 0 = 拿到了；非 0 = 判不出来（没装 hook / commit 早于安装 / message 被手改）。
+    # 不再从内容推导：patch-id 认不出 combined diff，且 rebase 改动上下文就会变；
+    # trailer 随 message 被 git 原样重放，rebase / amend / cherry-pick 全部存活，
+    # 因此没有「旧锚→新锚」的迁移问题。代价见 spec §4。
+    local id
+    id=$(git log -1 --format='%(trailers:key=Vibetrail-Id,valueonly)' "$1" 2>/dev/null) || return 1
+    id=$(printf '%s' "$id" | head -1 | tr -d '[:space:]')
+    [ -n "$id" ] || return 1
+    printf '%s' "$id"
     return 0
 }
 

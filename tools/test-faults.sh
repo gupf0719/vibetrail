@@ -73,23 +73,48 @@ sz=0; [ "$n" -gt 0 ] && sz=$(wc -c < "$(ls "$d/.claude/trace/audits/"*.jsonl|hea
 [ "$sz" = 0 ] && [ "$n" -gt 0 ] && r T5 "空输入不得落下 0 字节残骸" RED || r T5 "空输入不得落下 0 字节残骸" GREEN
 rm -rf "$d"
 
-echo "════ 锚：必须是冲突解决内容的函数 ════"
-mkmerge(){ # 造一个有冲突解决的 merge，解决成 $2
-    local d=$1 c=$2
+echo "════ 锚：必须跨历史重写存活 ════"
+mkrepo(){ # 装了 hook 的空仓
+    local d; d=$(mktemp -d)
     ( cd "$d" && git init -q -b main && git config user.email t@t && git config user.name t
-      echo base > f.md && git add -A && git commit -q -m base
-      git checkout -q -b s && echo side > f.md && git commit -q -am s
-      git checkout -q main && echo mine > f.md && git commit -q -am m
-      git merge s >/dev/null 2>&1; echo "$c" > f.md; git add -A && git commit -q --no-edit )
+      mkdir -p .git/hooks && cp "$SELF/prepare-commit-msg" .git/hooks/ && chmod +x .git/hooks/prepare-commit-msg )
+    echo "$d"
 }
-# 调真实现，不在测试里复制一份算法 —— 复制品不会跟着修，测的就成了拷贝而非被测对象。
-anchor(){ ( cd "$1" && bash "$SELF/vibetrail-audit" anchor HEAD 2>/dev/null ); }
-a=$(mktemp -d); b=$(mktemp -d); mkmerge "$a" "解决方案甲"; mkmerge "$b" "解决方案乙-完全不同"
-[ "$(anchor "$a")" != "$(anchor "$b")" ] && r T6 "两个不同的冲突解决 → 锚必须不同" GREEN || r T6 "两个不同的冲突解决 → 锚必须不同" RED
-c=$(mktemp -d); mkmerge "$c" "解决方案甲"
-# T7 只有在 T6 绿之后才承重：现在所有冲突 merge 的锚都相同，它恒真。
-[ "$(anchor "$a")" = "$(anchor "$c")" ] && r T7 "相同的冲突解决 → 锚必须相同" GREEN || r T7 "相同的冲突解决 → 锚必须相同" RED
-rm -rf "$a" "$b" "$c"
+anc(){ ( cd "$1" && bash "$SELF/vibetrail-audit" anchor "${2:-HEAD}" 2>/dev/null ); }
+
+# T6 两个不同的 commit 必须有不同的锚
+d=$(mkrepo); ( cd "$d" && echo a > f && git add -A && git commit -q -m one && echo b >> f && git commit -q -am two )
+[ "$(anc "$d" HEAD)" != "$(anc "$d" HEAD~1)" ] && r T6 "两个不同 commit → 锚必须不同" GREEN || r T6 "两个不同 commit → 锚必须不同" RED
+rm -rf "$d"
+
+# T7 冲突 rebase 后锚必须不变 —— 这是换锚的全部理由，patch-id 在此必失效
+d=$(mkrepo)
+( cd "$d" && printf 'l1\nl2\nl3\nTARGET\n' > f && git add -A && git commit -q -m base
+  git checkout -q -b feat && sed -i '' 's/TARGET/CHANGED/' f 2>/dev/null || sed -i 's/TARGET/CHANGED/' f
+  git commit -q -am "改 TARGET" )
+before=$(anc "$d")
+( cd "$d" && git checkout -q main && { sed -i '' 's/^l3$/l3-改过/' f 2>/dev/null || sed -i 's/^l3$/l3-改过/' f; }
+  git commit -q -am "改上下文" && git checkout -q feat
+  git -c core.editor=true rebase main >/dev/null 2>&1 || {
+    printf 'l1\nl2\nl3-改过\nCHANGED\n' > f; git add f
+    GIT_EDITOR=true git rebase --continue >/dev/null 2>&1; } )
+after=$(anc "$d")
+[ -n "$before" ] && [ "$before" = "$after" ] && r T7 "冲突 rebase 后锚必须不变" GREEN || r T7 "冲突 rebase 后锚必须不变" RED
+rm -rf "$d"
+
+# T13 cherry-pick 共用锚 —— 有意为之（同一逻辑变更），钉住以防将来悄悄变
+d=$(mkrepo)
+( cd "$d" && echo base > f && git add -A && git commit -q -m base
+  git checkout -q -b s && echo x > g && git add g && git commit -q -m 加g
+  git checkout -q main && git cherry-pick s >/dev/null 2>&1 )
+[ -n "$(anc "$d")" ] && [ "$(anc "$d")" = "$( cd "$d" && bash "$SELF/vibetrail-audit" anchor s 2>/dev/null )" ] \
+  && r T13 "cherry-pick 与原 commit 共用锚（有意）" GREEN || r T13 "cherry-pick 与原 commit 共用锚（有意）" RED
+rm -rf "$d"
+
+# T14 没装 hook 的 commit 没有锚 → 闸门必须拦（不能当作「无需审计」放行）
+d=$(mkfix); ( cd "$d" && rm -f "$(git rev-parse --git-path hooks)/prepare-commit-msg" ); risky "$d"
+[ -z "$(anc "$d")" ] && blocked "$d" && r T14 "没有锚的 commit → 闸门必须拦" GREEN || r T14 "没有锚的 commit → 闸门必须拦" RED
+rm -rf "$d"
 
 echo "════ 自检：doctor 必须能发现自己被破坏 ════"
 d=$(mkfix); risky "$d"; printf '\n# drift\n' >> "$d/.claude/vibetrail/vibetrail"

@@ -1,8 +1,24 @@
 #!/bin/bash
-[ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || exit 0     # 人工提交：变量不存在，直接跳过
+# 写两个 trailer，条件不同：
+#   Vibetrail-Id   —— 审计锚，**每个 commit 都要有**（人工提交也会被闸门要求审计）
+#   Claude-Session —— 归属，只有 agent 提交才有（人工提交没有会话）
+#
+# 为什么锚是 trailer 而不是从内容推导：内容推导的锚（patch-id）在 rebase 改动上下文时
+# 就会变，冲突 rebase 下必变——恰好是最需要它稳定的场景。trailer 在 message 里，
+# git 重放时原样搬运，于是「跨重写迁移」这件事根本不存在。
 g=$(git rev-parse --git-dir)                       # 重放别人的 commit（rebase / cherry-pick）不改归属
 { [ -d "$g/rebase-merge" ] || [ -d "$g/rebase-apply" ] || [ -f "$g/CHERRY_PICK_HEAD" ]; } && exit 0
 sed '/^# -* >8 -*$/,$d' "$1" | grep -q -v -e '^[[:space:]]*$' -e '^#' || exit 0   # 截掉 scissors 后为空：让 git 照常拒绝（见 §2.0 注）
 [ -n "$(tail -c1 "$1")" ] && echo >> "$1"          # 非编辑器路径的 merge（--no-edit / -m）没有末尾换行
+newid(){                                           # 可移植的 uuid
+    if command -v uuidgen >/dev/null 2>&1; then uuidgen | tr 'A-Z' 'a-z'
+    elif [ -r /proc/sys/kernel/random/uuid ]; then cat /proc/sys/kernel/random/uuid
+    else printf '%s%s%s' "$(date -u +%s)" "${RANDOM}" "$$" | shasum | cut -c1-32; fi
+}
+# --if-exists doNothing 保证幂等：已有 id 的 message 再过一次 hook 不会被换掉
+git interpret-trailers --in-place --no-divider --if-exists doNothing \
+    --trailer "Vibetrail-Id=$(newid)" "$1"
+
+[ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || exit 0     # 以下只对 agent 提交
 git interpret-trailers --in-place --no-divider --if-exists doNothing \
     --trailer "Claude-Session=$CLAUDE_CODE_SESSION_ID" "$1"   # 并入已有 trailer 块；已有则不动（幂等）
