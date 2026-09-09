@@ -16,10 +16,12 @@
 | 人机分歧提取 | ✅ **已实现** | `tools/extract-diverge.jq` |
 | 分歧判据回归测试 | ✅ **已实现** | `tools/fixtures.jsonl` + `tools/test-extract.sh` |
 | hook 机制探针 | ✅ **已实现** | `experiments/hook-probe.sh` |
-| commit ↔ session 接链 | 🔶 **机制已实测，未落地** | `prepare-commit-msg` + 环境变量 |
+| commit ↔ session 接链 | ✅ **已实现** | `tools/prepare-commit-msg`（12 场景回归 + 5 组变异验证）|
+| 接入 | ✅ **已实现** | `tools/vibetrail-install`（幂等）|
+| 留痕自检 | ✅ **已实现** | `tools/vibetrail-doctor` |
+| hook 回归测试 | ✅ **已实现** | `tools/test-hook.sh` |
 | 审计过程留痕 | ⬜ 未实现 | 改 `mark-audit.sh` |
-| 查询 / 复盘 | ⬜ **未实现，最大缺口** | 见 §3.1 |
-| 接入引导 | ⬜ 未实现 | 见 §3.4 |
+| 查询 / 复盘 | ⬜ **未实现，最大缺口** | 中心表 G1 |
 | 行级归属 | ❌ **已否决** | 见 [DESIGN.md §2.5](DESIGN.md) |
 
 ## 2. 实现原理
@@ -75,6 +77,27 @@ grep 原文会把「讨论」当成「发生」。实测对照：以本项目调
 **trailer 活过历史重写**：rebase ✅ cherry-pick ✅ ff-only ✅ no-ff merge ✅；squash ❌——
 `rebase -i` squash 只留最后一个被 squash 的 commit 的 trailer，`merge --squash` 原会话丢失、
 记成执行者（agentDock 1760 个 commit 里 0 次 squash，不受影响）。
+
+### 2.5 接入与自检
+
+**`tools/vibetrail-install`** 装 hook、写 `.gitattributes`、建 `.claude/trace/`，幂等可反复跑。
+
+关键决定是**装进有效 hooks 目录**（`git rev-parse --git-path hooks`）而**不是**
+`.githooks/` + 改 `core.hooksPath`：
+
+- `core.hooksPath` 可能已被别人占用——实测 agentDock 的 worktree 工具就在主仓 config
+  和**每个** `config.worktree` 里写死绝对路径。我们再设会被覆盖，**且失败是静默的**：
+  worktree 里 hook 不触发、trailer 为空、不报错。
+- 有效目录在主仓与全部 worktree 之间共享，**装一次全覆盖**（实测）。
+
+代价：`.git/hooks` 不入仓，所以**每个 clone 都要跑一次**。git 出于安全不允许仓库
+自动装 hook，这一步无法省——业内（husky）的解法是**搭车在人本来就会跑的步骤上**
+（它挂 `npm install`）。Go 项目没有等价物，agentDock 可搭 `Makefile`。见中心表 G3。
+
+**`tools/vibetrail-doctor`** 回答「这个仓的留痕现在是不是真的在工作」：hook 装没装、
+与仓内版本是否一致、`core.hooksPath` 被谁占用、最近 N 个 commit 有几个带归属。
+存在的理由是**所有失效形态都是静默的**——漏装、被别的 hook 顶掉、上游改字段名，
+都不报错，只是从此不再留痕。
 
 ### 2.4 回归保护
 

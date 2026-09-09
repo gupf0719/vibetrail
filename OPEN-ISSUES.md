@@ -80,9 +80,9 @@ git 自身也为 notes 提供 `union` / `cat_sort_uniq`。一行配置换掉一�
 |---|---|---|---|
 | **G1** | 功能缺口 | 🔴 | **查询端完全缺失**——有写入格式和提取器，没有任何「给我看这个 commit 怎么来的」的工具 |
 | **G2** | 功能缺口 | 🔴 | **session 流水的写入者未定义**——spec §3 定了格式，没说谁写、何时写（§2 的 trailer 写入者已解决） |
-| **G3** | 功能缺口 | 🔴 | **接入无引导**——hook 只存在于 spec §2.0 的代码块里；`core.hooksPath` 与 `.gitattributes` 都要手动加，任一漏掉即静默失效 |
+| **G3** | 功能缺口 | 🟡 | **没有「保证每人跑过 install」的机制**——脚本已有（`vibetrail-install` / `-doctor`，见 [CAPABILITIES §2.5](CAPABILITIES.md)），但 git 不允许仓库自动装 hook。业内解法是搭车在人本来就跑的步骤上（husky 挂 `npm install`）；agentDock 可搭 `Makefile`，**未做** |
 | **K1** | 已知缺陷 | 🟡 | **提取器重复计数未去重**——方案已定（同 sid + 同 kind + ≤10 秒，靠 `isSidechain`/`agentId` 分层），但 `hit` 还没输出这两个字段 |
-| **G4** | 功能缺口 | 🟡 | **没有留痕自检**——漏装、装错、上游改字段名，所有失效形态都是静默的，需要 `doctor` 类命令 |
+| ~~**G4**~~ | 功能缺口 | ✅ | ~~没有留痕自检~~ —— **已实现** `tools/vibetrail-doctor` |
 | **D1** | 待定决策 | 🟡 | **归属语义三处不一致**：`cherry-pick -n` 之后的 commit 与 `revert` 按执行者记；agent amend 人工 commit 记成 agent。都实测过、都写明了，但「该不该这样」没定 |
 | **D2** | 待定决策 | 🟢 | **SpecStory 留不留人类可读副本**（原 DESIGN O2；`brew trust` 随它自动定） |
 | **K2** | 已知缺陷 | 🟢 | **跨仓归属未定义**——一个会话可跨多仓，本项目开发会话即反例（`cwd` 在 agentDock、commit 在 vibetrail） |
@@ -94,7 +94,8 @@ git 自身也为 notes 提供 `union` / `cat_sort_uniq`。一行配置换掉一�
 | **M3** | 未量 | 🟢 | **`.meta.json` 字段集随版本变**——2.1.85 两项 / 2.1.202 三项 / 2.1.260 四项。将来写 `end.subagents` 要按缺失容错 |
 
 **已关闭**：O1 git-ai 采纳（否决）· O3 trace schema（已定）· O5 telemetry 配置（随 O1 消失）·
-O6 存量 marker 迁移（不迁移）· O7 `core.hooksPath`（并入 G3）· A 节四组数字 · B 节五条决策 · M1。
+O6 存量 marker 迁移（不迁移）· O7 `core.hooksPath`（并入 G3）· A 节四组数字 · B 节五条决策 ·
+M1 数组形态 · **G4 留痕自检** · **G3 的实现部分**（hook 成文件 + install/doctor，剩「保证每人跑」）。
 
 
 ## D. 三轮审计的方法教训
