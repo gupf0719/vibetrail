@@ -52,8 +52,12 @@
 grep 原文会把「讨论」当成「发生」。实测对照：以本项目调研会话为靶，裸 grep 命中 19 条、
 本规则命中 2 条，人工核对真实中断正是 2 次——**精确率 100% vs 10.5%**。
 
-全语料实测（755 会话 / 674MB）：`interrupt` 277、`permission_denied` 90、
-`permission_infra_fail` 6、`classifier_blocked` 1。判据细节与踩过的坑见
+全语料实测（**2026-09-09 重测**，756 个 transcript）：`interrupt` 282、
+`permission_denied` 92（主会话 39 + 子 agent 53）、`permission_infra_fail` 6、
+`classifier_blocked` 1。
+
+⚠️ 09-08 用旧提取器测得 277 / 90。差异两个来源：语料在持续增长，以及旧版对
+数组形态的 `is_error.content` 锚定永不命中、漏计 2 条。**引用需带测量日期。**判据细节与踩过的坑见
 [spec §3.3](spec/trace-v1.md)。
 
 ### 2.3 commit ↔ session 接链（机制已实测）
@@ -130,7 +134,8 @@ jq 的退出码只反映**最后一条**输入是否出错。
 
 ⚠️ 注意 `permission_denied` **不能同样去重**——子 agent 里有 53 次、比主会话的 39 次还多，
 那是子 agent 的工具调用审批冒泡给人、每次都是独立的人工决定。
-（⚠️ 53 + 39 = 92，与 §2.2 / spec §3.2 的 90 对不上，待在 agentDock 重数；不影响「不能去重」的结论。）
+（53 + 39 = 92，与 §2.2 一致——**已于 2026-09-09 重数解决**：旧版 90 是因为对数组形态的
+`is_error.content` 锚定永不命中、漏计 2 条，审计已修。）
 
 ### 3.4 🟡 接入没有引导
 
