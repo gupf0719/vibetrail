@@ -1,6 +1,7 @@
 # teamai-cli vs vibetrail
 
-> 配套文档：[teamai-cli.md](teamai-cli.md)（对方项目本身的分析）。
+> 配套文档：[teamai-cli.md](teamai-cli.md)（对方项目本身的分析）、
+> [teamai-cli-collection.md](teamai-cli-collection.md)（对方的采集清单）。
 > 对方快照 HEAD `224c0c4`（2026-09-09）。判据实测于 **2026-09-09**，语料 **762 个 transcript 文件**。
 
 ## 1. 结论先行

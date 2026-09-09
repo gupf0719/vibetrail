@@ -1,7 +1,8 @@
 # teamai-cli 项目分析
 
-> 三方项目分析，**不是**本项目的一部分。与之配套的对比文档见
-> [teamai-cli-vs-vibetrail.md](teamai-cli-vs-vibetrail.md)。
+> 三方项目分析，**不是**本项目的一部分。配套文档：
+> [teamai-cli-vs-vibetrail.md](teamai-cli-vs-vibetrail.md)（与本项目对比）、
+> [teamai-cli-collection.md](teamai-cli-collection.md)（采集清单：采什么、落哪、什么出本机）。
 >
 > 扫描对象：`/Users/gupengfei/program/go/src/teamai-cli`，HEAD `224c0c4`（2026-09-09）。
 > 本文所有数字均来自该快照，**引用请带这个日期**——它是个每天都在动的仓。
