@@ -19,11 +19,9 @@ mkfix(){ # 造一个装好工具、且 HEAD 是高风险 commit 的仓
     local d; d=$(mktemp -d)
     mkdir -p "$d/.claude/scripts" "$d/.claude/vibetrail" "$d/.claude/trace/audits" "$d/agent_v2"
     cp "$FIX"/*.sh "$d/.claude/scripts/"
-    for f in vibetrail vibetrail-audit vibetrail-sync vibetrail-doctor prepare-commit-msg extract-diverge.jq; do
-        [ -f "$SELF/$f" ] && cp "$SELF/$f" "$d/.claude/vibetrail/$f"
-    done
-    chmod +x "$d/.claude/scripts"/*.sh "$d/.claude/vibetrail"/* 2>/dev/null
+    chmod +x "$d/.claude/scripts"/*.sh 2>/dev/null
     ( cd "$d" && git init -q -b main && git config user.email t@t && git config user.name t
+      bash "$SELF/vibetrail-install" >/dev/null 2>&1      # 跑真装机，产出 MANIFEST
       git add -A >/dev/null && git commit -q -m "装工具" )
     echo "$d"
 }
@@ -32,7 +30,8 @@ risky(){ # 提交一个命中高风险模式的改动，让闸门有理由介入
         && git add -A >/dev/null && git commit -q -m "高风险改动" )
 }
 gate(){ ( cd "$1" && echo '{}' | bash .claude/scripts/check-audit-stop.sh 2>&1 ); }
-blocked(){ [ -n "$(gate "$1")" ]; }
+# 认「决定」而不是「有没有输出」：T12 让通过时也写 stderr，旧判据会把正向输出误读成拦截。
+blocked(){ gate "$1" | grep -q '"decision":"block"'; }
 
 echo "════ 闸门：任何「判不出来」都必须拦（fail-closed）════"
 d=$(mkfix); risky "$d"; blocked "$d" && r T0 "基线：未审的高风险 commit 被拦" GREEN || r T0 "基线" RED; rm -rf "$d"
@@ -83,7 +82,8 @@ mkmerge(){ # 造一个有冲突解决的 merge，解决成 $2
       git checkout -q main && echo mine > f.md && git commit -q -am m
       git merge s >/dev/null 2>&1; echo "$c" > f.md; git add -A && git commit -q --no-edit )
 }
-anchor(){ ( cd "$1" && git diff-tree -p --cc --root HEAD | git patch-id --stable | awk 'NR==1{print $1}' ); }
+# 调真实现，不在测试里复制一份算法 —— 复制品不会跟着修，测的就成了拷贝而非被测对象。
+anchor(){ ( cd "$1" && bash "$SELF/vibetrail-audit" anchor HEAD 2>/dev/null ); }
 a=$(mktemp -d); b=$(mktemp -d); mkmerge "$a" "解决方案甲"; mkmerge "$b" "解决方案乙-完全不同"
 [ "$(anchor "$a")" != "$(anchor "$b")" ] && r T6 "两个不同的冲突解决 → 锚必须不同" GREEN || r T6 "两个不同的冲突解决 → 锚必须不同" RED
 c=$(mktemp -d); mkmerge "$c" "解决方案甲"
@@ -94,31 +94,41 @@ rm -rf "$a" "$b" "$c"
 echo "════ 自检：doctor 必须能发现自己被破坏 ════"
 d=$(mkfix); risky "$d"; printf '\n# drift\n' >> "$d/.claude/vibetrail/vibetrail"
 o=$( cd "$d" && bash .claude/vibetrail/vibetrail-doctor 1 2>&1 | grep "vendored 运行时" )
-echo "$o" | grep -qE "⚠|✗" && r T8 "vendored 被改一个字节 → doctor 必须报警" GREEN || r T8 "vendored 被改一个字节 → doctor 必须报警" RED
+echo "$o" | grep -q "内容变了 1" && r T8 "vendored 被改一个字节 → doctor 必须报警" GREEN || r T8 "vendored 被改一个字节 → doctor 必须报警" RED
 rm -rf "$d"
 
 d=$(mkfix); risky "$d"; rm -rf "$d/.claude/vibetrail"
 o=$( cd "$d" && bash "$SELF/vibetrail-doctor" 1 2>&1 | grep "vendored 运行时" )
-echo "$o" | grep -qE "⚠|✗" && r T9 "vendored 缺失 → doctor 必须报警" GREEN || r T9 "vendored 缺失 → doctor 必须报警" RED
+echo "$o" | grep -q "目录缺失" && r T9 "vendored 缺失 → doctor 必须报警" GREEN || r T9 "vendored 缺失 → doctor 必须报警" RED
 rm -rf "$d"
 
 d=$(mkfix); risky "$d"; chmod -x "$d/.claude/vibetrail/vibetrail-audit"
 o=$( cd "$d" && bash .claude/vibetrail/vibetrail-doctor 1 2>&1 | grep "vendored 运行时" )
-echo "$o" | grep -qE "⚠|✗" && r T10 "运行时丢 +x → doctor 必须报警" GREEN || r T10 "运行时丢 +x → doctor 必须报警" RED
+echo "$o" | grep -q "丢可执行位 1" && r T10 "运行时丢 +x → doctor 必须报警" GREEN || r T10 "运行时丢 +x → doctor 必须报警" RED
 rm -rf "$d"
+
+d=$(mkfix); risky "$d"
+o=$( cd "$d" && bash .claude/vibetrail/vibetrail-doctor 1 2>&1 | grep "vendored 运行时" )
+echo "$o" | grep -q "✓" && r T7b "注入故障前 doctor 必须报健康（基线）" GREEN || r T7b "注入故障前 doctor 必须报健康（基线）" RED; rm -rf "$d"
 
 echo "════ 合并：整份重生成的文件不得用 union ════"
 d=$(mktemp -d); cd "$d" && git init -q -b main && git config user.email t@t && git config user.name t
 mkdir -p .claude/trace/sessions
-cp "$SELF/../.gitattributes" . 2>/dev/null || printf '.claude/trace/**/*.jsonl merge=union\n' > .gitattributes
+cp "$SELF/../.gitattributes" .   # 用仓内真实规则，改了这里测试就跟着变
 S=.claude/trace/sessions/s.jsonl
 printf '{"t":"session"}\n{"t":"diverge","at":"T1"}\n{"t":"end","at":"T1"}\n' > $S
 git add -A && git commit -q -m base
 git checkout -q -b br && printf '{"t":"session"}\n{"t":"diverge","at":"T1"}\n{"t":"diverge","at":"T2"}\n{"t":"end","at":"T2"}\n' > $S && git commit -q -am br
 git checkout -q main && printf '{"t":"session"}\n{"t":"diverge","at":"T1"}\n{"t":"diverge","at":"T3"}\n{"t":"end","at":"T3"}\n' > $S && git commit -q -am m
-git merge br >/dev/null 2>&1
+git merge br >/dev/null 2>&1; mrc=$?
 ends=$(grep -c '"t":"end"' $S 2>/dev/null || echo 9)
-[ "$ends" = 1 ] && r T11 "sessions 合并后只能有一条 end" GREEN || r T11 "sessions 合并后只能有一条 end（实得 $ends 条）" RED
+conflict=$(grep -c '^<<<<<<<' $S 2>/dev/null || echo 0)
+# 合法 = 只有一条 end；响亮失败 = 合并非零退出且留下冲突标记。二者皆可，静默出错不行。
+if [ "$ends" = 1 ] || { [ $mrc -ne 0 ] && [ "$conflict" -gt 0 ]; }; then
+    r T11 "sessions 合并：要么合法，要么响亮失败" GREEN
+else
+    r T11 "sessions 合并静默产出非法结构（$ends 条 end、无冲突标记）" RED
+fi
 cd /tmp && rm -rf "$d"
 
 echo "════ 正向断言：通过不能靠沉默 ════"

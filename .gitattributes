@@ -1,1 +1,4 @@
-.claude/trace/**/*.jsonl merge=union
+.claude/trace/audits/*.jsonl merge=union
+# sessions/ 不能用 union：它是整份重生成的投影，不是追加式日志。union 逐行取并集
+# 会合出两条 end、at 乱序，而且不报错。冲突时正解是重跑 vibetrail-sync 重新投影，
+# 不是把两份合起来 —— 这跟 lock 文件的处理是同一个道理。

@@ -67,4 +67,9 @@ EOF
 fi
 
 # 全通过, allow stop
+# 通过时正向说出检查了什么。
+# 「沉默 = 通过」与「沉默 = 闸门根本没跑」不可区分——死人开关那套讲的就是这个：
+# 通过必须是一条正向断言，不能靠没有输出。写 stderr 以免干扰 hook 的 JSON 协议。
+_pid=$("$VA" anchor "$last_sha" 2>/dev/null || echo '?')
+echo "vibetrail: 闸门通过 — commit ${last_sha:0:7} 锚 ${_pid:0:12} 记录 .claude/trace/audits/${_pid:0:12}….jsonl" >&2
 exit 0

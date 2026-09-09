@@ -43,11 +43,24 @@ echo "✓ .claude/trace/ 就绪"
 # 会 fail open —— 比没有闸门更糟。vendor 后仓库自给自足。
 # 版本漂移由 doctor 校验（同 hook 的做法），不靠人记得同步。
 VD=.claude/vibetrail; mkdir -p "$VD"
-for f in vibetrail vibetrail-audit vibetrail-sync vibetrail-doctor prepare-commit-msg extract-diverge.jq; do
+VT_FILES="vibetrail vibetrail-audit vibetrail-sync vibetrail-doctor vibetrail-install prepare-commit-msg extract-diverge.jq"
+for f in $VT_FILES; do
     [ -f "$SELF_DIR/$f" ] || continue
     cp "$SELF_DIR/$f" "$VD/$f"
     case "$f" in *.jq) ;; *) chmod +x "$VD/$f";; esac
 done
-echo "✓ 运行时 → $VD/（记得提交）"
+
+# 校验清单：装机时记下哈希与可执行位，doctor 据此独立验证。
+# 不能靠「跟上游目录比」—— 被观测仓里通常没有上游，而 doctor 以 vendored 副本
+# 身份运行时 SELF_DIR 就等于 VD，那是拿文件跟自己比，恒真。
+sha(){ if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}';
+       else shasum -a 256 "$1" | awk '{print $1}'; fi; }
+: > "$VD/MANIFEST"
+for f in $VT_FILES; do
+    [ -f "$VD/$f" ] || continue
+    x=-; [ -x "$VD/$f" ] && x=x
+    printf '%s %s %s\n' "$(sha "$VD/$f")" "$x" "$f" >> "$VD/MANIFEST"
+done
+echo "✓ 运行时 → $VD/（$(wc -l < "$VD/MANIFEST" | tr -d ' ') 个文件 + MANIFEST，记得提交）"
 echo
 echo "自检：bash $SELF_DIR/vibetrail-doctor"
