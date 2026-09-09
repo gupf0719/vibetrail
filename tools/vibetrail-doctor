@@ -1,0 +1,40 @@
+#!/bin/bash
+# 回答一个问题：这个仓现在的留痕，是不是真的在工作？
+# 存在的理由：所有失效形态都是静默的——漏装、被别的 hook 顶掉、上游改字段名，
+# 都不会报错，只是从此不再留痕。
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" 2>/dev/null || { echo "✗ 不在 git 仓库里"; exit 1; }
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+fail=0; warn=0
+
+HOOKS=$(git rev-parse --git-path hooks)
+DST="$HOOKS/prepare-commit-msg"
+printf '%-34s' "hook 已安装"
+if [ -x "$DST" ]; then echo "✓ $DST"; else echo "✗ 缺失或不可执行 —— 跑 vibetrail-install"; fail=1; fi
+
+printf '%-34s' "hook 与仓内版本一致"
+if [ -f "$DST" ] && cmp -s "$SELF_DIR/prepare-commit-msg" "$DST"; then echo "✓"
+else echo "✗ 内容漂了 —— 重跑 vibetrail-install"; fail=1; fi
+
+printf '%-34s' "core.hooksPath 被谁占用"
+HPO=$(git config --show-origin core.hooksPath 2>/dev/null | head -1 | cut -f1 || true)
+if [ -z "$HPO" ]; then echo "— 未设（git 默认 .git/hooks）"
+else echo "ℹ 被 ${HPO#file:} 设定（已尊重，装进其指向的目录）"; fi
+
+printf '%-34s' "会话变量可见"
+if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then echo "✓ ${CLAUDE_CODE_SESSION_ID:0:8}…"
+else echo "— 当前 shell 不在 agent 会话里（人工提交本就不该留痕）"; fi
+
+printf '%-34s' ".gitattributes merge=union"
+if grep -qF 'merge=union' .gitattributes 2>/dev/null; then echo "✓"
+else echo "⚠ 缺失 —— 同分支并发追加时会要人工解冲突"; warn=1; fi
+
+N=${1:-20}
+printf '%-34s' "最近 $N 个 commit 的归属"
+have=$(git log -"$N" --format='%(trailers:key=Claude-Session,valueonly,separator=)' 2>/dev/null | grep -c . || true)
+echo "$have / $N 带 Claude-Session"
+
+echo
+if [ $fail -ne 0 ]; then echo "✗ 有致命项，留痕当前不工作"; exit 1
+elif [ $warn -ne 0 ]; then echo "⚠ 可用，但有告警"; exit 0
+else echo "✓ 留痕工作正常"; fi

@@ -1,0 +1,42 @@
+#!/bin/bash
+# vibetrail 接入脚本。幂等，可反复跑。
+#
+# 装进**有效 hooks 目录**而不是 `.githooks/` + 改 core.hooksPath，因为：
+#   1. core.hooksPath 可能已被别人占用（实测 agentDock 的 worktree 工具就在每个
+#      config.worktree 里写绝对路径），我们再设会被覆盖，且**失败是静默的**；
+#   2. 有效目录在主仓与全部 worktree 之间共享，装一次全覆盖（实测）。
+# 代价：`.git/hooks` 不入仓，所以**每个 clone 都要跑一次本脚本**（git 出于安全
+# 不允许仓库自动装 hook，这一步无法省掉——见 README 的搭车建议）。
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SRC="$SELF_DIR/prepare-commit-msg"
+[ -f "$SRC" ] || { echo "✗ 找不到 $SRC" >&2; exit 1; }
+
+HOOKS=$(git rev-parse --git-path hooks)
+mkdir -p "$HOOKS"
+DST="$HOOKS/prepare-commit-msg"
+
+if [ -e "$DST" ] && ! cmp -s "$SRC" "$DST"; then
+    echo "✗ $DST 已存在且内容不同。" >&2
+    echo "  它可能是别的工具装的。请人工合并后再跑，或先备份删除。" >&2
+    exit 1
+fi
+cp "$SRC" "$DST"; chmod +x "$DST"
+echo "✓ hook → $DST"
+
+GA=.gitattributes
+LINE='.claude/trace/**/*.jsonl merge=union'
+if [ -f "$GA" ] && grep -qF "$LINE" "$GA"; then
+    echo "✓ .gitattributes 已有 merge=union"
+else
+    [ -f "$GA" ] && [ -n "$(tail -c1 "$GA")" ] && echo >> "$GA"
+    echo "$LINE" >> "$GA"
+    echo "✓ .gitattributes 追加 merge=union（记得提交它）"
+fi
+
+mkdir -p .claude/trace/sessions .claude/trace/audits
+echo "✓ .claude/trace/ 就绪"
+echo
+echo "自检：bash $SELF_DIR/vibetrail-doctor"
