@@ -178,10 +178,17 @@ git log -1 --format='%(trailers:key=Claude-Session,valueonly)' <sha>            
 
 | kind | human | 判据 |
 |---|---|---|
-| `interrupt` | ✅ | user 消息的 text 块或字符串正文，去前导空白后 `startswith("[Request interrupted by user")` |
+| `interrupt` | ✅ | 去前导空白后 `startswith("[Request interrupted by user")` **且不含** `for tool use` —— 人主动打断 |
+| `interrupt_for_tool_use` | ✅ | 同上但**含** `for tool use` —— 人拒绝工具调用时伴随的打断，**总是**与一条 `permission_denied` 同时出现 |
 | `permission_denied` | ✅ | `is_error` 块正文 `^Permission to use .* has been denied`（带 `m` 标志）或 `^The user doesn't want to proceed with this tool use` |
 | `classifier_blocked` | ❌ | 正文含 `denied by the Claude Code auto mode classifier` 或 `Blocked by classifier` —— auto mode 分类器拒的，不是人 |
 | `permission_infra_fail` | ❌ | 正文含 `Tool permission request failed` 或 `Tool permission stream closed` —— 链路故障，不是任何人的决定 |
+
+⚠️ **两个 interrupt 变体必须分开，否则一次「拒绝工具调用」被记两条。**
+实测全语料：`for tool use` 变体 **35** 次，而「同一会话同一秒同时命中
+`permission_denied` 与 `interrupt`」也恰是 **35** 次——精确对上。两者是**同一个人类动作
+的两条记录**（turn uuid 不同）。合成一个 kind 会让「人主动打断了多少次」把拒绝也算进去。
+统计「人机分歧总数」时，`interrupt_for_tool_use` 应与其配对的 `permission_denied` 计为一次。
 
 判据全部**只读 JSON 字段**，不 grep 整行原文。`interrupt` 只认 user 消息的 text 块或字符串正文，
 **不认** `tool_result` 块；其余三类**只认** `is_error == true` 的块正文（Claude Code 里只有 `tool_result`

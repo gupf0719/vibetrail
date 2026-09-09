@@ -21,7 +21,7 @@
 | 留痕自检 | ✅ **已实现** | `tools/vibetrail-doctor` |
 | hook 回归测试 | ✅ **已实现** | `tools/test-hook.sh` |
 | 审计过程留痕 | ⬜ 未实现 | 改 `mark-audit.sh` |
-| 查询 / 复盘 | ⬜ **未实现，最大缺口** | 中心表 G1 |
+| 查询 / 复盘 | ✅ **已实现** | `tools/vibetrail`（show / log / session / diverge）|
 | 行级归属 | ❌ **已否决** | 见 [DESIGN.md §2.5](DESIGN.md) |
 
 ## 2. 实现原理
@@ -54,7 +54,7 @@
 grep 原文会把「讨论」当成「发生」。实测对照：以本项目调研会话为靶，裸 grep 命中 19 条、
 本规则命中 2 条，人工核对真实中断正是 2 次——**精确率 100% vs 10.5%**。
 
-全语料实测（**2026-09-09 重测**，756 个 transcript）：`interrupt` 282、
+全语料实测（**2026-09-09 重测**，756 个 transcript）：`interrupt` 248（人主动打断）、`interrupt_for_tool_use` 35（伴随拒绝）、
 `permission_denied` 92（主会话 39 + 子 agent 53）、`permission_infra_fail` 6、
 `classifier_blocked` 1。
 

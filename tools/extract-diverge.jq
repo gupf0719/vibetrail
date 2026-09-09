@@ -54,12 +54,23 @@ def isHumanDenial:
 #   （实测 278 命中里有 1 条是这种假阳；锚定后 277 条全真、一条不漏）。
 # 同时只认 user 的 text 块与字符串正文，排除 tool_result——否则会话自己
 #   讨论这个标记时会被当成发生过。
+# 两个变体必须分开，否则一次「拒绝工具调用」会被记两条（实测 35 次，见下）：
+#   [Request interrupted by user]                → 人主动打断 agent，自发
+#   [Request interrupted by user for tool use]   → 人拒绝工具调用时伴随的打断
+# 后者**总是**与一条 permission_denied 同时出现（同一动作、两条记录、不同 turn uuid）。
+# 实测全语料：for-tool-use 变体 35 次，而「同秒同时命中两类」也恰是 35 次——精确对上。
+# 合成一个 kind 会让「人打断了多少次」把拒绝也算进去。
 def isInterruptText: (sub("^\\s+"; "")) | startswith("[Request interrupted by user");
-( select(.type == "user" and (
-    (((.message.content | type) == "array") and
-       any(.message.content[]? | objects; .type == "text" and ((.text // "") | isInterruptText)))
-    or (((.message.content | type) == "string") and (.message.content | isInterruptText))
-  )) | hit("interrupt"; true) ),
+def isForToolUse:    test("for tool use");
+def anyText: if (.message.content | type) == "array"
+             then [.message.content[]? | objects | select(.type=="text") | (.text // "")]
+             elif (.message.content | type) == "string" then [.message.content]
+             else [] end;
+
+( select(.type == "user" and any(anyText[]; isInterruptText and (isForToolUse | not)))
+  | hit("interrupt"; true) ),
+( select(.type == "user" and any(anyText[]; isInterruptText and isForToolUse))
+  | hit("interrupt_for_tool_use"; true) ),
 
 # ---- 2. permission_denied：人拒绝了一次工具调用 ----
 ( select(any(errTexts[]; isHumanDenial)) | hit("permission_denied"; true) ),
