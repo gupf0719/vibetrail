@@ -52,9 +52,11 @@ while IFS= read -r tp; do
     tmp=$(mktemp)
     # ── 头
     jq -c --arg sid "$sid" 'select(.cwd != null) | {
-        t:"session", v:1, id:$sid,
-        tool:"claude-code", toolVersion:(.version // null),
-        entrypoint:(.entrypoint // null), startedAt:.timestamp,
+        t:"session", version:"1", id:$sid,
+        timestamp:.timestamp,
+        tool:{name:"claude-code", version:(.version // null)},
+        vcs:{type:"git", revision:null},
+        entrypoint:(.entrypoint // null),
         cwd:.cwd, branch:(.gitBranch // null)
     }' "$tp" 2>/dev/null | head -1 >> "$tmp"
     # ── 分歧（主 + 子，按时间排序）

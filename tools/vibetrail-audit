@@ -49,10 +49,18 @@ cmd_record(){
         --arg pid "$pid" --arg kind "$kind" --arg sha "$sha" \
         --arg subj "$(git log -1 --format=%s "$sha")" \
         --arg sid "${CLAUDE_CODE_SESSION_ID:-}" \
-        --arg at "$(date -u +%FT%TZ)" '
-        {t:"audit", v:1, patchId:$pid, kind:$kind,
+        --arg at "$(date -u +%FT%TZ)" \
+        --arg rid "$(if command -v uuidgen >/dev/null 2>&1; then uuidgen | tr 'A-Z' 'a-z'; \
+                     elif [ -r /proc/sys/kernel/random/uuid ]; then cat /proc/sys/kernel/random/uuid; \
+                     else printf '%s%s' "$(date -u +%s)" "$RANDOM" | shasum | cut -c1-32; fi)" '
+        {t:"audit", version:"1",
+         id:$rid,
+         timestamp:$at,
+         tool:{name:"vibetrail", version:"1"},
+         vcs:{type:"git", revision:$sha},
+         anchor:$pid, kind:$kind,
          sessionId:(if $sid=="" then null else $sid end),
-         at:$at, shaAtTime:$sha, subject:$subj,
+         subject:$subj,
          agents:(.agents // []), findings:(.findings // [])}')
     # 先在内存里成形并验非空，再落盘：直接 >> 会让 shell 在 jq 无输出时
     # 照样建出一个 0 字节文件，而那个文件看着像「记录存在」。
@@ -68,8 +76,8 @@ cmd_show(){
     local pid; pid=$(anchor "$sha")
     [ -z "$pid" ] && { echo "  锚为空 —— 无需审计"; return 0; }
     local f="$OUT/$pid.jsonl"
-    [ -f "$f" ] || { echo "  无审计记录（patchId ${pid:0:12}…）"; return 0; }
-    jq -rc '"── \(.kind)  \(.at)  by \(.sessionId // "?" | .[0:8])…",
+    [ -f "$f" ] || { echo "  无审计记录（锚 ${pid:0:12}…）"; return 0; }
+    jq -rc '"── \(.kind)  \(.timestamp)  by \(.sessionId // "?" | .[0:8])…",
             "   agents: \([.agents[]? | "\(.perspective // .type)(\(.findings // 0))"] | join(", "))",
             (.findings[]? | "   [\(.severity // "?")] \(.verdict // "?")  \(.claim // "")")' "$f"
 }
@@ -82,7 +90,7 @@ cmd_stats(){
       ([.[].findings[]?] | length) as $tot
       | ([.[].findings[]? | select(.verdict=="confirmed")] | length) as $ok
       | { "审计次数": length,
-          "覆盖 commit 数": ([.[].patchId] | unique | length),
+          "覆盖 commit 数": ([.[].anchor] | map(select(. != null)) | unique | length),
           "finding 总数": $tot,
           "按判定": ([.[].findings[]?.verdict // "未判定"] | group_by(.) | map({(.[0]): length}) | add),
           "按严重度": ([.[].findings[]?.severity // "未标"] | group_by(.) | map({(.[0]): length}) | add),

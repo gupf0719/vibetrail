@@ -62,7 +62,7 @@ cmd_show(){
         jq -rc '"  \(.kind)  finding \(.findings|length) 条  by \(.sessionId[0:8])…"' \
           ".claude/trace/audits/$pid.jsonl" 2>/dev/null
     else
-        echo "  无（patchId ${pid:0:12}…）"
+        echo "  无（锚 ${pid:0:12}…）"
     fi
 }
 

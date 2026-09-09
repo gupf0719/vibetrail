@@ -62,5 +62,20 @@ before=$(ls .claude/trace/audits/*.jsonl 2>/dev/null | wc -l | tr -d ' ')
 printf '%s' "$F" | "$SELF/vibetrail-audit" record HEAD audit >/dev/null 2>&1
 ck "没有锚 → 拒写记录" "$before" "$(ls .claude/trace/audits/*.jsonl 2>/dev/null | wc -l | tr -d ' ')"
 
+# —— 消费端（show / stats）的输出必须真的读到字段 ——
+# 之前信封改名后 show 的时间显示 null、stats 的「覆盖 commit 数」读到 null，
+# 而单条记录下 [null]|unique|length 也是 1、看着正确 —— 必须用 N=2 才测得出来。
+ck "show 显示时间不是 null" "0" "$("$SELF/vibetrail-audit" show HEAD 2>/dev/null | grep -c 'null')"
+# 前一条用例把 hook 删了（测「没有锚 → 拒写」），这里要装回来，否则新 commit
+# 同样没有锚、记录被拒，测到的是「没装 hook」而不是 stats 读没读对字段。
+cp "$SELF/prepare-commit-msg" "$(git rev-parse --git-path hooks)/prepare-commit-msg"
+chmod +x "$(git rev-parse --git-path hooks)/prepare-commit-msg"
+
+# 差分断言：fixture 前面的用例已经记过若干 commit，不能假设绝对值
+covered_before=$("$SELF/vibetrail-audit" stats 2>/dev/null | jq -r '."覆盖 commit 数"')
+echo n2 > n2f; git add n2f; git commit -q -m "第二个 commit"
+printf '%s' "$F" | "$SELF/vibetrail-audit" record HEAD audit >/dev/null 2>&1
+ck "新 commit 让覆盖数 +1（N≥2 才测得出）" "$((covered_before+1))" "$("$SELF/vibetrail-audit" stats 2>/dev/null | jq -r '."覆盖 commit 数"')"
+
 echo
 if [ $fail -eq 0 ]; then echo "  ✅ $pass/$((pass+fail)) 通过"; else echo "  ❌ $fail/$((pass+fail)) 失败"; exit 1; fi
