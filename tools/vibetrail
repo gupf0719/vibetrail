@@ -1,0 +1,120 @@
+#!/bin/bash
+# vibetrail 查询端。留痕的全部目的是复盘，而复盘的动作就是这几条。
+#
+# 数据来源三处，各自可缺、缺了降级不报错：
+#   1. commit message 的 Claude-Session trailer —— commit ↔ session 的唯一真相源
+#   2. ~/.claude/projects/**/<sid>.jsonl —— 原始 transcript（不入仓，可能已丢）
+#   3. <repo>/.claude/trace/ —— 耐久投影（G2 未实现前通常为空）
+set -uo pipefail
+SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+JQF="$SELF/extract-diverge.jq"
+PROJ="$HOME/.claude/projects"
+
+die(){ echo "✗ $*" >&2; exit 1; }
+sess_of(){ git log -1 --format='%(trailers:key=Claude-Session,valueonly,separator=)' "$1" 2>/dev/null | tr -d '\n'; }
+# sid → transcript 路径（含子 agent 目录）；找不到返空
+tpath(){ find "$PROJ" -name "$1.jsonl" -maxdepth 3 2>/dev/null | head -1; }
+patchid(){ git diff-tree -p --cc --root "$1" 2>/dev/null | git patch-id --stable | awk 'NR==1{print $1}'; }
+
+cmd_show(){
+    local ref=${1:-HEAD}
+    local sha; sha=$(git rev-parse "$ref" 2>/dev/null) || die "解析不了 $ref"
+    echo "── commit ────────────────────────────────────"
+    git log -1 --format='  %h  %s%n  %an  %ad' --date=short "$sha"
+
+    local sid; sid=$(sess_of "$sha")
+    echo
+    echo "── 产出它的会话 ──────────────────────────────"
+    if [ -z "$sid" ]; then
+        echo "  （无 Claude-Session trailer）"
+        echo "  可能是人工提交，或提交时 hook 未安装 —— 跑 vibetrail-doctor 确认"
+    else
+        echo "  session: $sid"
+        local tp; tp=$(tpath "$sid")
+        if [ -z "$tp" ]; then
+            echo "  transcript: 已不在本机（正文不可回溯，这是 D2 的既定代价）"
+        else
+            echo "  transcript: $tp ($(du -h "$tp" | cut -f1))"
+            echo
+            echo "── 该会话的人机分歧 ──────────────────────────"
+            local n; n=$(jq -c -f "$JQF" "$tp" 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$n" = "0" ]; then echo "  无"
+            else
+                jq -c -f "$JQF" "$tp" 2>/dev/null \
+                  | jq -rc '"  \(.at[0:19])  \(if .human then "人" else "机" end)  \(.kind)"' | head -20
+                [ "$n" -gt 20 ] && echo "  … 共 $n 条"
+            fi
+        fi
+        echo
+        echo "── 同会话产出的其他 commit ───────────────────"
+        git log --all --format='%H %(trailers:key=Claude-Session,valueonly,separator=)' 2>/dev/null \
+          | awk -v s="$sid" '$2==s{print $1}' \
+          | while read -r c; do [ "$c" = "$sha" ] && continue; git log -1 --format='  %h  %s' "$c"; done \
+          | head -10
+    fi
+
+    local pid; pid=$(patchid "$sha")
+    echo
+    echo "── 审计记录 ──────────────────────────────────"
+    if [ -z "$pid" ]; then
+        echo "  锚为空（无冲突 merge / 空 commit）—— 按 spec §4.0 无需审计"
+    elif [ -f ".claude/trace/audits/$pid.jsonl" ]; then
+        jq -rc '"  \(.kind)  finding \(.findings|length) 条  by \(.sessionId[0:8])…"' \
+          ".claude/trace/audits/$pid.jsonl" 2>/dev/null
+    else
+        echo "  无（patchId ${pid:0:12}…）"
+    fi
+}
+
+cmd_log(){
+    local n=${1:-20}
+    printf '  %-9s %-38s %s\n' "commit" "subject" "session"
+    git log -"$n" --format='%h|%s|%(trailers:key=Claude-Session,valueonly,separator=)' 2>/dev/null \
+      | while IFS='|' read -r h s sid; do
+            printf '  %-9s %-38s %s\n' "$h" "$(echo "$s" | cut -c1-38)" "${sid:0:8}"
+        done
+}
+
+cmd_session(){
+    local sid=${1:?用法: vibetrail session <sid>}
+    local tp; tp=$(tpath "$sid")
+    echo "── 会话 $sid ──"
+    [ -n "$tp" ] && echo "  transcript: $tp" || echo "  transcript: 已不在本机"
+    echo
+    echo "  产出的 commit:"
+    git log --all --format='%H %(trailers:key=Claude-Session,valueonly,separator=)' 2>/dev/null \
+      | awk -v s="$sid" '$2==s{print $1}' \
+      | while read -r c; do git log -1 --format='    %h  %ad  %s' --date=short "$c"; done
+    [ -z "$tp" ] && return 0
+    echo
+    echo "  人机分歧:"
+    jq -c -f "$JQF" "$tp" 2>/dev/null | jq -rc '"    \(.at[0:19])  \(if .human then "人" else "机" end)  \(.kind)"'
+}
+
+cmd_diverge(){
+    local n=${1:-20}
+    echo "  最近 $n 个 commit 涉及的会话，其人机分歧汇总："
+    git log -"$n" --format='%(trailers:key=Claude-Session,valueonly,separator=)' 2>/dev/null \
+      | grep . | sort -u | while read -r sid; do
+            local tp; tp=$(tpath "$sid"); [ -z "$tp" ] && continue
+            jq -c -f "$JQF" "$tp" 2>/dev/null
+        done | jq -rc 'select(.human) | .kind' | sort | uniq -c | sort -rn | sed 's/^/   /'
+}
+
+case "${1:-}" in
+    show)    shift; cmd_show "$@";;
+    log)     shift; cmd_log "$@";;
+    session) shift; cmd_session "$@";;
+    diverge) shift; cmd_diverge "$@";;
+    *) cat <<'H'
+vibetrail —— 开发过程留痕的查询端
+
+  vibetrail show [<commit>]   这个 commit 是怎么来的（默认 HEAD）
+  vibetrail log [<n>]         最近 n 个 commit 的归属概览
+  vibetrail session <sid>     这个会话做了什么
+  vibetrail diverge [<n>]     最近 n 个 commit 涉及会话的分歧汇总
+
+  接入 / 自检： vibetrail-install / vibetrail-doctor
+H
+    ;;
+esac
