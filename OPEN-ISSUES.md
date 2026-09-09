@@ -24,22 +24,45 @@
 2026-09-09 重测的完整口径与命令见 DESIGN.md D3 的口径说明。
 
 
-## B. 我单方面定的、需要确认的决策
+## B. ~~我单方面定的、需要确认的决策~~ —— 已拍板（2026-09-09）
 
-1. **空 patchId 的读方语义 = 告警并放行**（[spec §4](spec/trace-v1.md)）。merge commit 与
-   `--allow-empty` 的 patch-id 是空串；原文只说写方跳过，读方（Stop 闸门）怎么办没写。
-   我定为放行，理由是拦住会把 agent 卡死在一次 `merge --no-ff` 之后。
-   备选：为 merge 定义退化锚（`diff-tree -m` 取第一父的 id）；或读方拦截、强制人工确认。
-2. **编辑器路径不注入 trailer**（spec §2.0）。这是空消息守卫的副作用：`git commit` 不带 `-m`
-   时 hook 跑在编辑器之前，消息尚空。agent 从不开编辑器，人在带变量的 shell 里手工提交因此
-   不会被误记，方向对；但若将来 agent 走编辑器路径（如 `-t` 模板为空），也不会有 trailer。
-   备选：去掉判空守卫，接受 `-m ''` 与留空的 `commit -v` 会被 trailer 填成非空提交。
-3. **删掉提取器第 5 条规则 `user_edited_after_agent`**。按 spec §3.1「已删除的 kind」这个既定
-   决定收口。备选：保留为哨兵——若某个客户端真把 `userModified` 置真，命中本身就是情报。
-4. **`.gitattributes` 须声明 `.claude/trace/**/*.jsonl merge=union`** 已写进接入清单
-   （CAPABILITIES §3.4、spec §1.1）。这是对被观测仓的新要求，agentDock 还没加。
-5. **删掉了 DESIGN §1 的 `.gitignore:9` 引用**。原文说它「排除 `.claude/projects/`」，但
-   transcript 在 home 目录、仓库 .gitignore 管不到，因果不成立。若原作者另有所指，请补回并写清。
+四条经三方对照 + 实测后定为 **B / A / A / A**：
+
+### B1 空 patchId 的读方语义 → **改为分档**（唯一推翻原提案的一条）
+
+原提案「一律告警放行」会让**有冲突解决的 merge 整个溜过闸门**，而那是真有人写了代码的。
+
+- 三方：git-ai 标准 §2.2 只豁免**无冲突**的 merge（*"MAY have an empty authorship log"*），
+  并要求 merge 的归属 *"MUST only contain attributions for conflict resolution changes"*。
+- 实测排除了备选：`diff-tree -m --first-parent` 的退化锚 patch-id **与被合入 commit 的完全相同**，
+  会让两者共用一条审计记录。
+- 实测发现的解：锚统一改为 `git diff-tree -p --cc --root`。加 `--cc` 后普通与根 commit
+  结果**逐字不变**，而有冲突的 merge 变为非空、内容恰为冲突解决部分。**读方无需分支判断。**
+
+五种 commit 的锚与读方语义已写入 [spec §4.0](spec/trace-v1.md)。
+
+### B2 编辑器路径不注入 trailer → **维持**
+
+git 自身惯例相反（`commit -s` 在编辑器前就写入、不判空），但 agent 恒带 `-m`、从不开编辑器，
+所以判空守卫的代价为零；去掉它则 `git commit -m ''` 会被 trailer 填成非空而提交成功。
+**差异已在 spec §2.0 写明是有意的。**
+
+### B3 删掉 `user_edited_after_agent` → **维持删除**
+
+保留为哨兵的收益是「我们不用的客户端可能有信号」，成本是永久维护一条死规则及其类型守卫，
+且与 spec §3.1「已删除的 kind」自相矛盾。将来换客户端时再加。
+
+### B4 `.gitattributes` 声明 `merge=union` → **维持要求**
+
+实测：两分支追加**相同**记录时普通合并即解决、不重复；追加**不同**记录时两边都留。
+唯一副作用是文件内顺序可能非时序，而记录带 `at` 时间戳、读方不依赖文件内顺序。
+git 自身也为 notes 提供 `union` / `cat_sort_uniq`。一行配置换掉一类人工解冲突。
+
+### B5 删掉 `.gitignore:9` 引用 → **确认删对了**
+
+原文说它「排除 `.claude/projects/` 导致换机器即丢」，但 transcript 在 `~/.claude/projects/`
+（home 目录），仓库的 .gitignore 管不到它，因果不成立。
+
 
 ## C. 已记为已知、但没修的缺口
 

@@ -54,7 +54,7 @@ Claude-Session: 0bf59c3d-59dc-416c-b21d-9137feef79af
 [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || exit 0     # 人工提交：变量不存在，直接跳过
 g=$(git rev-parse --git-dir)                       # 重放别人的 commit（rebase / cherry-pick）不改归属
 { [ -d "$g/rebase-merge" ] || [ -d "$g/rebase-apply" ] || [ -f "$g/CHERRY_PICK_HEAD" ]; } && exit 0
-sed '/^# -* >8 -*$/,$d' "$1" | grep -q -v -e '^[[:space:]]*$' -e '^#' || exit 0   # 截掉 scissors 后为空：让 git 照常拒绝
+sed '/^# -* >8 -*$/,$d' "$1" | grep -q -v -e '^[[:space:]]*$' -e '^#' || exit 0   # 截掉 scissors 后为空：让 git 照常拒绝（见 §2.0 注）
 [ -n "$(tail -c1 "$1")" ] && echo >> "$1"          # 非编辑器路径的 merge（--no-edit / -m）没有末尾换行
 git interpret-trailers --in-place --no-divider --if-exists doNothing \
     --trailer "Claude-Session=$CLAUDE_CODE_SESSION_ID" "$1"   # 并入已有 trailer 块；已有则不动（幂等）
@@ -93,6 +93,12 @@ Bash 调用的环境里；子 agent 的 Bash 里拿到的也是**父会话的 id
 |---|---|---|
 | 多 worktree 并发会话 | ❌ 串号 | ✅ 各进程各自的值 |
 | 人工手动 `git commit` | ❌ 误记成 agent 的 | ✅ 变量不存在，不注入 |
+
+> **判空守卫与 git 自身惯例不同，这是有意的。** git 的 `commit -s` 在编辑器打开**之前**
+> 就写入 `Signed-off-by`，不因消息为空而跳过。我们反过来：消息为空就不注入，
+> 让 git 照常以「空消息」中止提交。代价是**编辑器路径下不会有 trailer**；
+> 由于 agent 恒带 `-m`、从不开编辑器，这个代价为零。
+> 去掉判空的后果是 `git commit -m ''` 会被 trailer 填成非空而提交成功。
 
 ⚠️ **两个部署要点，漏了会静默失效**：
 
@@ -301,16 +307,39 @@ userModified:   false     ← 不是它
 ## 4. 审计记录 `audits/<patchId>.jsonl`
 
 ```bash
-git diff-tree -p --root <sha> | git patch-id --stable | awk '{print $1}'
+git diff-tree -p --cc --root <sha> | git patch-id --stable | awk 'NR==1{print $1}'
 ```
 
-三个参数都是必需的，各挡一个坑（都实测过）：
+四个参数都是必需的，各挡一个坑（都实测过）：
 
 | 参数 | 去掉会怎样 |
 |---|---|
 | `--stable` | 结果在不同 git 版本间不保证一致 |
 | `--root` | 根 commit **静默返回空串**（不报错），整条记录锚在空 id 上 |
 | `-p` | 没有 patch 正文，`patch-id` 无输入 |
+| `--cc` | **有冲突解决的 merge 会返回空**，整个 merge 溜过审计闸门（见下表）|
+
+### 4.0 五种 commit 的锚，以及空锚怎么办
+
+| commit 类型 | 锚 | 读方（Stop 闸门） |
+|---|---|---|
+| 根 commit | 有值 | 照常要求审计 |
+| 普通 commit | 有值 | 照常要求审计 |
+| 无冲突 merge | **空** | **放行** |
+| **有冲突解决的 merge** | **有值**（内容恰为冲突解决部分）| 照常要求审计 |
+| `--allow-empty` | **空** | **放行** |
+
+**加 `--cc` 对普通与根 commit 的结果逐字相同**（实测），所以无条件加即可，
+读方不需要按 commit 类型分支——**那正是「两处判据必须保持一致」的坑**。
+
+**空锚 = 放行**，理由不是「拦不住就放」，而是**确实没有可归属的内容**。
+git-ai 标准 §2.2 对同一问题的规定是：无冲突的 merge commit *"MAY have an empty
+authorship log"*，而 merge 的归属 *"MUST only contain attributions for conflict
+resolution changes"*——两者一致。
+
+⚠️ **一个被实测排除的备选**：曾考虑用 `diff-tree -m --first-parent` 给 merge 造退化锚。
+不可行——它算出的 patch-id **与被合入的那个 commit 的 patch-id 完全相同**，
+merge 与被合入 commit 会共用一条审计记录，审了一个等于标了另一个。
 
 写成 `<sha>^ <sha>` 也能用，但在根 commit 上 `fatal: ambiguous argument`。
 `--root` 在普通 commit 上与之结果**逐字相同**（实测），所以无条件加它即可，
