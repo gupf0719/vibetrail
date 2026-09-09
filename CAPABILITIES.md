@@ -21,7 +21,7 @@
 | 留痕自检 | ✅ **已实现** | `tools/vibetrail-doctor` |
 | hook 回归测试 | ✅ **已实现** | `tools/test-hook.sh` |
 | session 流水投影 | ✅ **已实现** | `tools/vibetrail-sync` |
-| 审计过程留痕 | ⬜ 未实现 | 改 `mark-audit.sh` |
+| 审计过程留痕 | ✅ **已实现** | `tools/vibetrail-audit`（record / show / stats）|
 | 查询 / 复盘 | ✅ **已实现** | `tools/vibetrail`（show / log / session / diverge）|
 | 行级归属 | ❌ **已否决** | 见 [DESIGN.md §2.5](DESIGN.md) |
 
@@ -96,6 +96,26 @@ grep 原文会把「讨论」当成「发生」。实测对照：以本项目调
 
 实测（agentDock）：26 个会话 / 419 条记录 / **220K**，对照 transcript 406MB，
 约 1800 倍压缩，符合 D2 的 KB 级要求。
+
+### 2.4c 审计过程留痕（`vibetrail-audit`）
+
+**本项目唯一没有先例可抄的部分。** 业内工具审的都是**代码**——git-ai 记行级归属、
+SpecStory 存对话、Memento 把 transcript 挂进 git notes，**没有一个记「审计本身」**。
+
+它替代 0 字节 marker：旧做法只记「审过了」，不记「审了什么、报了几个、几真几假」，
+于是命中率这类数字只能人肉从对话里数，而对话会被压缩掉。现在 `stats` 直接算：
+
+```
+{"审计次数":1, "finding 总数":4, "按判定":{"confirmed":3,"false-positive":1}, "命中率":"75%"}
+```
+
+**锚用 patch-id 不用 sha**——sha 在 rebase 后就变（实测本仓 294 个旧 marker 已有 4 个失效）。
+计算式与 [spec §4](spec/trace-v1.md) 逐字一致，回归里有一条专门钉这个。
+
+**SARIF 只取词汇不取封装**：SARIF 是 findings 的事实标准，但它为「带代码位置的工具输出」
+设计，最小信封每个结果十几行样板，且没有「N 个 agent 各带视角」与「二次交叉验证」的概念。
+我们保留紧凑 JSONL，finding 可带 SARIF 形状的 `location`，severity 记录到 SARIF `level`
+的映射（HIGH→error / MED→warning / LOW→note），将来要导出是机械转换。
 
 ### 2.5 接入与自检
 

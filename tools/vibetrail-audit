@@ -1,0 +1,85 @@
+#!/bin/bash
+# 审计过程留痕。这是本项目唯一没有先例可抄的部分——业内所有工具审的是**代码**，
+# 没人审**审计过程**（git-ai / SpecStory / Memento 都不记）。
+#
+# 它替代的是「0 字节 marker」：只记「审过了」，不记「审了什么、报了几个、几真几假」，
+# 于是命中率这类数字只能人肉从对话里数，而对话会被压缩掉。
+#
+# 锚用 patch-id 不用 sha —— sha 在 rebase 后就变（实测本仓 294 个旧 marker 已有 4 个失效）。
+set -uo pipefail
+SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "$(git rev-parse --show-toplevel)" || exit 1
+OUT=.claude/trace/audits
+
+# 与 spec §4 逐字一致的锚。--cc 让有冲突解决的 merge 也有锚；普通与根 commit 结果不变。
+anchor(){ git diff-tree -p --cc --root "$1" 2>/dev/null | git patch-id --stable | awk 'NR==1{print $1}'; }
+
+cmd_record(){
+    local sha kind; sha=$(git rev-parse "${1:-HEAD}") || exit 1; kind=${2:-audit}
+    local pid; pid=$(anchor "$sha")
+    if [ -z "$pid" ]; then
+        echo "✓ 锚为空（无冲突 merge / 空 commit）—— 按 spec §4.0 无需审计，未写记录"
+        return 0
+    fi
+    local body; body=$(cat)                       # findings JSON 从 stdin 读
+    printf '%s' "$body" | jq -e . >/dev/null 2>&1 || { echo "✗ stdin 不是合法 JSON" >&2; exit 1; }
+    mkdir -p "$OUT"
+    printf '%s' "$body" | jq -c \
+        --arg pid "$pid" --arg kind "$kind" --arg sha "$sha" \
+        --arg subj "$(git log -1 --format=%s "$sha")" \
+        --arg sid "${CLAUDE_CODE_SESSION_ID:-}" \
+        --arg at "$(date -u +%FT%TZ)" '
+        {t:"audit", v:1, patchId:$pid, kind:$kind,
+         sessionId:(if $sid=="" then null else $sid end),
+         at:$at, shaAtTime:$sha, subject:$subj,
+         agents:(.agents // []), findings:(.findings // [])}' >> "$OUT/$pid.jsonl"
+    local n; n=$(printf '%s' "$body" | jq '(.findings // [])|length')
+    echo "✓ $kind 记录 → $OUT/${pid:0:12}….jsonl（finding $n 条）"
+}
+
+cmd_show(){
+    local sha; sha=$(git rev-parse "${1:-HEAD}") || exit 1
+    local pid; pid=$(anchor "$sha")
+    [ -z "$pid" ] && { echo "  锚为空 —— 无需审计"; return 0; }
+    local f="$OUT/$pid.jsonl"
+    [ -f "$f" ] || { echo "  无审计记录（patchId ${pid:0:12}…）"; return 0; }
+    jq -rc '"── \(.kind)  \(.at)  by \(.sessionId // "?" | .[0:8])…",
+            "   agents: \([.agents[]? | "\(.perspective // .type)(\(.findings // 0))"] | join(", "))",
+            (.findings[]? | "   [\(.severity // "?")] \(.verdict // "?")  \(.claim // "")")' "$f"
+}
+
+# 命中率这类数字**算出来**，不是从对话里人肉数——这正是断链二要解决的
+cmd_stats(){
+    [ -d "$OUT" ] || { echo "  无审计记录"; return 0; }
+    # jq 的对象键若含非 ASCII 必须加引号，取值也要用 .["…"]；不加是编译错不是运行错。
+    cat "$OUT"/*.jsonl 2>/dev/null | jq -s '
+      ([.[].findings[]?] | length) as $tot
+      | ([.[].findings[]? | select(.verdict=="confirmed")] | length) as $ok
+      | { "审计次数": length,
+          "覆盖 commit 数": ([.[].patchId] | unique | length),
+          "finding 总数": $tot,
+          "按判定": ([.[].findings[]?.verdict // "未判定"] | group_by(.) | map({(.[0]): length}) | add),
+          "按严重度": ([.[].findings[]?.severity // "未标"] | group_by(.) | map({(.[0]): length}) | add),
+          "命中率": (if $tot > 0 then (($ok * 100 / $tot) | floor | tostring) + "%" else "n/a" end) }' 
+}
+
+case "${1:-}" in
+    record) shift; cmd_record "${1:-HEAD}" "${2:-audit}";;
+    show)   shift; cmd_show "${1:-HEAD}";;
+    stats)  shift; cmd_stats;;
+    *) cat <<'H'
+vibetrail-audit —— 审计过程留痕（替代 0 字节 marker）
+
+  vibetrail-audit record [<ref>] [<kind>] < findings.json
+        kind: audit（默认）/ crossverify / commentaudit
+        stdin: {"agents":[{"type":..,"perspective":..,"findings":N}],
+                "findings":[{"id":..,"severity":"HIGH|MED|LOW","claim":..,
+                             "verdict":"confirmed|false-positive","why":..,
+                             "location":{"uri":..,"line":..},"fix":..}]}
+  vibetrail-audit show   [<ref>]     看某个 commit 的审计记录
+  vibetrail-audit stats              命中率等，从记录算出来
+
+  severity → SARIF level 的映射（将来要导出是机械转换）：HIGH→error / MED→warning / LOW→note
+H
+    ;;
+esac

@@ -96,7 +96,8 @@ git 自身也为 notes 提供 `union` / `cat_sort_uniq`。一行配置换掉一�
 
 **已关闭**：O1 git-ai 采纳（否决）· O3 trace schema（已定）· O5 telemetry 配置（随 O1 消失）·
 O6 存量 marker 迁移（不迁移）· O7 `core.hooksPath`（并入 G3）· A 节四组数字 · B 节五条决策 ·
-M1 数组形态 · **G4 留痕自检** · **G3 的实现部分**（hook 成文件 + install/doctor，剩「保证每人跑」）。
+M1 数组形态 · G4 留痕自检 · G3 的实现部分 · **G1 查询端** · **G2 session 投影** · **K5 跨 kind 重复** ·
+**L2 审计留痕**（`vibetrail-audit`，断链二解决）。
 
 
 ## D. 三轮审计的方法教训
