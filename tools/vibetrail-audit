@@ -12,19 +12,41 @@ cd "$(git rev-parse --show-toplevel)" || exit 1
 OUT=.claude/trace/audits
 
 # 与 spec §4 逐字一致的锚。--cc 让有冲突解决的 merge 也有锚；普通与根 commit 结果不变。
-anchor(){ git diff-tree -p --cc --root "$1" 2>/dev/null | git patch-id --stable | awk 'NR==1{print $1}'; }
+anchor(){
+    # 返回 0 = 算出来了（值在 stdout）；非 0 = 算不出来。两者必须分开：
+    # 命令替换 $(anchor …) 会丢掉退出码，只看 stdout 的话，任何让管道输出为空的
+    # 故障（缺 awk、git 报错、对象不可读）都会退化成「空锚」，而空锚曾被当作放行
+    # —— 故障静默变成通过。pipefail 要在子 shell 内显式开，外层的管不到 $() 里面。
+    local out st
+    out=$(set -o pipefail
+          git diff-tree -p --cc --root "$1" 2>/dev/null \
+            | git patch-id --stable 2>/dev/null \
+            | awk 'NR==1{print $1}' 2>/dev/null); st=$?
+    [ $st -ne 0 ] && return 1
+    printf '%s' "$out"
+    return 0
+}
 
 cmd_record(){
     local sha kind; sha=$(git rev-parse "${1:-HEAD}") || exit 1; kind=${2:-audit}
-    local pid; pid=$(anchor "$sha")
+    local pid
+    pid=$(anchor "$sha") || { echo "✗ 锚算不出来（git / patch-id / awk 有问题），未写记录" >&2; exit 1; }
     if [ -z "$pid" ]; then
         echo "✓ 锚为空（无冲突 merge / 空 commit）—— 按 spec §4.0 无需审计，未写记录"
         return 0
     fi
     local body; body=$(cat)                       # findings JSON 从 stdin 读
+    # 空输入必须显式拦：jq -e . 对空输入返回 0（把「没有输入」当成功），
+    # 于是空 stdin 一路走到底、写出 0 字节、还打印 ✓。这是那条死循环的根因。
+    [ -z "$body" ] && {
+        echo "✗ 没有收到 findings。二选一：" >&2
+        echo "    …… | $(basename "$0") record $sha $kind    # 管进 findings JSON" >&2
+        echo "    mark-audit.sh $kind --none                  # 显式声明本次没找到" >&2
+        exit 1; }
     printf '%s' "$body" | jq -e . >/dev/null 2>&1 || { echo "✗ stdin 不是合法 JSON" >&2; exit 1; }
     mkdir -p "$OUT"
-    printf '%s' "$body" | jq -c \
+    local rec
+    rec=$(printf '%s' "$body" | jq -c \
         --arg pid "$pid" --arg kind "$kind" --arg sha "$sha" \
         --arg subj "$(git log -1 --format=%s "$sha")" \
         --arg sid "${CLAUDE_CODE_SESSION_ID:-}" \
@@ -32,9 +54,14 @@ cmd_record(){
         {t:"audit", v:1, patchId:$pid, kind:$kind,
          sessionId:(if $sid=="" then null else $sid end),
          at:$at, shaAtTime:$sha, subject:$subj,
-         agents:(.agents // []), findings:(.findings // [])}' >> "$OUT/$pid.jsonl"
-    local n; n=$(printf '%s' "$body" | jq '(.findings // [])|length')
-    echo "✓ $kind 记录 → $OUT/${pid:0:12}….jsonl（finding $n 条）"
+         agents:(.agents // []), findings:(.findings // [])}')
+    # 先在内存里成形并验非空，再落盘：直接 >> 会让 shell 在 jq 无输出时
+    # 照样建出一个 0 字节文件，而那个文件看着像「记录存在」。
+    [ -z "$rec" ] && { echo "✗ 记录未能生成，未写盘" >&2; exit 1; }
+    printf '%s\n' "$rec" >> "$OUT/$pid.jsonl"
+    local n; n=$(printf '%s' "$rec" | jq '(.findings // [])|length')
+    # 回显以实际写入为准，不是无条件打印 —— 之前写 0 字节也照样报 ✓
+    echo "✓ $kind 记录 → $OUT/${pid:0:12}….jsonl（finding $n 条，本文件累计 $(wc -l < "$OUT/$pid.jsonl" | tr -d ' ') 条）"
 }
 
 cmd_show(){
@@ -67,8 +94,11 @@ cmd_stats(){
 # 0 = 该 kind 的记录已存在，或锚为空（无需审计）；1 = 缺记录
 cmd_check(){
     local sha kind; sha=$(git rev-parse "${1:-HEAD}" 2>/dev/null) || return 1; kind=${2:-audit}
-    local pid; pid=$(anchor "$sha")
-    [ -z "$pid" ] && return 0                    # 空锚：spec §4.0 定为放行
+    local pid
+    pid=$(anchor "$sha") || return 1             # 算不出来 ⇒ 不放行
+    [ -z "$pid" ] && return 1                    # 空锚 ⇒ 不放行。合法空锚（干净 merge /
+                                                 # 空 commit）在闸门层已早退，到不了这里；
+                                                 # 能走到这儿的空锚只可能来自故障。
     local f="$OUT/$pid.jsonl"
     [ -f "$f" ] || return 1
     jq -e --arg k "$kind" -s 'any(.[]; .kind == $k)' "$f" >/dev/null 2>&1
