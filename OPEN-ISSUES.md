@@ -5,6 +5,11 @@
 > 单方面定下需要确认的决策、已知未修的缺口。**修掉一条删一条，本文为空即可删除。**
 >
 > 每条写四样：在哪、现状、为什么没动、要动需要什么。
+>
+> **K6 / G6 不来自那三轮**，是 2026-09-09 扫三方项目 teamai-cli、并对那两份文档做
+> 对抗性审计时反照出来的（见 [third-party/](third-party/teamai-cli-vs-vibetrail.md)）。
+> 又一次印证 §D 第一条：**盲区要靠换个视角才照得出来**——这次的「视角」是拿别人的
+> 实现当镜子，成本比再起一轮审计低得多。
 
 ## A. ~~需要在有 agentDock 与语料的机器上重数的数字~~ —— 已解决（2026-09-09）
 
@@ -80,16 +85,17 @@ git 自身也为 notes 提供 `union` / `cat_sort_uniq`。一行配置换掉一�
 |---|---|---|---|
 | ~~**G1**~~ | 功能缺口 | ✅ | ~~查询端完全缺失~~ —— **已实现** `tools/vibetrail`。做完当场照出一个写入端缺陷（见 K5）|
 | **G2** | 功能缺口 | 🔴 | **session 流水的写入者未定义**——spec §3 定了格式，没说谁写、何时写（§2 的 trailer 写入者已解决） |
+| **K6** | 已知缺陷 | 🔴 | **trace 已落自由文本，且一处脱敏都没有**——`audits/*.jsonl` 的 `findings[].claim`（审计结论正文，**由审计 agent 生成**，正文里完全可能带上被审代码片段、路径、密钥样本）与 `agents[].perspective`；`sessions/*.jsonl` 的 `end.subagents[].desc` 与 `session.cwd`（绝对路径，带用户名与项目名）。这些**随代码入仓**，推远端即团队可见。三方对照：teamai-cli 的对等字段（`promptSummary` / `firstPrompt`）**全部强制过 `redactWithEnv()`**，且团队推送默认只推计数与工具名、自由文本要显式 opt-in。要动：把「trace 落自由文本前必须过脱敏」写进 [spec §5 稳定面](spec/trace-v1.md)，并给 `claim` / `desc` 补脱敏环节。**原 K4（分支名）是本条的子集，已并入** |
 | **G3** | 功能缺口 | 🟡 | **没有「保证每人跑过 install」的机制**——脚本已有（`vibetrail-install` / `-doctor`，见 [CAPABILITIES §2.5](CAPABILITIES.md)），但 git 不允许仓库自动装 hook。业内解法是搭车在人本来就跑的步骤上（husky 挂 `npm install`）；agentDock 可搭 `Makefile`，**未做** |
 | **K5** | ~~已知缺陷~~ | ✅ | ~~一次「拒绝工具调用」被记两条~~ —— **已修**：`for tool use` 变体拆成独立 kind。实测 35 = 35 精确对上（见 spec §3.1）|
 | **K1** | 已知缺陷 | 🟡 | **提取器重复计数未去重**——方案已定（同 sid + 同 kind + ≤10 秒，靠 `isSidechain`/`agentId` 分层），但 `hit` 还没输出这两个字段 |
+| **G6** | 功能缺口 | 🟡 | **判据 fixture 是照「见过的形态」手搭的，没见过的第三种形态对测试不可见**——`tools/fixtures.jsonl` 26 条覆盖两种拒绝正文（`Permission to use …` 六个变体含多行命令 + `The user doesn't want to proceed …`），这次核过没有镜像盲区；但**机制上挡不住新形态**。三方实测的反例值得警惕：teamai-cli 的判据测试与我们同级完备（10 个测试文件，含一条把两个 interrupt 变体钉成预期的用例），却因全套件里 `Permission to use` 出现 **0 次**，对它自己 52% 的人拒漏判**恒绿**——测试不是缺失，是靠 fixture 选择恒绿。这正是 [CAPABILITIES §2.4](CAPABILITIES.md) 记的「假绿」模式。要动：fixture 来源从「见过的」换成「从全语料聚类出的 `is_error` / interrupt 正文形态」 |
 | ~~**G4**~~ | 功能缺口 | ✅ | ~~没有留痕自检~~ —— **已实现** `tools/vibetrail-doctor` |
 | **D1** | 待定决策 | 🟡 | **归属语义三处不一致**：`cherry-pick -n` 之后的 commit 与 `revert` 按执行者记；agent amend 人工 commit 记成 agent。都实测过、都写明了，但「该不该这样」没定 |
 | **D2** | 待定决策 | 🟢 | **SpecStory 留不留人类可读副本**（原 DESIGN O2；`brew trust` 随它自动定） |
 | **K2** | 已知缺陷 | 🟢 | **跨仓归属未定义**——一个会话可跨多仓，本项目开发会话即反例（`cwd` 在 agentDock、commit 在 vibetrail） |
 | **G5** | 功能缺口 | 🟢 | **`tool` 字段未产出**——被拒的工具名可从 `Permission to use (\S+)` 捕获，可选字段不升版本 |
 | **K3** | 已知缺陷 | 🟢 | **空消息守卫假设 `core.commentChar` 为 `#`**——改了注释符的仓退化为不判空（不崩溃） |
-| **K4** | 已知缺陷 | 🟢 | **分歧记录含分支名**——入仓后暴露内部分支命名，是否脱敏未定 |
 | **M1** | ~~未量~~ | ✅ | ~~`is_error` 数组形态在语料里有多少~~ —— **已量（09-09）：1145 个 `is_error` 块全部字符串形态，数组形态 0 个**。铁律五的修复是纯防御，未恢复任何漏计 |
 | **M2** | 未量 | 🟢 | **召回率绝对基线未测**——现有基线是无锚子串候选集；`permission_denied` 的「人工核对候选集」口径没记 |
 | **M3** | 未量 | 🟢 | **`.meta.json` 字段集随版本变**——2.1.85 两项 / 2.1.202 三项 / 2.1.260 四项。将来写 `end.subagents` 要按缺失容错 |
@@ -97,6 +103,7 @@ git 自身也为 notes 提供 `union` / `cat_sort_uniq`。一行配置换掉一�
 **已关闭**：O1 git-ai 采纳（否决）· O3 trace schema（已定）· O5 telemetry 配置（随 O1 消失）·
 O6 存量 marker 迁移（不迁移）· O7 `core.hooksPath`（并入 G3）· A 节四组数字 · B 节五条决策 ·
 M1 数组形态 · G4 留痕自检 · G3 的实现部分 · **G1 查询端** · **G2 session 投影** · **K5 跨 kind 重复** ·
+K4 分歧记录含分支名（并入 K6）·
 **L2 审计留痕**（`vibetrail-audit`，断链二解决）。
 
 
