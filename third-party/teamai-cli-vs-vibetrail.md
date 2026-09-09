@@ -15,7 +15,9 @@
 | 数据归属 | 机器本地 + 独立的团队知识仓 | **随被观测的代码走**（`<repo>/.claude/trace/`） |
 | 规模 | 62.5K 行 TS，685 commit，39 人 | 一组 shell/jq 工具 |
 
-唯一的正面重叠：**都读 Claude Code 的 transcript，都从里面提取人机分歧信号**。
+唯一的正面重叠：**都读 Claude Code 的 transcript，都从里面提取人机分歧信号**
+（它的扫描器还兼读 CodeBuddy `index.json` 与 Codex rollout，Cursor 无 transcript 只算
+`correction`——判据是几种 harness 的最小公分母，见分析文档 §4.1）。
 下面 §3 是这一处的逐条实测对比。
 
 ## 2. 功能面对照
@@ -23,18 +25,20 @@
 | 能力 | teamai-cli | vibetrail | 说明 |
 |---|---|---|---|
 | 团队资源分发（skill/rule/MCP/hook/agent） | ✅ 成熟 | ❌ 不做 | 对方的主业 |
-| 多 harness 适配（10 个工具） | ✅ | ❌ 只 Claude Code | |
-| 多 git provider（6 类） | ✅ | ❌ 只本地 git | |
+| 多 harness 适配（README 矩阵 10 个，代码另有 JoyCode） | ✅ | ❌ 只 Claude Code | |
+| 多 git provider（6 类）+ 非 git 的 HTTP 后端模式 | ✅ | ❌ 只本地 git | |
 | 团队知识库 + 检索（BM25 + 图） | ✅ beta | ❌ 不做 | |
 | 代码知识图谱（tree-sitter AST） | ✅ beta | ❌ 不做 | |
 | **读 transcript 提取人机分歧** | ✅ | ✅ | **唯一重叠，见 §3** |
 | 纠正话术识别（`correction`） | ✅ 启发式 | ❌ 已主动搁置 | 见 §3.4 |
-| 敏感信息脱敏 | ✅ `redact()` 全链路 | ❌ **已落自由文本，无脱敏** | 见 §6.1 |
+| 敏感信息脱敏 | ✅ 出口处 `redact()`（本地事件流仍明文） | ❌ **已落自由文本，无脱敏** | 见 §6.1 |
 | 团队看板 / 周报 | ✅ | ❌ 不做 | |
+| learning 投票飞轮 + 晋升（votes / `recall promote`） | ✅ | ❌ 不做 | |
+| CI 上从 MR 提知识（`ci extract-mr`） | ✅ | ❌ 不做 | MR → 知识，非 commit → 会话，见 §5.1 |
 | **commit ↔ session 关联** | ❌ | ✅ trailer 注入 | 见 §5.1 |
 | **审计过程留痕** | ❌ | ✅ `vibetrail-audit` | 见 §5.2 |
 | 单事件可回跳原文（uuid 指针） | ❌ 只存计数 | ✅ `turn` 字段 | |
-| 留痕随代码走 | ❌ 反向设计 | ✅ D2 | 见 §4 |
+| 留痕随代码走 | ❌ 默认反向；self 模式知识随 main 走 | ✅ D2 | 见 §4 |
 
 ## 3. 正面对撞：同一份语料，两套判据
 
@@ -119,7 +123,7 @@ Permission to use Bash with command cd /Users/…/worktrees/great-pascal-a9287f
 
 `scanTranscriptStop(hookData.transcript_path)` 只扫 hook 递过来的**单个**文件，
 而 Claude Code 的落盘是两层（布局本身见本项目 [DESIGN.md](../DESIGN.md):27，早有记录；
-下面的量级与 `isSidechain` 观察是本次实测新增）：
+下面的量级与字段层观察是本次实测新增）：
 
 ```
 ~/.claude/projects/<cwd-slug>/<sessionId>.jsonl                        ← 主会话，34 个
@@ -127,11 +131,14 @@ Permission to use Bash with command cd /Users/…/worktrees/great-pascal-a9287f
 ```
 
 子 agent 文件名是 `agent-<hex>`（728/728），记录里带的是**父会话的 `sessionId`**；
-`isSidechain` 在这些文件里根本不出现——**靠目录层级区分，不是靠字段**。
+每条记录 `"isSidechain":true` 且带 `agentId`（等于文件名里的 hex），主会话文件里每条都是
+`false`——子 agent 记录**不再嵌在主文件里**，目录与字段两套标识都在，任取其一都能分开。
 单个 sessionId 最多横跨 **291 个文件**。
+（第一版把这条写成「`isSidechain` 根本不出现」，写反了，见附录第 8 条。）
 
-teamai 拿不到这 728 个文件：它注册的 hook 里**没有 `SubagentStop`**，
-全仓也没有遍历 `subagents/` 的代码路径（均已 grep 核实）。
+teamai 拿不到这 728 个文件：它**内置**注册的 hook 里**没有 `SubagentStop`**，
+全仓也没有遍历 `subagents/` 的代码路径，且 transcript 只在 `stop` 事件里扫（均已 grep 核实）。
+团队自声明的 `hooks/hooks.yaml` 可以挂任意事件，但只跑自定义命令，不进扫描器。
 
 按文件类别分别实测：
 
@@ -159,8 +166,10 @@ teamai 处理**字符串形态**的 `message.content` 时，只把 interrupt 从
 必须讲清楚，否则上面就是稻草人。
 
 teamai 要的是**一个阈值判断**——「这次会话值不值得提示用户写成经验」。阈值 20，
-单个强信号即触发（interrupt / toolReject / correction 各 20 分；toolError 走分档，
-≥3 → 10 分、≥5 → 18、≥8 → 25）。
+分数上单个强信号即够（interrupt / toolReject / correction 各 20 分；toolError 走分档，
+≥3 → 10 分、≥5 → 18、≥8 → 25）。另有一道与判据无关的硬门槛 `toolCount >= 15`，
+下面的验算**没有建模它**——它只会让 teamai 提示得更少，与判据缺口同向，不改变
+「误差被阈值吸收」的结论，但「0 个跌破」是**分数口径**，不是最终提示口径。
 
 - **那 35 次双计不改变结论**：配对的那条 `toolReject` 已经给了 20 分，早过阈值。
 - **那 48 条归错桶确实掉 20 分**：它们**没有**配对打断（§3.1 ③），所以少一个强信号。
@@ -171,14 +180,17 @@ teamai 要的是**一个阈值判断**——「这次会话值不值得提示用
 
 两条必须说明的边界：
 
-- 这是**下界**：`correction`、skill/多样性加成没有建模，实际得分只会更高。
+- 这是**下界**：`correction`、skill/多样性加成、知识缺口加成没有建模，实际得分只会更高
+  （git commit 降权常量为 0，不需要建模）。
 - 有 **3 个会话正好卡在 20 分**（只有 1 次打断、`toolError` 不足 3 条）。
   判据再退一步就会掉下去，余量并不厚。
 
 **它的误差在阈值判断上基本被吸收了。对方的设计对它自己的用途是够的。**
 
-误差真正显形的地方是**把这些数字当数字用**——而 teamai 恰好有两处这么用：
-`teamai digest` 的「干预率」和 `teamai dashboard` 的成员「干预数」。
+误差真正显形的地方是**把这些数字当数字用**——而 teamai 恰好这么用，且是官方使用指南
+明写的用法：`teamai dashboard` 的成员「干预数」（原话「干预越少，说明 agent 一次把事做对的
+能力越强」），随 `pull` 聚合进团队仓 `stats/<user>.yaml`，再由 `teamai digest` 出
+「会话自主性」的人均干预率排行，并建议用它「验证某个 skill / rule 上线后干预率是否下降」。
 
 用本语料算（且假设它能扫到全部文件，实际还要再打个对折）：
 它会报 `285 + 44 = 329` 次干预，真实的人类分歧动作是 **342** 次
@@ -217,6 +229,14 @@ spec 该节的「三个实现读下来」应当补上它。
 团队走，放进某个业务仓反而是错的；我们存的是「这段代码是怎么来的」——它跟着代码走，
 放在机器本地则换台机器就没了。
 
+**一条必须加的限定：上表是 teamai 的默认模式（独立团队仓）。** 它还有一个单仓模式
+（self mode，`teamai init .`），在这个模式下**知识资产是随代码走的**：skills / rules / docs /
+learnings 和 `teamai.yaml` 提交在业务仓 main 的 `.teamai/` 里，clone 即得；会话与摩擦上报
+（members / sessions / votes / stats）推到同一 origin 的 `teamai-reports` 孤儿分支——同仓、
+但独立历史。所以「目标冲突」准确说是**默认模式冲突、self 模式部分重合**：它让「团队现在的
+配置和经验」跟着代码走了，但「这段代码是怎么来的」这类会话数据仍不在代码的提交历史里，
+与本项目的分歧在这一层没变。
+
 有意思的是**两边都被 worktree 咬过，解法相反**：
 
 - teamai：`git worktree list --porcelain` 取**第一条**当 `projectAnchor`，作为稳定的
@@ -231,10 +251,11 @@ spec 该节的「三个实现读下来」应当补上它。
 
 ### 5.1 commit ↔ session 关联
 
-teamai **完全没有**。它离得最近的是 `hasGitCommitInSession()`：
-`git log --after=<会话开始时间> -1`，只回答「这个时间窗里有没有人提交过」，
-用来给 friction 分**降权**（有 commit 且检索命中 → 说明顺利）。
-它不回答、也无意回答「哪个 commit 属于哪个会话」。
+teamai **完全没有**。它离得最近的是两条：`hasGitCommitInSession()`——
+`git log --after=<会话开始时间> -1`，只回答「这个时间窗里有没有人提交过」，本意是给 friction
+分降权，但降权常量当前为 0，只剩一个标志；以及 `teamai ci extract-mr` / `import --from-mr`——
+从已合并 MR 的 diff 与 commits 里提取知识建议，方向是 **MR → 知识**。
+两条都不回答、也无意回答「哪个 commit 属于哪个会话」。
 
 它的 `coauthor-reconcile` 只是**替团队开关各工具原生的 `Co-Authored-By` 策略**，
 写的是「AI 参与过」这个布尔，不是**哪一次会话**。
@@ -264,11 +285,22 @@ teamai 只存聚合计数和脱敏摘要，**没有回跳锚点**——它的用
 
 按性价比排序。**只列真正该做的，不列「它有所以我们也要有」的。**
 
+### 6.0 装一次、之后每次会话自动上报 —— 已立为需求，见 OPEN-ISSUES G7
+
+这条不是本文的推断，是用户看完对比后直接提的：「做成和 teamai 一样，装一次就行，
+然后 Claude 每次对话写代码的时候自动上报两路信息」。对方的做法在分析文档 §4.4
+（一次 `init` 写四个 harness hook、一个入口分发）和 §4.3（self 模式把 `.claude/settings.json`
+连 hooks 提交到 main，clone 即得）。现状、要动什么、以及「两路」待确认，都只记在
+[OPEN-ISSUES.md](../OPEN-ISSUES.md) 中心表 G7，此处不重复。
+
 ### 6.1 脱敏（`redact()`）—— 建议列入待办
 
-teamai 全链路强制：任何自由文本（prompt 摘要、会话摘要）落盘或上推前都过
-`redactWithEnv()`，且团队推送默认**只推计数和工具名**，prompt 文本要显式 opt-in
-（注释理由：`redact()` 是尽力而为，所以即便脱过也默认不推）。
+teamai 在**每个出口**强制脱敏：contribute 提示里的任务摘要、session save 的首 prompt、
+Stop 时截取的 AI 输出，三处都过 `redactWithEnv()`；且团队推送默认**只推计数和工具名**，
+prompt 文本要显式 opt-in（注释理由：`redact()` 是尽力而为，所以即便脱过也默认不推）。
+但它**不是全链路**：UserPromptSubmit 把 prompt 前 200 字符原样写进本机
+`~/.teamai/dashboard/events.jsonl`，本地事件流是明文（第一版写成「全链路强制」，已改）。
+差别在于它的明文不出机器，我们的会随仓推远端。
 
 我们的 trace 落在**仓里、随代码走**，一旦推到远端就是团队可见——**脱敏缺口比它更要命**。
 
@@ -294,7 +326,8 @@ teamai 对等的字段（`promptSummary`、`firstPrompt`）**全部强制过 `re
 两边都硬编码英文消息串，上游改文案即**静默失效**。
 
 ⚠️ **本文第一版写「它的判据常量没看到等价的回归钉子，这一点比 teamai 强」，
-审计时核实是错的，撤回。** teamai 有 10 个测试文件覆盖这套判据，
+审计时核实是错的，撤回。** teamai 有 13 个测试文件涉及这套判据（按 `toolReject` /
+中断串 grep；直接引用判据常量的 4 个），
 `dashboard-collector.test.ts` 里三条用例分别钉住「两个 interrupt 变体」「工具拒绝」
 「普通工具错误不算拒绝」——**保护强度与我们的 `test-extract.sh` 同级**。
 
@@ -331,7 +364,7 @@ teamai 对等的字段（`promptSummary`、`firstPrompt`）**全部强制过 `re
 实测证明这个精度差是真的，而且分两层：**判据层**漏 52% 的人拒（归成了机器失败），
 **运行时层**再漏一次（不扫 `subagents/`，而 58% 的人拒在那里），合计只登记 40%。
 同时也证明**对方并不因此有 bug**——这些误差在它自己的阈值判断里基本被吸收了，
-实测没有一个有分歧的会话被它彻底漏掉。
+实测没有一个有分歧的会话在分数口径上被它彻底漏掉（`toolCount` 硬门槛未建模，见 §3.4）。
 
 真正的教训不是「谁更准」，而是两条：
 
@@ -345,7 +378,8 @@ teamai 对等的字段（`promptSummary`、`firstPrompt`）**全部强制过 `re
 
 ## 附录：本文档的审计记录（2026-09-09）
 
-初稿写完后做了一轮对抗性审计，逐条回查代码与数据。**7 处断言被推翻或需要修正**，
+初稿写完后做了一轮对抗性审计，逐条回查代码与数据，**7 处断言被推翻或需要修正**；
+第二轮对照 teamai 官方 `docs/` 复核，又推翻 1 处、限定 4 处（第 8 条）。
 均已改在正文里，此处只留台账——这份文档自己也该有留痕。
 
 | # | 初稿的错误断言 | 核实结果 | 落在 |
@@ -353,11 +387,16 @@ teamai 对等的字段（`promptSummary`、`firstPrompt`）**全部强制过 `re
 | 1 | contribute-check「挂在 `PostToolUse` 上」 | 错。`hook-handlers.ts` 注册表里只挂 `stop`。我照抄了它 `types.ts` 里一句**过时注释** | 分析文档 §4.1 |
 | 2 | 把打分写成一个公式 | 不准。实为 `computeSmartScore()` + `applyPhase2Adjustments()` 两阶段 | 分析文档 §4.1 |
 | 3 | 「子 agent 文件名是自己的 uuid」 | 错。实为 `agent-<hex>.jsonl`，728/728 | 两份 |
-| 4 | 把 `subagents/` 布局当本次新发现 | 错。本项目 DESIGN.md:27 早有记录；新的只是量级与 `isSidechain` 缺席 | 两份 |
+| 4 | 把 `subagents/` 布局当本次新发现 | 错。本项目 DESIGN.md:27 早有记录；新的只是量级与字段层观察（第一版这里写的「`isSidechain` 缺席」本身也是错的，第 8 条推翻） | 两份 |
 | 5 | 「我们的 trace 暂时没有自由文本」 | **错，且方向相反**。`findings[].claim` / `agents[].perspective` / `end.subagents[].desc` 已在落盘。脱敏不是预防，是补洞 | 对比 §6.1 |
 | 6 | §3.4 用全语料算「0 个会话被漏掉」 | 口径错。teamai 运行时只见主会话文件。已按运行时语义重算：结论仍成立（0/20），但**有 3 个会话正好卡在 20 分**，余量不厚 | 对比 §3.4 |
-| 7 | 「它的判据常量没有回归钉子，这点我们更强」 | **错，撤回**。它有 10 个测试文件覆盖，含一条 `counts user interrupts (both variants)` 把双计**钉成预期行为**——所以 §3.1 ① 也从「疏漏」改判为「有意的分类学差异」 | 对比 §3.1 / §6.2 |
+| 7 | 「它的判据常量没有回归钉子，这点我们更强」 | **错，撤回**。它有 13 个测试文件涉及判据（第一版写 10，口径不明，已改），含一条 `counts user interrupts (both variants)` 把双计**钉成预期行为**——所以 §3.1 ① 也从「疏漏」改判为「有意的分类学差异」 | 对比 §3.1 / §6.2 |
+| 8 | 「`isSidechain` 在子 agent 文件里根本不出现，靠目录区分」 | **错，方向反了**。728 个文件 119,969 条记录全是 `true` 并带 `agentId`；主会话文件全是 `false`。同轮限定了 4 条：提示还有 `toolCount >= 15` 硬门槛（§3.4 验算未建模）；git commit 降权常量为 0；脱敏在出口而非全链路（本地 events.jsonl 明文）；「业务仓零残留」只是默认模式，self 模式知识随 main 走 | 两份 §3.2 / §3.4 / §4 / §5.1 / §6.1 |
 
 第 7 条连带出了本次审计**最有价值的一条**：它的测试不是缺失，是
 **靠 fixture 选择恒绿**——全套件 `Permission to use` 出现 0 次。
 这比「它没写测试」有意思得多，也更值得我们警惕。
+
+第 8 条的教训和第 1 条同款：第一版的「不出现」是**没数就下的结论**，数一遍只要一条 grep。
+第二轮的 4 条限定则都来自**只读代码、没读官方文档**——self 模式、硬门槛、降权为 0、
+本地明文，官方 `docs/usage-guide.md` 和设计文档里都有明写。

@@ -6,8 +6,9 @@
 >
 > 每条写四样：在哪、现状、为什么没动、要动需要什么。
 >
-> **K6 / G6 不来自那三轮**，是 2026-09-09 扫三方项目 teamai-cli、并对那两份文档做
-> 对抗性审计时反照出来的（见 [third-party/](third-party/teamai-cli-vs-vibetrail.md)）。
+> **K6 / G6 / G7 不来自那三轮**：K6 / G6 是 2026-09-09 扫三方项目 teamai-cli、并对那两份文档做
+> 对抗性审计时反照出来的（见 [third-party/](third-party/teamai-cli-vs-vibetrail.md)）；
+> G7 是同日用户看完对比后直接提的需求。
 > 又一次印证 §D 第一条：**盲区要靠换个视角才照得出来**——这次的「视角」是拿别人的
 > 实现当镜子，成本比再起一轮审计低得多。
 
@@ -89,8 +90,9 @@ git 自身也为 notes 提供 `union` / `cat_sort_uniq`。一行配置换掉一�
 | **G3** | 功能缺口 | 🟡 | **没有「保证每人跑过 install」的机制**——脚本已有（`vibetrail-install` / `-doctor`，见 [CAPABILITIES §2.5](CAPABILITIES.md)），但 git 不允许仓库自动装 hook。业内解法是搭车在人本来就跑的步骤上（husky 挂 `npm install`）；agentDock 可搭 `Makefile`，**未做** |
 | **K5** | ~~已知缺陷~~ | ✅ | ~~一次「拒绝工具调用」被记两条~~ —— **已修**：`for tool use` 变体拆成独立 kind。实测 35 = 35 精确对上（见 spec §3.1）|
 | **K1** | 已知缺陷 | 🟡 | **提取器重复计数未去重**——方案已定（同 sid + 同 kind + ≤10 秒，靠 `isSidechain`/`agentId` 分层），但 `hit` 还没输出这两个字段 |
-| **G6** | 功能缺口 | 🟡 | **判据 fixture 是照「见过的形态」手搭的，没见过的第三种形态对测试不可见**——`tools/fixtures.jsonl` 26 条覆盖两种拒绝正文（`Permission to use …` 六个变体含多行命令 + `The user doesn't want to proceed …`），这次核过没有镜像盲区；但**机制上挡不住新形态**。三方实测的反例值得警惕：teamai-cli 的判据测试与我们同级完备（10 个测试文件，含一条把两个 interrupt 变体钉成预期的用例），却因全套件里 `Permission to use` 出现 **0 次**，对它自己 52% 的人拒漏判**恒绿**——测试不是缺失，是靠 fixture 选择恒绿。这正是 [CAPABILITIES §2.4](CAPABILITIES.md) 记的「假绿」模式。要动：fixture 来源从「见过的」换成「从全语料聚类出的 `is_error` / interrupt 正文形态」 |
+| **G6** | 功能缺口 | 🟡 | **判据 fixture 是照「见过的形态」手搭的，没见过的第三种形态对测试不可见**——`tools/fixtures.jsonl` 26 条覆盖两种拒绝正文（`Permission to use …` 六个变体含多行命令 + `The user doesn't want to proceed …`），这次核过没有镜像盲区；但**机制上挡不住新形态**。三方实测的反例值得警惕：teamai-cli 的判据测试与我们同级完备（13 个测试文件涉及判据，含一条把两个 interrupt 变体钉成预期的用例），却因全套件里 `Permission to use` 出现 **0 次**，对它自己 52% 的人拒漏判**恒绿**——测试不是缺失，是靠 fixture 选择恒绿。这正是 [CAPABILITIES §2.4](CAPABILITIES.md) 记的「假绿」模式。要动：fixture 来源从「见过的」换成「从全语料聚类出的 `is_error` / interrupt 正文形态」 |
 | ~~**G4**~~ | 功能缺口 | ✅ | ~~没有留痕自检~~ —— **已实现** `tools/vibetrail-doctor` |
+| **G7** | 需求 | 🔴 | **「做成和 teamai 一样：装一次就行，然后 Claude 每次对话写代码的时候自动上报两路信息」**（用户原话，2026-09-09）。它把 G2 剩下的一半（sessions 谁写、何时写）和 G3（保证每人跑过 install）合成一件事。**现状**：git 的 `prepare-commit-msg` 每个 clone 手跑一次 `vibetrail-install`；`vibetrail-sync` 完全手动；Stop 侧只有审计闸门（`tools/fixtures/check-audit-stop.sh`）。**teamai 的做法**（[分析文档 §4.4](third-party/teamai-cli.md)）：一次 `init` 把 SessionStart / Stop / PostToolUse / UserPromptSubmit 写进各工具 settings，全部经 `teamai hook-dispatch <event>` 一个入口分发；其 self 模式更进一步——把 `.claude/settings.json` 连 hooks **提交到 main**，队友 clone 即得，SessionStart 再自愈式 bootstrap 本机侧。**要动需要什么**：① 在 `.claude/settings.json`（可入仓，不像 git hook）里挂 SessionStart → 幂等跑 `vibetrail-install`（G3 由此消失）、Stop → 投影当前会话（G2 由此消失）；hook stdin 直接给 `transcript_path` / `session_id`，不需要 ID 映射（[DESIGN §2.1](DESIGN.md)）；② 投影仍须按 `git worktree list` 聚合而不是只扫 hook 递来的那一个文件——teamai 正是栽在这一步，58% 的人拒在子 agent 文件里（[对比 §3.2](third-party/teamai-cli-vs-vibetrail.md)）；③ 每次 Stop 都重投影的成本要量（单会话 transcript 最大 106MB，`vibetrail-sync` 是整份重生成）；④ 入仓的项目级 hooks 在 Claude Code 里是否要用户确认一次，**待实测**。**先记录、暂不定**（用户 09-09：等需求和功能完善后再定）：「两路」具体指哪两路——最可能是 FLOW ④ 的两条投影流 `sessions/`（会话摘要 + 人机分歧）与 `audits/`（审计记录）；另一种读法是 sessions 与 commit 归属 trailer（后者装完 git hook 后已自动）。定了再拆任务 |
 | **D1** | 待定决策 | 🟡 | **归属语义三处不一致**：`cherry-pick -n` 之后的 commit 与 `revert` 按执行者记；agent amend 人工 commit 记成 agent。都实测过、都写明了，但「该不该这样」没定 |
 | **D2** | 待定决策 | 🟢 | **SpecStory 留不留人类可读副本**（原 DESIGN O2；`brew trust` 随它自动定） |
 | **K2** | 已知缺陷 | 🟢 | **跨仓归属未定义**——一个会话可跨多仓，本项目开发会话即反例（`cwd` 在 agentDock、commit 在 vibetrail） |
