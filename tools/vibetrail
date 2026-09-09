@@ -69,10 +69,25 @@ cmd_show(){
 cmd_log(){
     local n=${1:-20}
     printf '  %-9s %-38s %s\n' "commit" "subject" "session"
-    git log -"$n" --format='%h|%s|%(trailers:key=Claude-Session,valueonly,separator=)' 2>/dev/null \
-      | while IFS='|' read -r h s sid; do
-            printf '  %-9s %-38s %s\n' "$h" "$(echo "$s" | cut -c1-38)" "${sid:0:8}"
-        done
+    # subject 常含汉字：macOS 的 cut -c 按字节切（切出半个字）、printf %-Ns 按字节补齐（列错位），
+    # 所以截断和补齐交给 python3 按显示宽度算（东亚宽/全角字符算 2）。字段用 NUL 分隔，subject 里可以有 |
+    git log -"$n" --format='%h%x00%s%x00%(trailers:key=Claude-Session,valueonly,separator=)' 2>/dev/null \
+      | python3 -X utf8 -c '
+import sys, unicodedata
+def cw(c):  # 单字符显示宽度
+    if unicodedata.category(c) in ("Mn", "Me", "Cf"): return 0
+    return 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+def fit(s, w):  # 截到 w 列以内（整字），再补空格到 w 列
+    out, used = [], 0
+    for c in s:
+        d = cw(c)
+        if used + d > w: break
+        out.append(c); used += d
+    return "".join(out) + " " * (w - used)
+for line in sys.stdin:
+    h, s, sid = line.rstrip("\n").split("\0", 2)
+    print("  %-9s %s %s" % (h, fit(s, 38), sid[:8]))
+'
 }
 
 cmd_session(){
