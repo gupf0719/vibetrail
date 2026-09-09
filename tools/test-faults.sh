@@ -156,6 +156,32 @@ else
 fi
 cd /tmp && rm -rf "$d"
 
+echo "════ 装机：merge=union 只能圈 audits/ ════"
+BROAD_RE='^[[:space:]]*\.claude/trace/\*\*/\*\.jsonl[[:space:]]+merge=union'
+NARROW_RE='^[[:space:]]*\.claude/trace/audits/\*\.jsonl[[:space:]]+merge=union'
+# T15 全新装机只能写窄规则 —— 9bb5498 把 .gitattributes 收窄后 install 的 LINE 没跟上，
+# 每次装机都把 sessions/ 圈回 union，而 doctor 看不出来（重装 hook 时当场撞到）
+d=$(mkfix)
+if grep -qE "$NARROW_RE" "$d/.gitattributes" && ! grep -qE "$BROAD_RE" "$d/.gitattributes"; then
+    r T15 "全新装机只写 audits/ 的 union 规则" GREEN
+else r T15 "全新装机只写 audits/ 的 union 规则" RED; fi
+rm -rf "$d"
+
+# T16 旧的宽规则残留 → doctor 必须报警（以前只 grep 'merge=union'，宽窄都 ✓）
+d=$(mkfix)
+( cd "$d" && echo '.claude/trace/**/*.jsonl merge=union' > .gitattributes && git commit -q -am "旧的宽规则" )
+o=$( cd "$d" && bash "$SELF/vibetrail-doctor" 1 2>&1 | grep ".gitattributes" )
+echo "$o" | grep -q "宽规则" && r T16 "旧的宽规则残留 → doctor 必须报警" GREEN || r T16 "旧的宽规则残留 → doctor 必须报警" RED
+rm -rf "$d"
+
+# T17 重跑 install 必须删掉宽规则、补上窄规则，再跑一次不重复追加（幂等）
+d=$(mkfix)
+( cd "$d" && echo '.claude/trace/**/*.jsonl merge=union' > .gitattributes && git commit -q -am "旧的宽规则"
+  bash "$SELF/vibetrail-install" >/dev/null 2>&1; bash "$SELF/vibetrail-install" >/dev/null 2>&1 )
+nb=$(grep -cE "$BROAD_RE" "$d/.gitattributes"); nn=$(grep -cE "$NARROW_RE" "$d/.gitattributes")
+[ "$nb" = 0 ] && [ "$nn" = 1 ] && r T17 "重跑 install 收窄旧规则且幂等" GREEN || r T17 "重跑 install 收窄旧规则且幂等（宽 $nb / 窄 $nn）" RED
+rm -rf "$d"
+
 echo "════ 正向断言：通过不能靠沉默 ════"
 d=$(mkfix); risky "$d"
 ( cd "$d" && printf '%s' '{"agents":[],"findings":[]}' | bash .claude/vibetrail/vibetrail-audit record HEAD audit >/dev/null 2>&1

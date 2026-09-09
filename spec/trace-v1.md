@@ -31,7 +31,9 @@ transcript 没了就只剩摘要——这是**有意的取舍**，不是缺陷�
 `sessions/` 下每个 session 只写**自己那个文件**，并发会话之间不会冲突，也不需要读-改-写。
 `audits/` 按 patch 分文件，两个分支各审一次同一个 patch 再合并时，两侧各追加一行**必然冲突**
 （实测 `CONFLICT (content)`）。被观测仓的 `.gitattributes` 须声明
-`.claude/trace/**/*.jsonl merge=union`，声明后三行齐全、无冲突（实测）。
+`.claude/trace/audits/*.jsonl merge=union`，声明后三行齐全、无冲突（实测）。只圈 `audits/`：
+`sessions/` 是整份重生成的投影，union 会静默合出两条 `end`，冲突时正解是重跑 `vibetrail-sync`
+（`.gitattributes` 里有注释，故障套件 T11 / T15–T17 钉着）。
 JSONL 而非单个 JSON 对象：追加即写，崩溃不会留下半个文件，配合 `merge=union` 并发追加可无冲突合并。
 
 ## 2. commit ↔ session：只用 trailer，不留第二份

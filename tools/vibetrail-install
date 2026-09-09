@@ -26,14 +26,25 @@ fi
 cp "$SRC" "$DST"; chmod +x "$DST"
 echo "✓ hook → $DST"
 
+# 只对 audits/ 用 union：审计记录是追加式流，两个分支各追加一行、union 逐行取并集正好是对的。
+# sessions/ 是整份重生成的投影，union 会静默合出两条 end、at 乱序（.gitattributes 里有注释，
+# T11 钉着）。旧版这里写的是 `**/*.jsonl`，每次装机都把 sessions/ 一起圈进去，与它上面那条
+# 注释自相矛盾，而 doctor 只 grep 'merge=union'，宽窄都算 ✓ —— 所以装机时顺手把旧的宽规则
+# 删掉再补窄的，而不是再追加一条（T15–T17）。
 GA=.gitattributes
-LINE='.claude/trace/**/*.jsonl merge=union'
-if [ -f "$GA" ] && grep -qF "$LINE" "$GA"; then
-    echo "✓ .gitattributes 已有 merge=union"
+LINE='.claude/trace/audits/*.jsonl merge=union'
+BROAD='^[[:space:]]*\.claude/trace/\*\*/\*\.jsonl[[:space:]]+merge=union[[:space:]]*$'
+NARROW='^[[:space:]]*\.claude/trace/audits/\*\.jsonl[[:space:]]+merge=union[[:space:]]*$'
+if [ -f "$GA" ] && grep -qE "$BROAD" "$GA"; then
+    grep -vE "$BROAD" "$GA" > "$GA.tmp" || true; mv "$GA.tmp" "$GA"
+    echo "✓ .gitattributes 旧的宽规则 **/*.jsonl 已删（它把 sessions/ 也圈进了 union）"
+fi
+if [ -f "$GA" ] && grep -qE "$NARROW" "$GA"; then
+    echo "✓ .gitattributes 已有 audits/ 的 merge=union"
 else
     [ -f "$GA" ] && [ -n "$(tail -c1 "$GA")" ] && echo >> "$GA"
     echo "$LINE" >> "$GA"
-    echo "✓ .gitattributes 追加 merge=union（记得提交它）"
+    echo "✓ .gitattributes 追加 audits/ 的 merge=union（记得提交它）"
 fi
 
 mkdir -p .claude/trace/sessions .claude/trace/audits

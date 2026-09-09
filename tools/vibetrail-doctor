@@ -26,8 +26,14 @@ if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then echo "✓ ${CLAUDE_CODE_SESSION_ID
 else echo "— 当前 shell 不在 agent 会话里（人工提交本就不该留痕）"; fi
 
 printf '%-34s' ".gitattributes merge=union"
-if grep -qF 'merge=union' .gitattributes 2>/dev/null; then echo "✓"
-else echo "⚠ 缺失 —— 同分支并发追加时会要人工解冲突"; warn=1; fi
+# 只认 audits/ 那条。旧版 install 写的是 `**/*.jsonl`，连 sessions/ 一起 union 合并——那是整份
+# 重生成的投影，union 会静默合出两条 end；而这里以前只 grep 'merge=union'，宽窄都算 ✓（T16）。
+BROAD='^[[:space:]]*\.claude/trace/\*\*/\*\.jsonl[[:space:]]+merge=union[[:space:]]*$'
+NARROW='^[[:space:]]*\.claude/trace/audits/\*\.jsonl[[:space:]]+merge=union[[:space:]]*$'
+if grep -qE "$BROAD" .gitattributes 2>/dev/null; then
+    echo "⚠ 仍是旧的宽规则 **/*.jsonl —— sessions/ 会被 union 合并（静默合出两条 end），重跑 vibetrail-install"; warn=1
+elif grep -qE "$NARROW" .gitattributes 2>/dev/null; then echo "✓ 只对 audits/ 生效"
+else echo "⚠ audits/ 缺 merge=union —— 同分支并发追加时会要人工解冲突"; warn=1; fi
 
 printf '%-34s' "vendored 运行时完好"
 VD=.claude/vibetrail

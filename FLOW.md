@@ -13,7 +13,7 @@
 %%{init: {"flowchart": {"wrappingWidth": 320}}}%%
 flowchart TB
     subgraph S0["① 接入 —— 每个 clone 跑一次（git 不让仓库自动装 hook）"]
-        IN["tools/vibetrail-install（幂等）<br/>hook 装进有效 hooks 目录<br/>主仓与全部 worktree 共享，装一次全覆盖<br/>.gitattributes 加 .claude/trace/**/*.jsonl merge=union<br/>建 &lt;repo&gt;/.claude/trace/{sessions,audits}/<br/>vendor 运行时到 &lt;repo&gt;/.claude/vibetrail/<br/>闸门不依赖没克隆的外部仓"]
+        IN["tools/vibetrail-install（幂等）<br/>hook 装进有效 hooks 目录<br/>主仓与全部 worktree 共享，装一次全覆盖<br/>.gitattributes 加 .claude/trace/audits/*.jsonl merge=union，sessions/ 不用 union<br/>建 &lt;repo&gt;/.claude/trace/{sessions,audits}/<br/>vendor 运行时到 &lt;repo&gt;/.claude/vibetrail/<br/>闸门不依赖没克隆的外部仓"]
         DR["接着跑 tools/vibetrail-doctor 自检<br/>失效全是静默的，不自检不会知道<br/>查 hook 装没装 · 与仓内版本一致<br/>core.hooksPath 被谁占 · 会话变量可见<br/>merge=union 在不在<br/>vendored 运行时与上游一致<br/>最近 N 个 commit 几个带归属"]
     end
 
