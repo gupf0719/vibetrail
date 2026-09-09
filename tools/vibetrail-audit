@@ -63,7 +63,19 @@ cmd_stats(){
           "命中率": (if $tot > 0 then (($ok * 100 / $tot) | floor | tostring) + "%" else "n/a" end) }' 
 }
 
+# 专供闸门（Stop hook 等）调用：退出码即答案，锚的判据不需要在调用方复制一份。
+# 0 = 该 kind 的记录已存在，或锚为空（无需审计）；1 = 缺记录
+cmd_check(){
+    local sha kind; sha=$(git rev-parse "${1:-HEAD}" 2>/dev/null) || return 1; kind=${2:-audit}
+    local pid; pid=$(anchor "$sha")
+    [ -z "$pid" ] && return 0                    # 空锚：spec §4.0 定为放行
+    local f="$OUT/$pid.jsonl"
+    [ -f "$f" ] || return 1
+    jq -e --arg k "$kind" -s 'any(.[]; .kind == $k)' "$f" >/dev/null 2>&1
+}
+
 case "${1:-}" in
+    check)  shift; cmd_check "${1:-HEAD}" "${2:-audit}"; exit $?;;
     record) shift; cmd_record "${1:-HEAD}" "${2:-audit}";;
     show)   shift; cmd_show "${1:-HEAD}";;
     stats)  shift; cmd_stats;;
@@ -78,6 +90,7 @@ vibetrail-audit —— 审计过程留痕（替代 0 字节 marker）
                              "location":{"uri":..,"line":..},"fix":..}]}
   vibetrail-audit show   [<ref>]     看某个 commit 的审计记录
   vibetrail-audit stats              命中率等，从记录算出来
+  vibetrail-audit check  [<ref>] [<kind>]   闸门用：退出码 0=已审 / 1=缺记录
 
   severity → SARIF level 的映射（将来要导出是机械转换）：HIGH→error / MED→warning / LOW→note
 H

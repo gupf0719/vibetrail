@@ -38,5 +38,16 @@ fi
 
 mkdir -p .claude/trace/sessions .claude/trace/audits
 echo "✓ .claude/trace/ 就绪"
+
+# vendor 运行时进被观测仓。理由：Stop hook 这类**强制闸门**若依赖一个没克隆的外部仓，
+# 会 fail open —— 比没有闸门更糟。vendor 后仓库自给自足。
+# 版本漂移由 doctor 校验（同 hook 的做法），不靠人记得同步。
+VD=.claude/vibetrail; mkdir -p "$VD"
+for f in vibetrail vibetrail-audit vibetrail-sync vibetrail-doctor prepare-commit-msg extract-diverge.jq; do
+    [ -f "$SELF_DIR/$f" ] || continue
+    cp "$SELF_DIR/$f" "$VD/$f"
+    case "$f" in *.jq) ;; *) chmod +x "$VD/$f";; esac
+done
+echo "✓ 运行时 → $VD/（记得提交）"
 echo
 echo "自检：bash $SELF_DIR/vibetrail-doctor"

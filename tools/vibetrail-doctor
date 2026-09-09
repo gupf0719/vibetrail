@@ -29,6 +29,18 @@ printf '%-34s' ".gitattributes merge=union"
 if grep -qF 'merge=union' .gitattributes 2>/dev/null; then echo "✓"
 else echo "⚠ 缺失 —— 同分支并发追加时会要人工解冲突"; warn=1; fi
 
+printf '%-34s' "vendored 运行时与上游一致"
+VD=.claude/vibetrail
+if [ ! -d "$VD" ]; then echo "— 未 vendor（跑 vibetrail-install）"
+else
+    drift=0
+    for f in vibetrail vibetrail-audit vibetrail-sync vibetrail-doctor prepare-commit-msg extract-diverge.jq; do
+        [ -f "$SELF_DIR/$f" ] || continue
+        [ -f "$VD/$f" ] && cmp -s "$SELF_DIR/$f" "$VD/$f" || drift=$((drift+1))
+    done
+    if [ $drift -eq 0 ]; then echo "✓"; else echo "⚠ $drift 个文件与上游不同 —— 重跑 vibetrail-install"; warn=1; fi
+fi
+
 N=${1:-20}
 printf '%-34s' "最近 $N 个 commit 的归属"
 have=$(git log -"$N" --format='%(trailers:key=Claude-Session,valueonly,separator=)' 2>/dev/null | grep -c . || true)
