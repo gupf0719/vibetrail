@@ -199,7 +199,7 @@ SpecStory 存对话、Memento 把 transcript 挂进 git notes，**没有一个�
 
 ### 2.4 回归保护
 
-`tools/test-extract.sh` 跑 24 条正负例，比对的是**整条输出**（含 `human` 与全部字段名），
+`tools/test-extract.sh` 跑 26 条正负例，比对的是**整条输出**（含 `human` 与全部字段名），
 不只比 kind——否则 `human` 翻转、`t`/`at`/`branch` 字段名漂移都抓不到（实测变异全绿）。
 判据依赖英文消息串、Claude Code 改文案即静默失效，**这个测试是唯一的哨兵**。
 
