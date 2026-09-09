@@ -3,7 +3,9 @@
 > 三方项目分析，**不是**本项目的一部分。配套文档：[teamai-cli.md](teamai-cli.md)（项目分析）、
 > [teamai-cli-vs-vibetrail.md](teamai-cli-vs-vibetrail.md)（与本项目对比）。
 >
-> 快照 HEAD `224c0c4`（2026-09-09），行号均指向该快照，**引用请带日期**。全部读码所得；
+> 快照 HEAD `6ae0619`（2026-09-09），仓在 `/Users/gupengfei/program/code/teamai-cli`，行号均指向该快照，
+> **引用请带日期**。第一版基于同日的 `224c0c4`；两者之间 10 个 commit（ZCode、multi-project P3、self 模式瘦身），
+> 采集代码本身一行没动，只有 `types.ts` / `builtin-hooks.ts` / `pull.ts` / `init.ts` 与使用指南的行号平移，本文已对齐。全部读码所得；
 > 本机未装 teamai（`~/.teamai` 不存在），没有实机数据可对照。
 
 本文只回答一个问题：**它采了什么、落在哪、什么出本机。** 摩擦判据的精度问题不在这里重复，
@@ -11,7 +13,7 @@
 
 ## 0. 一句话
 
-**采的是「会话行为计数 + 少量截断文本」。** 入口只有它注入的 4 个 harness hook；先落
+**采的是「会话行为计数 + 少量截断文本」。** 入口只有它注入的 4 类 harness hook 事件（6 条条目，PostToolUse 按 `*` / `Skill` / `TodoWrite` 三个 matcher 各一条）；先落
 `~/.teamai/`；计数类随 `teamai pull` 自动 git 直推团队仓；文本类默认不出本机。
 
 分三层看：
@@ -24,7 +26,7 @@
 
 ## 1. 入口：4 个 hook 事件
 
-`teamai init` 往各 harness 注入 4 类 hook（`src/builtin-hooks.ts:222-227`），全部经
+`teamai init` 往各 harness 注入 4 类 hook（`src/builtin-hooks.ts:233-238`），全部经
 `teamai hook-dispatch <event>` 一个入口分发到注册表（`src/hook-handlers.ts:450`
 `buildHandlerRegistry()`，共 19 条注册）。与采集有关的：
 
@@ -32,6 +34,7 @@
 |---|---|---|---|
 | SessionStart | `dashboard-report` | 记 `session_start`；解析 AI 工具主进程 PID | 前台 |
 | SessionStart | `local-agent-sync` | HTTP 模式：POST report + sync（§3.3） | 前台 |
+| Stop / PostToolUse `*` / UserPromptSubmit | `local-agent-sync` | 同上——四个事件各 POST 一次（`:474,480,487`） | Stop 与 PostToolUse 后台，UserPromptSubmit 前台 |
 | PostToolUse `*` | `dashboard-report` | 每次工具调用记 `tool_use`，**只记工具名，不记参数** | 前台 |
 | PostToolUse `Skill` | `track` | skill 名 → `usage.jsonl`；Cursor 靠 `Read` 到 `SKILL.md` 识别 | 前台 |
 | UserPromptSubmit | `dashboard-report` | 记 `prompt_submit`，存 prompt **前 200 字** | 前台 |
@@ -41,31 +44,39 @@
 | Stop | `votes-sync` | 扫 transcript 里的 recall 标记，记 learning 采纳票 | 前台，gitOnly |
 | Stop | `update` | 后台查 npm registry 有无新版，只发包名 | 后台 |
 
-三个口径：
+四个口径：
 
+- 分发层 **fail-open**：`hook-dispatch-cli.ts:185` 用 cwd 选 config，取不到（没 init、解析失败）时
+  `filterHandlersForConfig()` 原样放行全部 19 条（`hook-handlers.ts:503-517`，注释自称「fail-open by design」），
+  `dashboardReportHandler` 自己也不看 config——没 init 过的目录里事件照样进 `events.jsonl`；「限定在指定项目」
+  只在上报环节按 cwd 过滤（§3.1）。
 - `gitOnly` 的 handler 在 HTTP 团队源下被整体过滤（`:510` `filterHandlersForConfig()`）；
   `dashboard-report` 不带这个标记，所以 **HTTP 模式下本机采集照常，只是不往 git 仓上报**。
-- 开关：`sharing.contributeHint.enabled: false` 关掉整个 `contribute-check`；`TEAMAI_RECALL_DISABLED=1`
-  关掉 `votes-sync`。**`dashboard-report` 本次 grep 未见任何开关**，要彻底不采只能 `teamai hooks remove`。
+- 开关：`contribute-check` 有三级，优先级为环境变量 `TEAMAI_CONTRIBUTE_HINT_DISABLED=1` > 本机 config 的
+  `contributeHintEnabled` > 团队 `sharing.contributeHint.enabled`（`src/types.ts:147-155`）；`TEAMAI_RECALL_DISABLED=1`
+  关掉 `votes-sync`。**`dashboard-report` 没有任何开关**（grep 了全部 `TEAMAI_*` 环境变量与 config 键）：
+  `TEAMAI_HOOKS_DISABLED=1` 只否决团队在 `hooks.yaml` 里自声明的 hook，注释明写「built-in operational hooks
+  still apply」（`src/types.ts:1563-1567`），要彻底不采只能 `teamai hooks remove`。
 - 没有 `SubagentStop`，子 agent 的 transcript 一律看不到。已在
   [teamai-cli.md §4.1.1](teamai-cli.md) 展开，此处不重复。
 
 ## 2. 本机落盘：`~/.teamai/` 清单
 
 采集类数据全部在 `~/.teamai/` 顶层，**不按项目分区**；teamai-cli.md §4.3 说的
-`~/.teamai/projects/<slug>/` 分区只装团队仓 clone 与资源缓存。也就是说多项目的会话事件混在同一个
+`~/.teamai/projects/<slug>/` 分区只装团队仓 clone、资源缓存与 config / state 这类机器数据（P2 瘦身搬的也只是这些，
+采集流一个文件没动；跨项目混流的问题设计文档明写推迟到 P3）。也就是说多项目的会话事件混在同一个
 `events.jsonl` 里，靠每条的 `cwd` 事后过滤（§3.1 的作用域过滤即基于此）。
 
 ### 2.1 `dashboard/events.jsonl`：主数据流
 
 `parseHookEvent()`（`src/dashboard-collector.ts:785`）把 hook 的 STDIN JSON 折成一条
-`DashboardEvent`（`src/types.ts:849`）追加写入。每条都有的字段：
+`DashboardEvent`（`src/types.ts:860`）追加写入。每条都有的字段：
 
 | 字段 | 来源 |
 |---|---|
 | `type` | `session_start` / `tool_use` / `prompt_submit` / `stop`；看板进程另会补 `process_exit`（`src/dashboard.ts:87-104`） |
 | `timestamp` | hook 触发时刻，不是 transcript 里的时间 |
-| `sessionId` | hook 的 `session_id` > `CLAUDE_SESSION_ID` > `pid-<ppid>-<cwd>` 兜底（`src/utils/session-id.ts`） |
+| `sessionId` | hook 的 `session_id` > `CLAUDE_SESSION_ID` > `pid-<ppid>-<cwd>` 兜底（`src/utils/session-id.ts:28-39`）。**兜底 id 把 cwd 绝对路径原样嵌进 id**，不哈希——它就是 §3.2 里写进团队仓 HTML 注释的「完整 sessionId」 |
 | `tool` | harness 名：claude / codex / cursor / codebuddy … |
 | `cwd` | hook 的 `cwd`，Cursor 取 `workspace_roots` 第一项；**绝对路径** |
 
@@ -78,8 +89,8 @@
 | `prompt_submit` | `promptSummary` | `prompt.slice(0, 200)`，**未脱敏** | `:841` |
 | `stop` | `transcriptPath` | hook 递来的 transcript 绝对路径 | `:846` |
 | `stop` | `stoppedOutput` | 读 transcript 末尾 10 KB，取最后一条 assistant 文本，`redactWithEnv()` 后截 500 字 | `:65-113` |
-| `stop` | `interventions` | `{interrupt, toolReject, toolError}`，全量扫 transcript 的累计快照；三者全 0 时不写 | `:854-860` |
-| `stop` | `tokens` | `{input, output, cacheRead, cacheCreation}`，全 0 时不写；Codex 另带 `tokenScope` | `:861-865` |
+| `stop` | `interventions` | `{interrupt, toolReject, toolError}`，全量扫 transcript 的累计快照；三者全 0 时不写 | `:853-859` |
+| `stop` | `tokens` | `{input, output, cacheRead, cacheCreation}`，全 0 时不写；Codex 另带 `tokenScope` | `:860-864` |
 | `stop` | `prompts` | 真人轮数：有真实文本的 user 记录，排除打断 / tool_result / `isMeta` / `isSidechain` / `<task-notification>` | `:286-333` |
 
 Stop 时那次全量扫描（`scanTranscriptStop()`，`:167`）的判据：
@@ -88,24 +99,24 @@ Stop 时那次全量扫描（`scanTranscriptStop()`，`:167`）的判据：
 - `toolReject`：`tool_result.is_error === true` 且正文含 `The tool use was rejected` 或
   `doesn't want to proceed with this tool use`（`:323`）
 - `toolError`：`is_error === true` 但不匹配上面两个串（`:327`）
-- token：Claude 按 `message.id` 去重后累加 `message.usage` 四项（`:276-282`）；Codex 取最新的
+- token：Claude 按 `message.id`（缺失时退到 `requestId`）去重后累加 `message.usage` 四项（`:270-282`）；Codex 取最新的
   `token_usage_record`；CodeBuddy 读 `index.json` 的 `requests[].usage`（`:509`）；Cursor 没有
   transcript，token 恒 0
-- 单文件上限 50 MB（`src/types.ts:976`），超过记一条 warn 后返回全 0
+- 单文件上限 50 MB（`src/types.ts:987`），超过记一条 warn 后返回全 0
 
-生命周期：超过 5,000 行触发压缩（`:1219`），**只保留活跃会话**（30 分钟内有活动，或刚停不到
+生命周期：满 5,000 行触发压缩（`:1219`，判据是 `< 5000` 则跳过），**只保留活跃会话**（30 分钟内有活动，或刚停不到
 30 秒）的事件，其余整段丢弃。原始事件流是短命的，长期留下的只有 §2.6 的上报水位和团队仓里的累计值。
 
 ### 2.2 `usage.jsonl` 与 `known-skills.json`
 
-- `usage.jsonl`：一行一条 `{skill, timestamp, tool}`（`src/types.ts:723`）。只有三种来源：
+- `usage.jsonl`：一行一条 `{skill, timestamp, tool}`（`src/types.ts:734`）。只有三种来源：
   `Skill` 工具调用、Cursor `Read` 到 `SKILL.md`、`/xxx` 开头的 prompt。上报成功后截断
   （`src/usage-tracker.ts:197`）。
 - `known-skills.json`：用过的 skill 名集合，不随截断丢失。
 
 ### 2.3 `sessions/<sid>.json`：contribute 状态
 
-`ContributeState`（`src/types.ts:1016`），Stop 时由 `contribute-check` 写：
+`ContributeState`（`src/types.ts:1027`），Stop 时由 `contribute-check` 写：
 
 | 字段 | 内容 |
 |---|---|
@@ -159,7 +170,7 @@ git 模式在 Stop 时写进本地团队仓副本、随下次 pull 推送；单�
 
 | 指标 | 算法 | 出处 |
 |---|---|---|
-| `correction` | Stop 后 60 秒内的 `prompt_submit`，且 `promptSummary` 命中中英日纠正词表；每个 Stop 只被消费一次 | `src/dashboard-collector.ts:1167`，词表 `src/types.ts:969` |
+| `correction` | Stop 后 60 秒内的 `prompt_submit`，且 `promptSummary` 命中中英日纠正词表；每个 Stop 只被消费一次 | `src/dashboard-collector.ts:1167`，词表 `src/types.ts:980` |
 | 会话状态灯 | running / waiting_for_input / idle（5 分钟）/ stopped（PID 死亡） | `rebuildSessions()` `:951` |
 | 按仓库归属 | 取 cwd 末段目录名；home / tmp / workspace 等归 `no_repo` | `src/utils/repo-attribution.ts:47` |
 | 按小时活动 / 夜猫子比例 / 活跃分钟 | 事件时间戳分桶；0-6 点占比；相邻事件间隔 < 5 分钟累加 | `src/session-analytics.ts:88` |
@@ -174,11 +185,11 @@ git 模式在 Stop 时写进本地团队仓副本、随下次 pull 推送；单�
 `reportUsageToTeam()`（`src/team-push.ts:313`）在每次 pull 末尾跑（`src/pull.ts` 第 4 步
 「Auto-report」段），直接 commit + push 到团队仓默认分支，**不走 MR**，5 秒超时，失败下次重试。写两个文件：
 
-**`stats/<user>.yaml`**（`UserStats`，`src/types.ts:737`）：
+**`stats/<user>.yaml`**（`UserStats`，`src/types.ts:748`）：
 
 | 字段 | 内容 | 上报口径 |
 |---|---|---|
-| `username` / `updatedAt` | git provider 登录名，generic git 取 git 身份（`src/init.ts:1080`） | |
+| `username` / `updatedAt` | git provider 登录名，generic git 取 git 身份（`src/init.ts:1105`） | |
 | `skills.<name>` | `{count, lastUsed}` | `usage.jsonl` 聚合后累加 |
 | `interventions` | `{sessions, interrupt, toolReject, correction}` | 按会话正增量累加；**`toolError` 不上报** |
 | `prompts` | 真人轮数累计 | 同上 |
@@ -194,8 +205,12 @@ git 模式在 Stop 时写进本地团队仓副本、随下次 pull 推送；单�
 
 HTTP 团队源不走这条（pull.ts 里 `repo.kind !== 'http'` 才进 targets），见 §3.3。
 
-另：`teamai init` 时注册 `members/<user>.yaml`（`src/init.ts:1237-1250`），记 username / displayName
-这类身份字段，无采集数据。
+另：`teamai init` 时注册 `members/<user>.yaml`（git 模式 `src/init.ts:1276-1283`；self 模式 `:927-940`，推到
+`teamai-reports`），经 `mergeMemberConfig()`（`src/members.ts:32-60`）写 username / displayName / registeredAt，
+以及 `--role` 的 `role` 和 `init --project <id>` 累加进去的 `projects` 列表（跨目录 append + 去重）——身份与项目归属，
+无采集数据。注意 **`--project` 不进采集口径**：`stats/<user>.yaml`、`events.jsonl`、session 摘要都不带 project id，
+作用域过滤只按 cwd（上文第二点）。它的「项目」解决的是资源分发，不是「采集限定在指定项目」（本项目 OPEN-ISSUES G8
+要的那种）——参照它时别把这两件事混起来。
 
 ### 3.2 手动：`teamai session save --push`
 
@@ -206,7 +221,7 @@ HTTP 团队源不走这条（pull.ts 里 `repo.kind !== 'http'` 才进 targets�
 |---|---|
 | HTML 注释 | **完整 sessionId**（幂等键） |
 | 标题 | 日期 · sessionId 前 8 位 · harness 名 |
-| Project | **cwd 绝对路径，原样**（`:157`） |
+| Project | **cwd 绝对路径，原样**（`:157`）；harness 不给 `session_id` 时，上一行 HTML 注释里的 `pid-<ppid>-<cwd>` 兜底 id 又带一次路径 |
 | Prompts / Tools | 真人轮数；工具总数与种类数 |
 | Interventions | interrupt / toolReject / correction 三个数 |
 | Top tools | 前 8 个工具名 × 次数 |
@@ -219,7 +234,8 @@ HTTP 团队源不走这条（pull.ts 里 `repo.kind !== 'http'` 才进 targets�
 
 配置了 HTTP 端点（`local-agent/config.json`，或 `TEAMAI_HTTP_ENDPOINT` 等环境变量，
 `src/local-agent.ts:623`）时，**每个 hook 事件**都会 POST 一次 report 加一次 sync
-（`reportAndSyncLocalAgent()`，`:3024`）。
+（`reportAndSyncLocalAgent()`，`:3024`）。例外：检测到 CloudStudio 沙箱时跳过 report、只跑 sync，除非
+`TEAMAI_ALLOW_SANDBOX_REPORT=1`（`:3050`）。
 
 report 载荷（`buildReportPayload()`，`:1527`）：
 
@@ -255,7 +271,7 @@ sync 载荷（`:1609`）只有 `agent_type / local_agent_id / status / workspace
 | 项 | 依据 |
 |---|---|
 | 工具参数 `tool_input` | `parseHookEvent()` 只取 `tool_name`；`track` 只从 `tool_input` 里抠 skill 名 |
-| 文件内容 / diff / 代码 | 无读工作区文件的采集路径；codebase extract 是显式命令，不在 hook 链上 |
+| 文件内容 / diff / 代码 | hook 链上唯一读工作区的是 HTTP 模式的资产清单：扫各绑定工作区的 `<tool>/skills`、`/rules` 目录取 slug / version（`src/local-agent.ts:1542-1551`），不读代码；codebase extract 是显式命令，不在 hook 链上 |
 | 完整 prompt / 完整对话 | 截断为 200 / 500 / 160 字三档 |
 | 子 agent transcript | 无 `SubagentStop`，无遍历 `subagents/` |
 | commit ↔ session 关联 | `hasGitCommitInSession()` 只做时间窗存在性判断 |
@@ -264,7 +280,7 @@ sync 载荷（`:1609`）只有 `agent_type / local_agent_id / status / workspace
 
 ## 5. 与自述不符之处
 
-`docs/usage-guide.zh-CN.md:1142,1155` 两处写「只统计次数 / 轮数与 token，**不落地任何 prompt 或
+`docs/usage-guide.zh-CN.md:1160,1173` 两处写「只统计次数 / 轮数与 token，**不落地任何 prompt 或
 transcript 原文**」。代码事实：
 
 | # | 事实 | 出处 | 出本机？ |
@@ -277,7 +293,7 @@ transcript 原文**」。代码事实：
 
 评估：1-4 都留在本机，不是泄露级问题，但「不落地任何 prompt 原文」这句话是错的，且 §2.9 说明
 `correction` 指标在结构上就依赖 prompt 文本。第 5 条是真出本机，把每个人的本机目录结构带进了团队仓；
-文档 `:1175` 只提了 prompt 行的 opt-in，没提路径。
+文档 `:1193` 只提了 prompt 行的 opt-in，没提路径。
 
 `--include-prompt` 那条链路的脱敏是 `redactWithEnv()`（`src/utils/redact.ts:142`）：环境变量里像密钥的值
 + 一组厂商 token 形态正则。对比文档 §6.1 已评估过，此处不重复。

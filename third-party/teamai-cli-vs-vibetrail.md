@@ -2,7 +2,8 @@
 
 > 配套文档：[teamai-cli.md](teamai-cli.md)（对方项目本身的分析）、
 > [teamai-cli-collection.md](teamai-cli-collection.md)（对方的采集清单）。
-> 对方快照 HEAD `224c0c4`（2026-09-09）。判据实测于 **2026-09-09**，语料 **762 个 transcript 文件**。
+> 对方快照 HEAD `6ae0619`（2026-09-09；第一版基于同日的 `224c0c4`，之间 10 个 commit，影响本文的只有 ZCode、
+> multi-project P3、self 模式瘦身三项，见附录第 9 条）。判据实测于 **2026-09-09**，语料 **762 个 transcript 文件**。
 
 ## 1. 结论先行
 
@@ -14,7 +15,7 @@
 | 时间方向 | **向前**：让下一次会话干得更好 | **向后**：让出问题时能查回去 |
 | 主体 | 团队（多人多仓多工具） | 代码（一个仓的提交历史） |
 | 数据归属 | 机器本地 + 独立的团队知识仓 | **随被观测的代码走**（`<repo>/.claude/trace/`） |
-| 规模 | 62.5K 行 TS，685 commit，39 人 | 一组 shell/jq 工具 |
+| 规模 | 63.4K 行 TS，695 commit，40 人 | 一组 shell/jq 工具 |
 
 唯一的正面重叠：**都读 Claude Code 的 transcript，都从里面提取人机分歧信号**
 （它的扫描器还兼读 CodeBuddy `index.json` 与 Codex rollout，Cursor 无 transcript 只算
@@ -26,7 +27,7 @@
 | 能力 | teamai-cli | vibetrail | 说明 |
 |---|---|---|---|
 | 团队资源分发（skill/rule/MCP/hook/agent） | ✅ 成熟 | ❌ 不做 | 对方的主业 |
-| 多 harness 适配（README 矩阵 10 个，代码另有 JoyCode） | ✅ | ❌ 只 Claude Code | |
+| 多 harness 适配（README 矩阵 11 个，新增 ZCode；代码另有 JoyCode 与内部变体） | ✅ | ❌ 只 Claude Code | |
 | 多 git provider（6 类）+ 非 git 的 HTTP 后端模式 | ✅ | ❌ 只本地 git | |
 | 团队知识库 + 检索（BM25 + 图） | ✅ beta | ❌ 不做 | |
 | 代码知识图谱（tree-sitter AST） | ✅ beta | ❌ 不做 | |
@@ -191,7 +192,7 @@ teamai 要的是**一个阈值判断**——「这次会话值不值得提示用
 误差真正显形的地方是**把这些数字当数字用**——而 teamai 恰好这么用，且是官方使用指南
 明写的用法：`teamai dashboard` 的成员「干预数」（原话「干预越少，说明 agent 一次把事做对的
 能力越强」），随 `pull` 聚合进团队仓 `stats/<user>.yaml`，再由 `teamai digest` 出
-「会话自主性」的人均干预率排行，并建议用它「验证某个 skill / rule 上线后干预率是否下降」。
+「会话自主性」的人均干预率排行，并说它「可用于验证某个 skill / rule 上线后干预率是否下降」。
 
 用本语料算（且假设它能扫到全部文件，实际还要再打个对折）：
 它会报 `285 + 44 = 329` 次干预，真实的人类分歧动作是 **342** 次
@@ -206,7 +207,8 @@ teamai 要的是**一个阈值判断**——「这次会话值不值得提示用
 不能只讲差异。teamai 做对了两件业内没普及的事，和本项目独立收敛到了同一处：
 
 1. **只读 JSON 字段，不 grep 整行原文。** 它锚定 `type === "user"` 的记录、逐块判
-   `is_error`，没有裸 grep。本项目 spec §3.3 第 1 条讲的是同一件事
+   `is_error`，没有裸 grep（`:233-241` 有一个整行 `includes('"user"')` 式的预筛，但只用来跳行，
+   产生不了命中）。本项目 spec §3.3 第 1 条讲的是同一件事
    （裸 grep 在对抗样本上精确率仅 10.5%）。
 2. **区分人的决定与机器的行为。** 它分 `toolReject`（人拒）/ `toolError`（机器），
    我们用 `human` 布尔。**这个区分本身是对的**，两边只是分界线画的位置不同。
@@ -230,11 +232,14 @@ spec 该节的「三个实现读下来」应当补上它。
 团队走，放进某个业务仓反而是错的；我们存的是「这段代码是怎么来的」——它跟着代码走，
 放在机器本地则换台机器就没了。
 
-**一条必须加的限定：上表是 teamai 的默认模式（独立团队仓）。** 它还有一个单仓模式
-（self mode，`teamai init .`），在这个模式下**知识资产是随代码走的**：skills / rules / docs /
+**一条必须加的限定：上表说的是采集数据与机器数据，两种模式都不随代码走；self 模式的特殊之处只在知识资产。**
+单仓模式（self mode，`teamai init .`）下**知识资产是随代码走的**：skills / rules / docs /
 learnings 和 `teamai.yaml` 提交在业务仓 main 的 `.teamai/` 里，clone 即得；会话与摩擦上报
 （members / sessions / votes / stats）推到同一 origin 的 `teamai-reports` 孤儿分支——同仓、
-但独立历史。所以「目标冲突」准确说是**默认模式冲突、self 模式部分重合**：它让「团队现在的
+但独立历史；机器数据（config / state / 搜索索引 / env 备份 / MCP manifest / workspaces）自 P2 瘦身
+（`b5435b3`，HEAD 已含）起也搬进 `~/.teamai/projects/<slug>/`，`.teamai/` 里只剩提交到 main 的知识和
+gitignore 的临时 worktree——第二轮写的「零残留只是默认模式的目标」在 HEAD 上已不成立，两种模式都零残留。
+所以「目标冲突」准确说是**采集数据两边都不随代码走、知识资产 self 模式随代码走**：它让「团队现在的
 配置和经验」跟着代码走了，但「这段代码是怎么来的」这类会话数据仍不在代码的提交历史里，
 与本项目的分歧在这一层没变。
 
@@ -264,9 +269,10 @@ teamai **完全没有**。它离得最近的是两条：`hasGitCommitInSession()
 我们走 `prepare-commit-msg` 注入 `Claude-Session:` trailer，读进程级环境变量
 `CLAUDE_CODE_SESSION_ID`，实测覆盖 11 个场景（含 rebase / cherry-pick / worktree 并发）。
 
-**这是两个项目最大的能力差，且方向上不可互换**——它主动不碰用户的 git hook
-（`src/utils/git.ts` 注释明确「不写 `core.hooksPath`，不改变用户平常的 git commit`」），
-这是个自觉的边界选择，不是没做完。
+**这是两个项目最大的能力差，且方向上不可互换**——它不碰用户的 git hook：全仓没有安装 git hook
+或写 `core.hooksPath` 的代码（grep 核实）。`src/utils/git.ts:30-31` 那句「不写 `core.hooksPath`，不改变用户
+平常的 `git commit`」说的是它自己在隔离 worktree 里提交知识 / 上报时 `--no-verify` 的作用域，不是关于用户
+hook 的政策宣示——「自觉的边界选择」是本文的推断，不是它的自述；结论（不是没做完）不变。
 
 ### 5.2 审计过程留痕
 
@@ -293,13 +299,21 @@ teamai 只存聚合计数和脱敏摘要，**没有回跳锚点**——它的用
 （一次 `init` 写四个 harness hook、一个入口分发）和 §4.3（self 模式把 `.claude/settings.json`
 连 hooks 提交到 main，clone 即得）。现状、要动什么、以及「两路」待确认，都只记在
 [OPEN-ISSUES.md](../OPEN-ISSUES.md) 中心表 G7，此处不重复。同日追加的 G8（采集限定在指定项目）、
-G9（本地能看采集了什么、让开发放心）同样以 teamai 为参照，也只记在中心表。
+G9（本地能看采集了什么、让开发放心）同样以 teamai 为参照，也只记在中心表。参照 G8 时注意一条实测：
+teamai 的 `--project`（HEAD 已落地 `projects list/set/members` 与 `push --project`）只作用于资源分发，
+采集数据（`stats/` / `events.jsonl` / session 摘要）不带 project id；而且分发层 **fail-open**——没 init 过的
+目录里 hook 一样把事件写进本机 `events.jsonl`（`hook-dispatch-cli.ts:185` 取不到 config 时
+`filterHandlersForConfig()` 原样放行，注释自称「fail-open by design」）。它有的只是**上报限定**：
+`filterEventsByScope` 按 cwd 决定哪个团队仓收哪些会话。「采集限定在指定项目」这个能力它没有，
+见采集清单 §1 / §3.1；OPEN-ISSUES G8 第一版转述的「其余目录一律早退」已同日改正。
 
 ### 6.1 脱敏（`redact()`）—— 建议列入待办
 
 teamai 在**每个出口**强制脱敏：contribute 提示里的任务摘要、session save 的首 prompt、
 Stop 时截取的 AI 输出，三处都过 `redactWithEnv()`；且团队推送默认**只推计数和工具名**，
-prompt 文本要显式 opt-in（注释理由：`redact()` 是尽力而为，所以即便脱过也默认不推）。
+prompt 文本要显式 opt-in（注释理由：`redact()` 是尽力而为，所以即便脱过也默认不推）。「只推计数」指的是
+不推 prompt 文本——`session save --push` 的 markdown 仍带完整 sessionId 与 cwd 绝对路径，harness 不给
+`session_id` 时兜底 id 里还嵌一次 cwd（采集清单 §2.1 / §3.2）。
 但它**不是全链路**：UserPromptSubmit 把 prompt 前 200 字符原样写进本机
 `~/.teamai/dashboard/events.jsonl`，本地事件流是明文（第一版写成「全链路强制」，已改）。
 差别在于它的明文不出机器，我们的会随仓推远端。
@@ -329,7 +343,8 @@ teamai 对等的字段（`promptSummary`、`firstPrompt`）**全部强制过 `re
 
 ⚠️ **本文第一版写「它的判据常量没看到等价的回归钉子，这一点比 teamai 强」，
 审计时核实是错的，撤回。** teamai 有 13 个测试文件涉及这套判据（按 `toolReject` /
-中断串 grep；直接引用判据常量的 4 个），
+中断串 grep；其中 4 个把判据字面串硬编码进 fixture，**0 个** import 判据常量本身——第一版写的
+「直接引用判据常量的 4 个」口径错了，第三轮改），
 `dashboard-collector.test.ts` 里三条用例分别钉住「两个 interrupt 变体」「工具拒绝」
 「普通工具错误不算拒绝」——**保护强度与我们的 `test-extract.sh` 同级**。
 
@@ -355,7 +370,7 @@ teamai 对等的字段（`promptSummary`、`firstPrompt`）**全部强制过 `re
 - **dashboard / digest**：需要团队规模才有意义，与本项目「一个仓的提交历史」的主体不符。
 - **多 harness 适配**：本项目的地基（hook 在 desktop 下热加载、
   `CLAUDE_CODE_SESSION_ID` 逐字等于 transcript 文件名）是 Claude Code 特有的实测结论，
-  摊到 10 个 harness 上等于重做地基。
+  摊到 11 个 harness 上等于重做地基。
 
 ## 7. 一句话总结
 
@@ -381,8 +396,16 @@ teamai 对等的字段（`promptSummary`、`firstPrompt`）**全部强制过 `re
 ## 附录：本文档的审计记录（2026-09-09）
 
 初稿写完后做了一轮对抗性审计，逐条回查代码与数据，**7 处断言被推翻或需要修正**；
-第二轮对照 teamai 官方 `docs/` 复核，又推翻 1 处、限定 4 处（第 8 条）。
+第二轮对照 teamai 官方 `docs/` 复核，又推翻 1 处、限定 4 处（第 8 条）；第三轮对齐到对方 HEAD `6ae0619`
+逐条回查三份文档，推翻 2 处、过期 3 处、补口径 4 处（第 9 条）；第四轮抽查 OPEN-ISSUES G8 对 teamai 的转述，
+推翻 1 处「其余目录一律早退」（第 10 条）。
 均已改在正文里，此处只留台账——这份文档自己也该有留痕。
+
+**第四轮的第二部分没跑完**：改完前九条之后照惯例（见本项目 memory「修完再全新审计」）另起了一个
+独立只读 agent，对三份文档做逐 hunk 的全新复核，但会话预算耗尽，用户在它读完第一批 diff、
+尚未产出结论前中止了它。**这份文档目前只经过「自己动手复核 + 抽查」，没有第 1-3 轮那种完整的
+独立第二意见。** 后续如果再碰这几份文档，应当先补跑一次完整的独立复核，而不是默认第 9/10 条
+已经是终态。
 
 | # | 初稿的错误断言 | 核实结果 | 落在 |
 |---|---|---|---|
@@ -394,11 +417,17 @@ teamai 对等的字段（`promptSummary`、`firstPrompt`）**全部强制过 `re
 | 6 | §3.4 用全语料算「0 个会话被漏掉」 | 口径错。teamai 运行时只见主会话文件。已按运行时语义重算：结论仍成立（0/20），但**有 3 个会话正好卡在 20 分**，余量不厚 | 对比 §3.4 |
 | 7 | 「它的判据常量没有回归钉子，这点我们更强」 | **错，撤回**。它有 13 个测试文件涉及判据（第一版写 10，口径不明，已改），含一条 `counts user interrupts (both variants)` 把双计**钉成预期行为**——所以 §3.1 ① 也从「疏漏」改判为「有意的分类学差异」 | 对比 §3.1 / §6.2 |
 | 8 | 「`isSidechain` 在子 agent 文件里根本不出现，靠目录区分」 | **错，方向反了**。728 个文件 119,969 条记录全是 `true` 并带 `agentId`；主会话文件全是 `false`。同轮限定了 4 条：提示还有 `toolCount >= 15` 硬门槛（§3.4 验算未建模）；git commit 降权常量为 0；脱敏在出口而非全链路（本地 events.jsonl 明文）；「业务仓零残留」只是默认模式，self 模式知识随 main 走 | 两份 §3.2 / §3.4 / §4 / §5.1 / §6.1 |
+| 9 | 第三轮（对方 HEAD `6ae0619`）：①「硬门槛 / 降权为 0 / 本地明文，官方文档都有明写」；②「直接引用判据常量的 4 个测试」；③「零残留只是默认模式」；④「README 矩阵 10 个 harness」；⑤「`projects set/members` 尚未落地」 | ① **错**：只有 self 模式在官方文档里，另三条只在代码注释，指南 `:1160` 对明文这条还写的是反话；② **口径错**：0 个测试 import 判据常量，4 个是把字面串硬编码进 fixture；③ **过期**：P2 瘦身后 self 模式机器数据也入分区；④ **过期**：ZCode 加入后 11 个；⑤ **过期**：P3 已落地。另补 5 条口径：`--project` 不进采集且分发层 fail-open（没 init 的目录照采，OPEN-ISSUES G8 的「其余目录早退」同日改正）；HTTP 同步四个事件都跑；contribute 提示三级开关；`git.ts` 那句注释是 `--no-verify` 作用域而非 hook 政策；recall 命中加的是 `recalled_count` 不是 upvote | 三份 + OPEN-ISSUES G8 |
+| 10 | OPEN-ISSUES G8 转述「hook-dispatch 按 cwd 门控……其余目录一律早退」 | **错**。`hook-dispatch-cli.ts:185` 取不到 config（没 init 过 / 解析失败）时 `filterHandlersForConfig()` 按注释「fail-open by design」原样放行全部 19 条 handler；`dashboardReportHandler` 本身也不查 config。teamai 有的是**上报限定**（`filterEventsByScope` 按 cwd 决定哪个团队仓收哪些会话），不是「采集限定在指定项目」这个能力 | OPEN-ISSUES G8 / 三份 |
 
 第 7 条连带出了本次审计**最有价值的一条**：它的测试不是缺失，是
 **靠 fixture 选择恒绿**——全套件 `Permission to use` 出现 0 次。
 这比「它没写测试」有意思得多，也更值得我们警惕。
 
 第 8 条的教训和第 1 条同款：第一版的「不出现」是**没数就下的结论**，数一遍只要一条 grep。
-第二轮的 4 条限定则都来自**只读代码、没读官方文档**——self 模式、硬门槛、降权为 0、
-本地明文，官方 `docs/usage-guide.md` 和设计文档里都有明写。
+第二轮的 4 条限定里，只有 self 模式是官方文档明写的（使用指南 + `data-directory-layout.md`）；硬门槛
+（`toolCount >= 15`）、降权为 0、本地 `events.jsonl` 明文三条**官方文档一个字都没有**，只在代码注释里
+（`src/types.ts:1063-1067`、`:1127-1128`、`src/dashboard-collector.ts:839-841`），使用指南 `:1160` 对明文
+这条写的还是反话。第二轮把这句写成「都有明写」，是**把自己读代码得来的结论记成了对方文档的自述**——
+第三轮撤回。第三轮自己的教训是**快照会动**：同一天里对方推了 10 个 commit，三条断言就此过期，
+所以三份文档的引用都改成带 HEAD 与日期。

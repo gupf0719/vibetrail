@@ -4,8 +4,9 @@
 > [teamai-cli-vs-vibetrail.md](teamai-cli-vs-vibetrail.md)（与本项目对比）、
 > [teamai-cli-collection.md](teamai-cli-collection.md)（采集清单：采什么、落哪、什么出本机）。
 >
-> 扫描对象：`/Users/gupengfei/program/go/src/teamai-cli`，HEAD `224c0c4`（2026-09-09）。
-> 本文所有数字均来自该快照，**引用请带这个日期**——它是个每天都在动的仓。
+> 扫描对象：`/Users/gupengfei/program/code/teamai-cli`（原在 `program/go/src/`，已迁），HEAD `6ae0619`（2026-09-09）。
+> 本文所有数字均来自该快照，**引用请带这个日期**——它是个每天都在动的仓：第一版基于同日的 `224c0c4`，
+> 复核时对方已推 10 个 commit（ZCode、multi-project P3、self 模式瘦身），本文三处断言因此过期，已改。
 
 ## 0. 一句话
 
@@ -19,11 +20,11 @@
 | 项 | 值 |
 |---|---|
 | 归属 | Tencent 开源，MIT，`npm i -g teamai-cli` |
-| 版本 | `package.json` 0.22.0；CHANGELOG 最新已发布 0.23.0（2026-09-08），另有 Unreleased 段 |
-| 规模 | src 非测试 TypeScript **62,514 行**；测试 **228 个文件 / 57,145 行**（测试与实现近 1:1） |
-| 历史 | 685 commit，39 位贡献者 |
+| 版本 | `package.json` 0.22.0；CHANGELOG 最新已发布 0.23.0（2026-09-08），另有 Unreleased 段（列了 multi-project #426 与分区迁移 #439；ZCode、self 模式瘦身、`projects` 子命令已进 main 但还没进 CHANGELOG） |
+| 规模 | src 非测试 TypeScript **63,426 行**；测试 **231 个文件 / 57,975 行**（测试与实现近 1:1） |
+| 历史 | 695 commit，40 位贡献者 |
 | 形态 | 单个 npm CLI（`teamai`），commander + tsup + vitest |
-| 内置资源 | 2 个 skill（`teamai-share-learnings`、`team-wiki-codebase`）、1 个 agent（`teamai-recall`）、一组内置 rules（`src/builtin-rules.ts`，recall 规则注入块，随 recall 开关部署） |
+| 内置资源 | 2 个 skill（`teamai-share-learnings`、`team-wiki-codebase`）、1 个 agent（`teamai-recall`）、**1 条**内置 rule（`teamai-recall`，`src/builtin-rules.ts:28`，每次 `pull` 部署，recall 关闭时以 `skipRecall` 跳过——`pull.ts:523` `skipRecall = !isRecallEnabled(...)`；第一版写「一组」不准） |
 
 ## 2. 产品三层
 
@@ -66,10 +67,12 @@ HTTP 源（`teamai source add-http`）。HTTP 团队会被过滤掉所有 `gitOn
 | Tags | `teamai tags` | 给 skill/rule 打标签，成员按标签订阅 |
 | Sources | `teamai source` | 订阅别的团队 / 组织内公共仓的 skill |
 | Exclude | `teamai skill exclude` | 本地排除不想要的 skill |
-| Projects（Unreleased） | `teamai init --project <ids>` | 与 role 正交的第二维：`manifest/projects.yaml` 声明逻辑项目，目录取 role ∪ project 的并集，`learnings/<project-id>/` 只对该项目可见；`projects set/members` 子命令尚未落地 |
+| Projects（Unreleased） | `teamai init --project <ids>`、`teamai projects list` / `set` / `members`、`teamai push --project <id>` | 与 role 正交的第二维：`manifest/projects.yaml` 声明逻辑项目，目录取 role ∪ project 的并集，`learnings/<project-id>/` 只对该项目可见；`init --project` 把 id 累加进 `members/<user>.yaml` 名册（P3，`f11e2d1`，HEAD 已含；第一版写「尚未落地」已过期）。**只管分发，不进采集**：stats / events / session 摘要都不带 project id（采集清单 §3.1） |
 
-**适配 10 个 agent harness**（README 矩阵的行数）：Claude Code、Codex、Cursor、CodeBuddy、
-WorkBuddy、OpenCode、OpenClaw、Hermes、DeepSeek Harness、Qoder。代码的 `toolPaths` 还多出
+**适配 11 个 agent harness**（README 矩阵的行数）：Claude Code、Codex、Cursor、CodeBuddy、
+WorkBuddy、OpenCode、OpenClaw、Hermes、DeepSeek Harness、Qoder，以及 `8b6c870` 新增的 **ZCode**
+（hook 是 Claude 形态但以 `process` 类型条目写进共享的 `~/.zcode/cli/config.json` 并强制 `hooks.enabled: true`；
+不同步 rules / env；co-author reconcile 显式跳过它）。代码的 `toolPaths` 还多出
 **JoyCode**（0.23.0 列为一等支持，但它没有 hook 机制，只能手动 `teamai pull`）和 4 个内部变体
 （`claude-internal` / `codex-internal` / `tclaude` / `tcodex`），矩阵没列。
 **适配 6 类 git provider**：GitHub、GitLab、GitCode、CNB、TGit、私有 git
@@ -89,7 +92,8 @@ WorkBuddy、OpenCode、OpenClaw、Hermes、DeepSeek Harness、Qoder。代码的 
 - **AST 轨**（TS/JS、Python、Go）：`web-tree-sitter` 的 WASM parser 解析
   `import`/`require`、调用点、TS `implements`，产出文件级
   `DEPENDS_ON` / `REFERENCES` / `IMPLEMENTS` 边，带置信度权重。
-- **启发式轨**（全语言，含 Java/Rust）：正则抽取，兜住 AST 轨不覆盖的语言。
+- **启发式轨**（TS/JS、Go、Python、Java、Rust，外加 TOML / SQL，`extractors/index.ts:5-24`；其余语言返回空，
+  第一版写「全语言」不准）：正则抽取，兜住 AST 轨不覆盖的 Java / Rust 等。
 
 WASM 是纯 JS 依赖，不需要本地工具链；加载失败自动退回启发式并记 `AST_UNAVAILABLE` gap。
 `TEAMAI_SKIP_AST=1` 可强制只走启发式。**这个降级设计是个亮点**——AST 解析是最容易
@@ -106,9 +110,9 @@ WASM 是纯 JS 依赖，不需要本地工具链；加载失败自动退回启�
 | 实时看板 | `teamai dashboard` | 网页看板：成员会话状态、干预数、token |
 | 知识库健康 | `dashboard` → KB Health | 覆盖率、被召回最多 / 从未被召回的条目、召回趋势 |
 | 库存维护 | `teamai recall maintenance` | 归档低置信 learning，标记过期 skill/rule/doc |
-| 知识飞轮 | `recall` 命中自动 upvote → `votes/<user>.yaml` → Stop 时 `votesSyncHandler` 同步 | learning 的**置信度**由此而来，上一行的「低置信」指的就是它 |
-| 晋升 | `teamai recall promote` | learning → skill / rule / doc；门槛四项：置信度 ≥ 0.90、≥ 5 upvote、≥ 2 贡献者、存在 ≥ 14 天 |
-| CI 接入 | `teamai ci extract-mr` / `import --from-mr` | MR 打开时把知识建议发成评论、reviewer 👎 拒绝、合并后 `--mode write` 写库；方向是 **MR → 知识**，不是 commit → 会话 |
+| 知识飞轮 | `recall` 命中自动加 `recalled_count`（`recall.ts:231-234`，函数名叫 `autoUpvote` 但加的不是 upvote）→ Stop 时 `votesSyncHandler` 扫 AI 回复末尾的 referenced-doc-ids 标记，只给本会话召回过的 id 加 `upvoted_count`（`hook-handlers.ts:307-310`）→ `votes/<user>.yaml` | learning 的**置信度**由此而来，上一行的「低置信」指的就是它；第一版写「命中自动 upvote」把两个计数器混了 |
+| 晋升 | `teamai recall promote` | learning → skill / rule / doc；门槛四项：置信度 ≥ 0.90、≥ 5 upvote、≥ 2 贡献者、存在 ≥ 14 天（`maintenance/promote.ts:25-28`；天数只在 frontmatter 有 `date` 时才查） |
+| CI 接入 | `teamai ci extract-mr` / `import --from-mr` | MR 打开时把知识建议发成评论、reviewer 👎 拒绝（TGit 上是 ☝️）、合并后 `--mode write` 写库；方向是 **MR → 知识**，不是 commit → 会话 |
 
 `docs/designs/git-native-memory.md` 还记了第三层 **Reflect**（LLM 对 learnings 做元分析）——
 推迟到知识库积累 20+ 篇之后。
@@ -120,7 +124,8 @@ WASM 是纯 JS 依赖，不需要本地工具链；加载失败自动退回启�
 
 ### 4.1 friction 打分：读会话流水的那一段
 
-**这是与本项目正面重叠的唯一一处代码**，所以单独展开。
+**这是与本项目正面重叠的唯一一处代码**，所以单独展开（读 transcript 的还有两处——Stop 时截最后一条
+AI 输出、votes 同步扫 referenced-doc-ids 标记——但都不判分歧）。
 
 入口 `src/dashboard-collector.ts` 的 `scanTranscriptStop()`，流式逐行读 transcript，
 只看 `type === "user"` 的记录，在 `message.content` 数组里逐块判：
@@ -130,7 +135,7 @@ WASM 是纯 JS 依赖，不需要本地工具链；加载失败自动退回启�
 | `interrupt` | text 块 `startsWith("[Request interrupted by user")` | 人打断 |
 | `toolReject` | `is_error === true` 的块正文 `includes` `"The tool use was rejected"` 或 `"doesn't want to proceed with this tool use"` | 人拒绝工具调用 |
 | `toolError` | `is_error === true` 但**不匹配上面两个串** | AI 自己搞不定工具 |
-| `correction` | 一次 Stop 之后 60s 内的新 prompt，且命中纠正词表 | 人在纠偏 |
+| `correction` | **不在 transcript 扫描里**：从 `events.jsonl` 算——上一次 `stop` 事件后 60s 内的 `prompt_submit`，其 `promptSummary` 命中纠正词表（`dashboard-collector.ts:1108-1171`） | 人在纠偏 |
 | `prompts` | 有真实文本的 user 记录，排除 interrupt / tool_result / meta / sidechain / `<task-notification>` 前缀 | 真人轮数 |
 
 纠正词表（`CORRECTION_KEYWORDS`）是中英日三语硬编码：`不对`/`错了`/`重来`/`撤销`、
@@ -139,8 +144,9 @@ prompt 消费一次，再往后的 prompt 算新任务。
 
 **这个扫描器不只读 Claude Code。** 同一个入口按文件名分流：CodeBuddy 的 `index.json` 走
 `scanCodebuddyIndex()`，Codex 的 rollout 文件另取会话级 `token_usage_record`；Cursor 没有
-transcript，只算 `correction`，token 记 N/A。判据取的是几种 harness 的最小公分母，
-这是它只认两个拒绝串的一部分原因。
+transcript，分歧只算 `correction`（真人轮数仍从 `prompt_submit` 计），没有 token 字段。判据取的是几种
+harness 的最小公分母，这是它在 Claude 路径上只认两个拒绝串的一部分原因（CodeBuddy 路径另有自己的一个：
+`CODEBUDDY_REJECT_MARKER = 'User rejected this command'`，`dashboard-collector.ts:538`，匹配 `errorMessage`）。
 
 **方法论上和本项目同源：只读 JSON 字段，不 grep 整行原文**，并且把「人拒」
 （`toolReject`）和「机器失败」（`toolError`）分开——这两点是对的，业内不是所有工具
@@ -163,7 +169,7 @@ applyPhase2Adjustments()   + 知识缺口加成（recall 一次没命中 → 20�
 才提示，每个会话最多一次（`state.hinted`）。
 
 分层短路做得细：第一层只看 `toolCount` 与 5 分钟 TTL，不读任何事件文件；第二层才
-读 `events.jsonl` 算分，且带缓存。
+读 `events.jsonl` 算分（并对 transcript 实时重扫一次，`frictionOnly`，`contribute-check.ts:591`），且带缓存。
 
 ⚠️ **注意别被它自己的注释带偏**：`src/types.ts` 里那段流程注释写的是
 「exit early (~1ms per PostToolUse)」，但 `src/hook-handlers.ts` 的注册表里
@@ -237,7 +243,8 @@ key 级手术，绝不整份重生成**；Codex 的 TOML 走文本手术以保�
 | Cursor | `~/.cursor/cli-config.json` 的 `attribution.attributeCommitsToAgent` | 尽力而为（已知上游 bug 可能忽略） |
 
 **只写不删**：团队之后撤销策略时不回滚，因为用户可能已经依赖那条 trailer 了。
-上次写入的意图记在 `state.coAuthorManaged` 里保证幂等。
+上次写入的意图记在 `state.coAuthorManaged` 里保证幂等。ZCode 被显式跳过：它没有文档化的 attribution 设置，
+写进共享 `config.json` 只会是个没人读的未知键（`coauthor-reconcile.ts:96-98`，HEAD 新加）。
 
 这是全仓工程判断最成熟的一处：明确区分了「我拥有的文件」和「我借住的文件」。
 
@@ -252,15 +259,21 @@ skill 资源 4.1 MB + 搜索索引 1.8 MB）。三个问题：污染业务仓工
 
 两条限定：
 
-- **零残留只是独立团队仓模式的目标。单仓模式（self mode，`teamai init .`）刻意反着来**：
-  skills / rules / docs / learnings 和 `teamai.yaml` 提交在业务仓 **main** 上的 `.teamai/`，
-  随 `git clone` 走；members / sessions / votes / stats 推到同一 origin 的 `teamai-reports`
-  **孤儿分支**（独立历史）；只有 config / token / state 留本机（gitignore）。
-  `data-directory-layout.md` 把 self 模式列为迁移的硬 no-op，理由就是「its `.teamai/` is
-  team knowledge committed to main」。
-- **旧安装自动迁移**（Unreleased）：首次 `init` / `pull` / `push` 把 `<repo>/.teamai/`
+- **零残留在 HEAD 上对两种模式都成立；单仓模式（self mode，`teamai init .`）反着来的只有知识资产**：
+  skills / rules / docs / learnings / env / agents / hooks / mcp 和 `teamai.yaml`、`.gitignore` 提交在业务仓
+  **main** 上的 `.teamai/`（`migrate.ts:60-66` 的 class-B 清单），随 `git clone` 走，所选工具的 settings
+  （如 `.claude/settings.json`）也一起提交；members / sessions / votes / stats 推到同一 origin 的
+  `teamai-reports` **孤儿分支**（独立历史）；机器数据（config.yaml、state.json、搜索索引、env 备份、
+  managed-mcp、workspaces/）自 P2 瘦身（`b5435b3`，HEAD 已含）起也搬进 `~/.teamai/projects/<slug>/`，
+  `.teamai/` 里只剩知识和 gitignore 的临时 worktree（`reports-wt/`、`knowledge-wt/`）；token 走全局
+  `~/.teamai/token`（`TEAMAI_TOKEN_PATH`）。第一版写的「self 模式是迁移的硬 no-op」在 `224c0c4` 是对的
+  （`migrate.ts` 当时 `kind === 'self'` 直接返回），HEAD 已过期：P2 给 self 模式加了**按白名单逐项搬迁**
+  （复制到分区再删源，不重命名 `.teamai/`、不改 `repo.localPath`）。
+- **旧安装自动迁移**（Unreleased）：git 模式首次 `init` / `pull` / `push` 把 `<repo>/.teamai/`
   复制 → 校验 → 原子切换进分区，旧目录保留为 `.teamai.bak/` 作人工回滚；只读命令与
   `hook-dispatch` 永不触发迁移，迁移后不支持降级。
+- 顺带：HEAD 上 `data-directory-layout.md:138` 的 P1-3 段仍写着「self mode is a hard no-op」，与同文新增的
+  P2 段自相矛盾，`migrate.ts:28,93` 的注释也没跟上——和 §4.1 那条过时注释同款，读它的文档要以代码为准。
 
 分区键用「双锚」模型：
 
@@ -274,8 +287,8 @@ workspaceRoot  = git rev-parse --show-toplevel（当前 checkout）
 资源必须落 `workspaceRoot` 的原因：所有 AI 工具都是从启动目录往上扫到**当前**仓根来
 发现项目资源的，没有一个会跟到主 checkout 去。
 
-⚠️ **这条设计（默认模式）与本项目的 D2 决策方向相反**，是两边最根本的架构分歧；self 模式
-让知识随代码走，与我们部分重合，但会话/摩擦数据仍在代码提交历史之外。见对比文档 §4。
+⚠️ **这条设计与本项目的 D2 决策方向相反**，是两边最根本的架构分歧；self 模式
+让知识随代码走，与我们部分重合，但会话/摩擦数据两种模式下都在代码提交历史之外。见对比文档 §4。
 
 ### 4.4 hook 策略：只用 harness 生命周期 hook，不碰 git hook
 
@@ -285,13 +298,14 @@ workspaceRoot  = git rev-parse --show-toplevel（当前 checkout）
 |---|---|---|
 | `SessionStart` | pull（后台）、dashboard 上报、MR 提示、包声明提示、HTTP 后端同步 | 15s |
 | `Stop` | 更新检查（后台）、votes 同步、**contribute 检查**、dashboard 上报（含 transcript 扫描）、HTTP 后端同步 | 15s |
-| `PostToolUse`（`*` / `Skill` / `TodoWrite`） | dashboard 计数、Skill 埋点、TodoWrite 的 recall 提醒 | 10s / 10s / 3s |
-| `UserPromptSubmit` | 延迟提示投递、包提示投递、slash 命令埋点、dashboard 上报 | 10s |
+| `PostToolUse`（`*` / `Skill` / `TodoWrite`） | dashboard 计数、Skill 埋点、TodoWrite 的 recall 提醒、HTTP 后端同步（后台） | 10s / 10s / 3s |
+| `UserPromptSubmit` | 延迟提示投递、包提示投递、slash 命令埋点、dashboard 上报、HTTP 后端同步 | 10s |
 
-\* 超时只渲染给 Cursor / WorkBuddy / CodeBuddy（`builtinHookDefs()` 里 `withTimeout` 的三个分支），
-**Claude Code 与 Codex 的条目不带 timeout**。全部经 `teamai hook-dispatch <event>` 一个入口分发；
+\* 超时只渲染给 Cursor / WorkBuddy / CodeBuddy / ZCode（`builtinHookDefs()` 里 `withTimeout` 的四个分支，
+ZCode 是 HEAD 新加的），**其余工具（含 Claude Code 与 Codex）的条目不带 timeout**。全部经 `teamai hook-dispatch <event>` 一个入口分发；
 团队还能在 `hooks/hooks.yaml` 里自声明任意事件的 hook（文档示例就是 `PreToolUse`），
-并禁用或覆盖内置 hook 的超时。
+并禁用或覆盖内置 hook 的超时。分发层对「没 init 过的目录」**fail-open**：config 取不到时全部 handler 照跑
+（`hook-dispatch-cli.ts:185`、`hook-handlers.ts:503-517`），采集不按项目门控，见采集清单 §1。
 
 **全仓不装 git hook，也不设 `core.hooksPath`**。`src/utils/git.ts` 里唯一相关的一处是
 `commitSkippingHooks()`——它在自己管理的 worktree 里用 `--no-verify` 跳过用户的
@@ -326,8 +340,8 @@ husky，注释明确写「`--no-verify` 只作用于这个 git 进程，不写 `
 - `correction` 是纯启发式（词表 + 60s 窗口），代码里没看到准确率实测；中英日词表在
   多语言混用的会话里的行为未知。
 - beta 层的能力（recall / codebase / dashboard）在 README 里明确标 beta，
-  10 个 harness × 13 种能力的矩阵里有不少 `—`，OpenCode / OpenClaw / Hermes / DSH
-  整个 Team Improvement 列都是空的。
+  11 个 harness × 13 种能力的矩阵里有不少 `—`，OpenCode / OpenClaw / Hermes / DSH
+  整个 Team Improvement 列都是空的（ZCode 的 Team Improvement 三格是 ✓，缺的是 rules / env）。
 
 ## 6. 它明确不做什么
 
@@ -338,7 +352,7 @@ husky，注释明确写「`--no-verify` 只作用于这个 git 进程，不写 `
 | commit ↔ session 关联 | ❌ 无 | 全仓无写 session id 进 commit 的路径；`hasGitCommitInSession` 只做时间窗存在性判断（且权重为 0）；`ci extract-mr` / `import --from-mr` 是 MR → 知识，方向不同 |
 | 行级 / 代码归属 | ❌ 无 | — |
 | 审计过程留痕 | ❌ 无 | `review-cmd` / `review-store` 审的是**知识库待审条目**（`.teamai/pending-review.jsonl`），不是代码审计 |
-| 留痕数据随代码走 | ❌ 默认模式反向设计 | `data-directory-layout.md` 的目标就是业务仓零残留；**self 模式例外**：知识资产随 main 走，会话/摩擦上报走同仓孤儿分支（§4.3） |
-| 单事件可回溯（指针回原文） | ❌ 无 | 只存聚合计数与脱敏摘要，不存回跳锚点 |
+| 留痕数据随代码走 | ❌ 两种模式都不随代码走 | `data-directory-layout.md` 的目标就是业务仓零残留（HEAD 起 self 模式的机器数据也入分区）；**self 模式例外的只有知识资产**：随 main 走，会话/摩擦上报走同仓孤儿分支（§4.3） |
+| 单事件可回溯（指针回原文） | ❌ 无 | 只存聚合计数与脱敏摘要；`stop` 事件带 `transcriptPath`（文件级指针），没有记录级锚点 |
 
 这些不是缺陷——**它不是干这个的**。列在这里是为了让对比文档有个准确的基线。
