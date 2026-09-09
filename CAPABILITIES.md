@@ -20,6 +20,7 @@
 | 接入 | ✅ **已实现** | `tools/vibetrail-install`（幂等）|
 | 留痕自检 | ✅ **已实现** | `tools/vibetrail-doctor` |
 | hook 回归测试 | ✅ **已实现** | `tools/test-hook.sh` |
+| session 流水投影 | ✅ **已实现** | `tools/vibetrail-sync` |
 | 审计过程留痕 | ⬜ 未实现 | 改 `mark-audit.sh` |
 | 查询 / 复盘 | ✅ **已实现** | `tools/vibetrail`（show / log / session / diverge）|
 | 行级归属 | ❌ **已否决** | 见 [DESIGN.md §2.5](DESIGN.md) |
@@ -77,6 +78,24 @@ grep 原文会把「讨论」当成「发生」。实测对照：以本项目调
 **trailer 活过历史重写**：rebase ✅ cherry-pick ✅ ff-only ✅ no-ff merge ✅；squash ❌——
 `rebase -i` squash 只留最后一个被 squash 的 commit 的 trailer，`merge --squash` 原会话丢失、
 记成执行者（agentDock 1760 个 commit 里 0 次 squash，不受影响）。
+
+### 2.4b session 流水投影（`vibetrail-sync`）
+
+**形态选择：事后投影，不是实时写。** session 文件是 transcript 的**纯投影**、随时可重算；
+按 D2，trace 的作用是扛住 transcript 丢失与换机器，所以要求只是「在 transcript 消失之前
+写下来」，不是「commit 那一刻必须同步」。这排除了在 pre-commit 里写+暂存那类方案
+（每个 commit 都带 trace 改动，churn 大）。
+
+三方对照：**SpecStory 也是事后 `sync`**（印证这个选择）；claude-story 用 `fs.watch`
+常驻守护进程（要养一个进程，不取）。
+
+**归属判据比 SpecStory 更宽**：它把 cwd 编码成 Claude 项目目录名做 1:1 反查，因此只看
+当前 cwd 那一个目录，**在 worktree 里 sync 不到主仓的会话**。本仓大量用 worktree，
+所以改成按 `git worktree list` 聚合全部 worktree 根。两侧路径都过 `realpath`——
+这条是照它的 `EvalSymlinks` 补的，不做的话符号链接会让前缀匹配**静默失配**。
+
+实测（agentDock）：26 个会话 / 419 条记录 / **220K**，对照 transcript 406MB，
+约 1800 倍压缩，符合 D2 的 KB 级要求。
 
 ### 2.5 接入与自检
 

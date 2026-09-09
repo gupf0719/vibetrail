@@ -1,0 +1,94 @@
+#!/bin/bash
+# 把属于本仓的会话，从 transcript 投影成 .claude/trace/sessions/<sid>.jsonl
+#
+# 为什么是「事后投影」而不是「实时写」：session 文件是 transcript 的**纯投影**，
+# 随时可重算。按 D2，trace 的作用是扛住 transcript 丢失/换机器，所以要求只是
+# 「在 transcript 消失之前写下来」，不是「commit 那一刻必须同步」。
+# 这排除了在 pre-commit 里写+暂存那类方案（每个 commit 都带 trace 改动，churn 大）。
+#
+# 幂等：整份重生成而非追加。JSONL 的 append-only 是**记录流的语义**，不是写入机制的约束。
+set -uo pipefail
+SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+JQF="$SELF/extract-diverge.jq"
+PROJ="$HOME/.claude/projects"
+cd "$(git rev-parse --show-toplevel)" || exit 1
+OUT=.claude/trace/sessions; mkdir -p "$OUT"
+
+# 本仓的全部 worktree 根 —— 归属判据的权威来源。
+# 对比 SpecStory：它把 cwd 编码成 Claude 项目目录名做 1:1 反查，因此**只看当前 cwd
+# 那一个目录**，在 worktree 里 sync 不到主仓的会话。本仓大量用 worktree，所以改成
+# 按 git 自己的 worktree 清单聚合。
+#
+# 路径两侧都过 realpath：transcript 里的 cwd 与 git 报的路径若在符号链接上解析不一致，
+# 前缀匹配会**静默失配**（macOS 的 /tmp → /private/tmp 就是一例）。
+# 这条是照 SpecStory 的 EvalSymlinks 补的。
+rp(){ cd "$1" 2>/dev/null && pwd -P || echo "$1"; }
+ROOTS=$(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' \
+        | while IFS= read -r r; do rp "$r"; done)
+[ -z "$ROOTS" ] && { echo "✗ 取不到 worktree 列表" >&2; exit 1; }
+
+belongs(){ # belongs <cwd> → 0 若落在本仓任一 worktree 之下
+    local c; c=$(rp "$1"); local r
+    while IFS= read -r r; do
+        [ -z "$r" ] && continue
+        case "$c" in "$r"|"$r"/*) return 0;; esac
+    done <<< "$ROOTS"
+    return 1
+}
+
+n_sess=0; n_rec=0
+# 只扫主会话 transcript（子 agent 的分歧并进父会话，见下）
+while IFS= read -r tp; do
+    sid=$(basename "$tp" .jsonl)
+    cwd=$(jq -rc 'select(.cwd != null) | .cwd' "$tp" 2>/dev/null | head -1)
+    [ -z "$cwd" ] && continue
+    belongs "$cwd" || continue
+
+    # 该会话的全部 transcript：主 + 子 agent
+    parts=("$tp")
+    subdir="$(dirname "$tp")/$sid/subagents"
+    [ -d "$subdir" ] && while IFS= read -r s; do parts+=("$s"); done < <(find "$subdir" -name '*.jsonl' 2>/dev/null)
+
+    tmp=$(mktemp)
+    # ── 头
+    jq -c --arg sid "$sid" 'select(.cwd != null) | {
+        t:"session", v:1, id:$sid,
+        tool:"claude-code", toolVersion:(.version // null),
+        entrypoint:(.entrypoint // null), startedAt:.timestamp,
+        cwd:.cwd, branch:(.gitBranch // null)
+    }' "$tp" 2>/dev/null | head -1 >> "$tmp"
+    # ── 分歧（主 + 子，按时间排序）
+    for p in "${parts[@]}"; do jq -c -f "$JQF" "$p" 2>/dev/null; done \
+      | jq -c --slurp 'sort_by(.at)[]' 2>/dev/null >> "$tmp"
+    # ── 收尾汇总
+    bytes=$(wc -c < "$tp" | tr -d ' ')
+    # ⚠️ 这里曾用 `... || echo '[]'`：set -o pipefail 下 ls 无匹配会让整条管道非零，
+    # 于是在 jq 已输出 [] 之后又追加一个 []，subs 变成两行。jq 单看认为是合法的 JSON
+    # **流**，但 --argjson 要求**单个**值，于是整条 jq 失败、end 记录静默丢失。
+    # 实测 26 个会话里 14 个因此没有 end。
+    subs='[]'
+    if [ -d "$subdir" ]; then
+        subs=$(find "$subdir" -name '*.meta.json' 2>/dev/null | while IFS= read -r m; do
+            jq -c '{id:(input_filename|split("/")|last|sub("\\.meta\\.json$";"")),
+                    type:(.agentType // null), desc:(.description // null)}' "$m" 2>/dev/null
+        done | jq -c --slurp '.')
+        [ -z "$subs" ] && subs='[]'
+    fi
+    jq -c --slurp --arg b "$bytes" --argjson subs "$subs" '{
+        t:"end",
+        at:(map(select(.timestamp!=null).timestamp)|max),
+        turns:{ user:(map(select(.type=="user"))|length),
+                assistant:(map(select(.type=="assistant"))|length) },
+        models:(map(select(.message.model!=null).message.model)|unique),
+        subagents:$subs,
+        transcript:{bytes:($b|tonumber)}
+    }' "$tp" 2>/dev/null >> "$tmp"
+
+    if [ -s "$tmp" ]; then
+        mv "$tmp" "$OUT/$sid.jsonl"
+        n_sess=$((n_sess+1)); n_rec=$((n_rec + $(wc -l < "$OUT/$sid.jsonl" | tr -d ' ')))
+    else rm -f "$tmp"; fi
+done < <(find "$PROJ" -maxdepth 2 -name '*.jsonl' 2>/dev/null)
+
+echo "✓ 投影 $n_sess 个会话 / $n_rec 条记录 → $OUT"
+echo "  （输入不变则输出逐字节一致；仍在进行的会话每次跑会多出新记录，这是对的）"
