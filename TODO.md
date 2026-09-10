@@ -60,18 +60,22 @@ spec §4.5 写过这条路：「要做到任何改动都能精确归属，必须
 （[DESIGN §2.5](DESIGN.md)：833MB 常驻库、完整 prompt 排队待上传、跑一次二进制就起守护进程）。
 其中上传 prompt 与常驻守护进程都不是快照必需的；占盘快照也有，要实测（§7）。否决的另一半理由是价值，见 §8。
 
-**① 快照。** PreToolUse / PostToolUse hook 里，复制一份真 index 当起点，把整个工作树写成 tree 对象：
+**① 快照。** PreToolUse / PostToolUse hook 里，复制一份真 index，先原样 `write-tree` 得到**暂存区**的 tree，
+再把整个工作树加进去、`write-tree` 得到**工作树**的 tree：
 
 ```bash
 d=$(mktemp -d); cp -p "$(git rev-parse --git-path index)" "$d/index"
-GIT_INDEX_FILE=$d/index git add -A && GIT_INDEX_FILE=$d/index git write-tree; rm -rf "$d"
+GIT_INDEX_FILE=$d/index git write-tree                                        # 暂存区
+GIT_INDEX_FILE=$d/index git add -A && GIT_INDEX_FILE=$d/index git write-tree  # 工作树
+rm -rf "$d"
 ```
 
 - 不碰真 index、不碰工作树；没改的文件复用已有 blob，只新增改过的内容。
 - 从真 index 起步：已跟踪但匹配 `.gitignore` 的文件不会漏（从空 index 起步会漏），stat 缓存也是热的。
 - 每次一份副本：并发的快照不抢同一个 `index.lock`（共用一份时实测会撞锁失败）。
 - `cp` 必须带 `-p`：git 靠 index 文件自身的 mtime 判断哪些条目得重读内容（racy-git），副本的 mtime 变成「现在」，
-  就会漏掉「`git add` 之后同一秒内被改成同样长度」的文件（demo 边界 11）。
+  就会漏掉「`git add` 之后同一秒内被改成同样长度」的文件（demo 边界 14）。
+- 暂存区那份 tree 是给 ③ 定「提交进去的那一版是什么时候暂存的」用的。
 - 不需要常驻进程，不存 prompt。PostToolUse 的 stdin 实测直接给 `session_id` 与 `tool_use_id`
   （[DESIGN §2.1](DESIGN.md)）；PreToolUse 的字段集、以及怎么区分子 agent，**待实测**。
 
@@ -85,40 +89,44 @@ GIT_INDEX_FILE=$d/index git add -A && GIT_INDEX_FILE=$d/index git write-tree; rm
 
 「进行中」怎么维护：
 
-- pre 登记、post 只注销自己那一次，按 tool_use_id 配对，**不看相邻顺序**，同一线程里的调用重叠也不会互相关掉。
-- 配不上 pre 的 post（pre 那次快照丢了，比如 hook 失败）：这一步标「起点不明」，不能落成 gap。
+- pre 登记、post 只注销自己那一次，按 tool_use_id 配对，**不看相邻顺序**，同一线程里的调用重叠也不会互相关掉
+  （demo 边界 3）。前提是 PreToolUse 也给 tool_use_id（待实测）；不给的话只能按线程配对，同线程重叠就分不开。
+- 配不上 pre 的 post（pre 那次快照丢了，比如 hook 失败）：这一步标「起点不明」，不能落成 gap。例外：第一个快照
+  就是这样的 post 时，没有更早的快照可比，这次调用的改动并进根里，标成「快照开始前已在工作树里」。
 - 被打断的调用等不到 post，也未必等得到同线程的下一个 pre（子 agent、会话就此结束），所以在**一轮结束时**关：
   下一次 UserPromptSubmit、Stop、SubagentStop、SessionEnd 到来时先拍一次，把到此为止的改动记给它、标「未完成」，
   再注销。被打断时 Stop 是否触发待实测。
-- 登记表放在 `git rev-parse --git-path` 解析出的本 worktree 私有目录里，每个 worktree 一份。
+- 登记表与快照日志都放在 `git rev-parse --git-path` 解析出的本 worktree 私有目录里，每个 worktree 一份。
 
 **③ 影子历史每个 worktree 一条、跨提交连续，post-commit 时只报本 commit 的行。**
 
 - 每次快照与末端不同，就往 `refs/worktree/vibetrail/shadow` 上接一个影子提交（`git commit-tree`，作者名 =
-  这一步归给谁）。`refs/worktree/` 是每个 worktree 各一份的命名空间——各 worktree 共用一条 ref 时，
-  别的 worktree 的快照会交替接进来，把改动冲成 gap（审计实测）。别的 worktree 要读，用
-  `worktrees/<名>/refs/worktree/…` 或 `main-worktree/refs/worktree/…`。默认 refspec 不推送它。
+  这一步归给谁）。`refs/worktree/` 是每个 worktree 各一份的命名空间；各 worktree 共用一条 ref、或共用登记表时，
+  别的 worktree 的快照或调用会串进来贴错标签（demo 边界 6 的标题写了两种串法各自贴成什么，已实测）。
+  别的 worktree 要读，用 `main-worktree/refs/worktree/…` 或 `worktrees/<id>/refs/worktree/…`——`<id>` 是
+  worktree 的 id（`.git/worktrees/` 下的目录名），不一定等于它的目录名。默认 refspec 不推送这些 ref。
 - 第一个快照是根，其中已有的内容记为「快照开始前已在工作树里」。
 - **不在每次提交时从父提交重开**——否则上一次提交没带走、留在工作树里的改动，会在下一次提交里被当成 gap。
-- post-commit 时，末端临时接上真 commit 的 tree：最后一个快照到提交之间的差额，归给此刻进行中的调用
-  （agent 在工具调用里提交就是那次调用，人在终端提交就是 gap）。
-- 落在这段差额上的行要再往回找一次：先暂存、后又改时，提交进去的是暂存区里的旧版本，它在更早的快照里就有。
-  沿影子历史往回找最近一个含这一行的版本，在那里 blame；找不到才真是最后一个快照之后写的（demo 边界 6）。
-  按行内容找，重复行（空行、`}`）会找错位置，是启发式。
-- 只报本 commit 相对父提交新增或改动的行：一次 `git diff -M -U0` 拿全部文件的新侧行号（`-M` 认改名，纯改名
-  没有新侧行；`core.quotePath=false`、不经 shell 拆词，带空格和中文的文件名不丢）。部分暂存时被「改回去」的行
-  不在 diff 里，不会被报；删掉的文件没有新侧行。
+- post-commit 时逐个文件做：先定出**提交进去的这一版是从哪个时刻的工作树暂存出来的**，在那个快照后面临时接上
+  真 commit 的 tree，差出来的行归给那一段进行中的调用，再 blame。定的方法是按 blob 查快照日志里的暂存区：
+  - 最后一段连续「暂存区里已经是这一版」的快照，它前面那个快照的工作树就是出发点，归给那一段（边界 7、8）；
+  - 最后一个快照时暂存区还不是这一版（提交前一刻才 `git add`，或 `commit -a`），出发点就是最后一个快照，
+    归给提交那一刻进行中的调用：agent 在工具调用里提交就是那次调用，人在终端提交就是 gap（边界 9）。
+  - 比的是整份 blob，不按行文本搜，同内容的行不会被认到别人头上。
+- 只报本 commit 相对父提交新增或改动的行：路径从 `git diff -M -z --name-status` 取（NUL 分隔、从不加引号；
+  `-M` 认改名，纯改名没有新侧行），行号用新旧两个 blob 之间的 `git diff -U0` 取，不解析带路径的 `+++` 行。
+  部分暂存时被「改回去」的行不在 diff 里，不会被报；删掉的文件没有新侧行；单个文件出错只跳过它（边界 13）。
 - 每行给两个答案：**放置者**（不带 `-M` / `-C` 的 blame：这一行是谁放到这里的）与**内容来源**（带 `-M` / `-C`：
-  认出的移动或复制的出处）。不同就都标上——复制别人的代码，放置者负责把它放在这里，内容却出自原作者（demo 边界 9）。
+  认出的移动或复制的出处）。不同就都标上——复制别人的代码，放置者负责把它放在这里，内容却出自原作者（边界 12）。
   `-M` / `-C` 是带阈值的启发式。
 
 **④ 落盘只存指针。** 文件、行范围、行内容哈希、会话、tool_use_id，锚在 `Vibetrail-Id` trailer 上——
 与审计记录同锚，rebase / cherry-pick 下不变（[spec §4.0](spec/trace-v1.md)）。每个 commit KB 级，符合 D2。
-影子历史和 transcript 一样只留本机。
+影子历史和快照日志与 transcript 一样只留本机。
 
 ### 5. 验证：demo（2026-09-11）
 
-脚本 [experiments/attrib-demo.sh](experiments/attrib-demo.sh)：在临时目录建一次性仓库，不碰当前仓库，本机十秒以内。
+脚本 [experiments/attrib-demo.sh](experiments/attrib-demo.sh)：在临时目录建一次性仓库，不碰当前仓库，本机 15 秒左右。
 
 主场景（BASE 之前还有历史，分两次提交）：
 
@@ -128,7 +136,8 @@ GIT_INDEX_FILE=$d/index git add -A && GIT_INDEX_FILE=$d/index git write-tree; rm
 3. 会话 B 用 `sed -i` 把 `calc.py` 的 `add` 改错（B1）；
 4. 会话 C 用 Edit 给 `util.py` 加函数（C1），然后删掉 `legacy.py`、提交全部（C2）。
 
-第二次提交的 trailer 上只会有 C。另有 11 个边界场景，每个对应两轮审计抓到的一类错（§11）。输出（`←` 之后是注释）：
+第二次提交的 trailer 上只会有 C。另有 14 个边界场景，每个对应三轮审计抓到的一类错（§11），预期写在各自的标题里。
+输出（`←` 之后是注释）：
 
 ```
 ######## 主场景：三个会话 + 一次人手改，分两次提交
@@ -154,54 +163,74 @@ f.txt      L3   Q:Y      C-by-Y
 == human commit —— 本 commit 新增或改动的行 ==
 f.txt      L2   P:X|Q:Y  B-by-X-or-Y
 
-######## 边界 3：已跟踪但匹配 .gitignore 的文件，只报改动的那一行
+######## 边界 3：同一线程两个调用重叠（pre A1、pre A2、post A1），按调用号配对，A1 结束不会把 A2 关掉
+== human commit —— 本 commit 新增或改动的行 ==
+f.txt      L2   A:A2     B-by-A2
+
+######## 边界 4：已跟踪但匹配 .gitignore 的文件，只报改动的那一行
 == bump —— 本 commit 新增或改动的行 ==
 deps.lock  L1   A:A1     v2
 
-######## 边界 4：并发快照（每次复制一份 index），30 轮 × 2 路
+######## 边界 5：并发快照（每次复制一份 index），30 轮 × 2 路
 快照失败 0 次（其中 index.lock 冲突 0 次）
 
-######## 边界 5：两个 worktree 各有各的影子历史，另一个 worktree 的快照不串进来
+######## 边界 6：两个 worktree 交替拍快照，影子历史与登记表各管各的（共用 ref 会标成 X:X1，共用登记表会标成 B:B1）
 == human commit in wt1 —— 本 commit 新增或改动的行 ==
-f.txt      L1   A:A1     A-by-A1
+f.txt      L2   gap      B-by-human
 
-######## 边界 6：先暂存、后又改，提交的是暂存区里的旧版本 → 仍归给写它的调用
+######## 边界 7：先暂存、后又改，提交的是暂存区里的旧版本 → 仍归给写它的调用
 == commit the staged v1 —— 本 commit 新增或改动的行 ==
 f.txt      L1   A:A1     v1
 
-######## 边界 7：调用被打断（有 pre 没 post），到这一轮结束时关掉并标未完成；之后的人手改归 gap
+######## 边界 8：人改、暂存、再改，都不经过 hook，然后 agent 在工具调用里提交暂存区 → gap，不记给提交者
+== agent commits the index —— 本 commit 新增或改动的行 ==
+f.txt      L1   gap      v1-by-human
+
+######## 边界 9：人在最后一个快照之后补的行，与 A1 写过的行同内容 → 仍是 gap，不认到 A1 头上
+== human adds h —— 本 commit 新增或改动的行 ==
+m.py       L3   A:A1     
+m.py       L4   A:A1     def g():
+m.py       L5   A:A1         return None
+m.py       L6   gap      
+m.py       L7   gap      def h():
+m.py       L8   gap          return None
+
+######## 边界 10：调用被打断（有 pre 没 post），到这一轮结束时关掉并标未完成；之后的人手改归 gap
 == human commit —— 本 commit 新增或改动的行 ==
 f.txt      L1   S:S1(未完成) A-by-S1
 f.txt      L2   gap      B-by-human
 
-######## 边界 8：pre 那次快照丢了（hook 失败），只有 post → 标起点不明，不记成 gap
+######## 边界 11：pre 那次快照丢了（hook 失败），只有 post → 标起点不明，不记成 gap
 == human commit —— 本 commit 新增或改动的行 ==
 f.txt      L1   A:A1(起点不明) A-by-A1
 
-######## 边界 9：复制——这一行是谁放进来的（放置者）与内容最早出自谁（-M / -C）分开标
+######## 边界 12：复制——这一行是谁放进来的（放置者）与内容最早出自谁（-M / -C）分开标
 == f and g —— 本 commit 新增或改动的行 ==
 m.py       L1   A:A1     def f(items):
 m.py       L2   A:A1         total = compute_total(items, discount_rate)
 m.py       L4   B:B1     def g(items):
 m.py       L5   B:B1(内容同 A:A1)     total = compute_total(items, discount_rate)
 
-######## 边界 10：改名（纯改名不算新增）+ 文件名带空格和中文
-== rename and append —— 本 commit 新增或改动的行 ==
+######## 边界 13：改名（纯改名不算新增）+ 文件名带空格、中文、双引号、tab，一个出问题也不拖垮别的
+== rename and odd names —— 本 commit 新增或改动的行 ==
+ok.txt     L2   A:A1     ok2
+say"hi".txt L1   A:A1     q
+tab	here.txt L1   A:A1     t
 说明 b.txt L4   A:A1     four
 
-######## 边界 11：复制 index 要带 -p（racy-git）：add 之后同一秒改成同长度，隔一秒再拍
-cp 不带-p → 快照里是 return a * b（工作树里是 return a - b）
-cp -p     → 快照里是 return a - b（工作树里是 return a - b）
+######## 边界 14：racy-git——add 之后同一秒改成同长度，隔一秒再拍；snaptree 要拍到工作树里的版本
+snaptree 拍到：return a - b（工作树里是 return a - b）
+对照：cp 不带 -p 拍到：return a * b
 ```
 
 主场景两次提交新增或改动的行全部归对：两处 bug 分别落在 B 的 sed 和人的手改上；第一次提交没带走的改动，
-在第二次提交里仍归给当初写它的 A2、A3；BASE 之前的旧行和删掉的文件都没有被报出来。边界场景各自的预期写在标题里，
-输出与预期一致。
+在第二次提交里仍归给当初写它的 A2、A3；BASE 之前的旧行和删掉的文件都没有被报出来。边界场景的输出与标题里的预期一致；
+边界 6 标题里另两种串法的结果，是把 ref 或登记表临时改成共用后实测的，不在 demo 里。
 
 **demo 没覆盖的**：搬运（`git stash pop`、`cherry-pick -n`、跨 worktree `cp`）；agent 在工具调用里移动 HEAD
-（checkout / rebase）；影子历史的并发追加（demo 是串行的）；hook 里怎么区分子 agent、PreToolUse 给哪些字段；
-§4③ 往回找暂存内容时碰上重复行；真实仓库规模下的耗时与占盘。场景是照已知的错搭的，没见过的错照样测不到。
-它也只打印、不断言。
+（checkout / rebase）；合并冲突时暂存区写不出 tree（快照日志记 `-`）；影子历史的并发追加（demo 是串行的）；
+hook 里怎么区分子 agent、PreToolUse 给哪些字段；真实仓库规模下的耗时与占盘。场景是照已知的错搭的，
+没见过的错照样测不到。它也只打印、不断言。
 
 ### 6. 判责：从 bug 回到对话
 
@@ -230,13 +259,14 @@ cp -p     → 快照里是 return a - b（工作树里是 return a - b）
   拿到，据此把并列拆开；Bash 之间的重叠拆不开。「拍快照 → 算标签 → 追加影子历史 → 改登记表」这一整段要串行：
   加一把 worktree 级的锁，或者追加时用 `update-ref` 带旧值校验、失败就重拍重算——光有旧值校验不够，登记表也得原子地改。
 - **调用进行中的人手改会记给这次调用。** 快照只看得出「这段时间里谁在跑」，看不出是谁动的手；被打断的调用
-  到一轮结束之前一直算进行中，其间的人手改同样记给它（边界 7 标了「未完成」，要按歧义看待）。
+  到一轮结束之前一直算进行中，其间的人手改同样记给它（边界 10 标了「未完成」，要按歧义看待）。暂存也一样：
+  §4③ 按「暂存发生在哪一段」归属，那一段里进行中的调用未必是写这几行的人。
 - **搬运。** `git stash pop`、`cherry-pick -n`、从别的 worktree `cp` 过来的改动，会记在执行搬运的那次调用上。
   要追到源头，得按行内容哈希在各 worktree 的影子历史里找最早出现的地方：它们共享同一个对象库（git-common-dir），
   ref 按 §4③ 的写法跨 worktree 可读，做得到，要多写一段。
 - **快照看不见的改动。** 复制真 index 会连带 `assume-unchanged` / `skip-worktree` 标记，这类文件的改动快照看不到（少见）。
-- **代价没量。** 大仓里每次 `add -A` + `write-tree` 的耗时要在 agentDock 上实测。影子历史跨提交连续，要定截断策略，
-  中间 blob 堆在本地 `.git/objects`，截断后让 gc 回收。没进 `.gitignore` 的未跟踪文件（比如 `.env`）
+- **代价没量。** 大仓里每次快照要两次 `write-tree` 加一次 `add -A`，耗时要在 agentDock 上实测。影子历史跨提交连续，
+  要定截断策略，中间 blob 堆在本地 `.git/objects`，截断后让 gc 回收。没进 `.gitignore` 的未跟踪文件（比如 `.env`）
   也会写进本地对象库——不出本机，但要知道。
 - **gap 不等于人。** 格式化器、文件监听、构建工具在工具调用之外改的文件也会落进 gap。
 - **squash 合流**下与 trailer 一样会丢（[spec §7](spec/trace-v1.md)）。
@@ -256,13 +286,13 @@ cp -p     → 快照里是 return a - b（工作树里是 return a - b）
 勾选只记拆解项做没做完，G11 整体的状态以中心表为准。
 
 - [ ] **测量（先做）**：在 agentDock 那台机器上挑几个真实的多会话 commit，只用现有 transcript 做 Edit / Write
-  内容匹配，量出不拍快照能覆盖多少行——spec §4.5 的「约 3%」只来自一个会话。同时量 `add -A` + `write-tree`
-  在 agentDock 上的单次耗时。这两个数决定快照值不值得上。
+  内容匹配，量出不拍快照能覆盖多少行——spec §4.5 的「约 3%」只来自一个会话。同时量一次快照（两次 `write-tree`
+  加一次 `add -A`）在 agentDock 上的耗时。这两个数决定快照值不值得上。
 - [ ] **快照 hook**：PreToolUse / PostToolUse，fail-open、不阻断宿主；UserPromptSubmit / Stop / SubagentStop /
   SessionEnd 关未完成的调用；定下围哪些工具（Bash / Edit / Write / NotebookEdit 与会写文件的 MCP 工具，还是全部）；
-  实测 PreToolUse 的字段集、子 agent 的区分方式、被打断时 Stop 是否触发。
-- [ ] **post-commit 归属**：影子历史 + blame → 归属记录，锚 `Vibetrail-Id`；和 `prepare-commit-msg` 一起由
-  `vibetrail-install` 装。
+  实测 PreToolUse 的字段集（有没有 tool_use_id）、子 agent 的区分方式、被打断时 Stop 是否触发。
+- [ ] **post-commit 归属**：影子历史 + 快照日志 + blame → 归属记录，锚 `Vibetrail-Id`；和 `prepare-commit-msg`
+  一起由 `vibetrail-install` 装。
 - [ ] **查询**：`vibetrail blame <file>:<line>` → commit → 会话 + tool_use_id → transcript 回跳；
   另加一个从修复 commit 出发的 SZZ 入口。
 - [ ] **限制处理**：整段加锁或旧值校验、搬运按内容哈希回溯、截断策略。
@@ -273,7 +303,7 @@ cp -p     → 快照里是 return a - b（工作树里是 return a - b）
 
 - 归属记录落哪：`.claude/trace/attributions/<vibetrailId>.jsonl`（随仓，与审计记录同锚，倾向这个），
   还是 git notes（不进 tree，但要单独配 push / fetch refspec）。
-- 影子历史保留多久、怎么截断。
+- 影子历史与快照日志保留多久、怎么截断。
 - 放置者与内容来源都存，还是只存一个；判责默认看哪个。
 - 判责口径（§6 的表）是固化成字段，还是只作为复盘时的人工指引。
 - 是否和 G7（装一次、自动上报）一起做：快照 hook 与 G7 计划的 `.claude/settings.json` hooks 是同一个挂载点。
@@ -281,7 +311,8 @@ cp -p     → 快照里是 return a - b（工作树里是 return a - b）
 
 ### 11. 审计记录
 
-两轮独立审计，都在合并之后跑，发现的问题都已改在正文与 demo 里；demo 的边界场景就是照这些问题搭的。
+三轮独立审计，都在合并之后跑，每轮的发现在下一轮之前改进正文与 demo；demo 的边界场景就是照这些发现搭的。
+下面的「改成」写的是**那一轮修完时**的做法，后一轮又改过的另行标出。
 
 **第一轮**审第一版 `514876d`（2026-09-11 00:13）：4 处错、8 处不准、6 个小问题。
 
@@ -290,8 +321,8 @@ cp -p     → 快照里是 return a - b（工作树里是 return a - b）
 | 错 1 | blame 影子历史末端、只滤掉 BASE 本身 | BASE 之前的旧行记在更老的提交上，被当成本 commit 的改动报出来；第一版 demo 的 BASE 恰好是根提交 | 影子历史的根是无父的快照提交，只报本 commit diff 里的行 |
 | 错 2 | 方案原文写「父提交以来的快照」，demo 照做 | 上一次提交没带走的 agent 改动，在下一次提交里被判成 gap | 影子历史跨提交连续（主场景 A2、A3） |
 | 错 3 | 部分暂存的差额记为 commit-time，报全部非 BASE 的行 | 被「改回去」的没改的行也被报出 | 差额归给提交时进行中的调用，只报 diff 里的行 |
-| 错 4 | 快照用一份共用的独立 index，从空开始 | 已跟踪但匹配 `.gitignore` 的文件漏掉 | 每次复制一份真 index（边界 3） |
-| 不准 5 | 共用 index；pre 与 post 按相邻顺序配对 | 并发快照撞 `index.lock`，fail-open 的 hook 会悄悄丢快照；交错时贴错 | 每份快照一个副本（边界 4）；按调用配对（边界 1、2） |
+| 错 4 | 快照用一份共用的独立 index，从空开始 | 已跟踪但匹配 `.gitignore` 的文件漏掉 | 每次复制一份真 index（边界 4） |
+| 不准 5 | 共用 index；pre 与 post 按相邻顺序配对 | 并发快照撞 `index.lock`，fail-open 的 hook 会悄悄丢快照；交错时贴错 | 每份快照一个副本（边界 5）；按线程配对（边界 1、2）——第二轮改为按调用配对（边界 3） |
 
 其余 7 处不准是措辞过度或转述不准：「大头」只有一个会话的依据、「代价都不在快照本身」说满了、DESIGN 引文不是逐字、
 OPEN-ISSUES 的 G11 行复述过多并把 demo 结论写成一般结论、没写行移动要靠 `-M` / `-C`、「demo 没覆盖的」漏了前提。
@@ -301,16 +332,31 @@ OPEN-ISSUES 的 G11 行复述过多并把 demo 结论写成一般结论、没写
 
 | # | 问题（均经实验复现） | 改成 |
 |---|---|---|
-| 错 1 | 影子历史改成跨提交连续后，还是一条所有 worktree 共用的 ref，别的 worktree 的快照交替接进来，把改动冲成 gap | `refs/worktree/` 每个 worktree 一条，登记表放本 worktree 私有目录（边界 5） |
-| 错 2 | 先暂存、后又改：提交的是暂存区里的旧版本，被记给提交者（第一轮就在，没抓到） | 落在差额上的行沿影子历史往回找（边界 6） |
-| 错 3 | 改成复制真 index 时 `cp` 没带 `-p`，丢了 racy-git 保护，同一秒内的同长度改动快照漏掉 | `cp -p`（边界 11） |
-| 错 4 | 按新路径逐个 `git diff -- <文件>`，改名的文件整份被当成新增 | 一次 `diff -M` 解析全部文件（边界 10） |
-| 错 5 | `for f in $(git diff --name-only)` 拆词，`core.quotePath` 转义中文，这些文件的行被静默丢掉 | 同上，路径不转义、不经 shell 拆词（边界 10） |
+| 错 1 | 影子历史改成跨提交连续后，还是一条所有 worktree 共用的 ref，别的 worktree 的快照交替接进来，把改动冲成 gap | `refs/worktree/` 每个 worktree 一条，登记表放本 worktree 私有目录。当时的验证场景证明不了这一条，第三轮换成边界 6 |
+| 错 2 | 先暂存、后又改：提交的是暂存区里的旧版本，被记给提交者（第一轮就在，没抓到） | 差额上的行按行文本沿影子历史往回找——**修错了**，第三轮改为按 blob 查暂存区快照 |
+| 错 3 | 改成复制真 index 时 `cp` 没带 `-p`，丢了 racy-git 保护，同一秒内的同长度改动快照漏掉 | `cp -p`（边界 14；第三轮改为直接测 snaptree） |
+| 错 4 | 按新路径逐个 `git diff -- <文件>`，改名的文件整份被当成新增 | 一次 `diff -M` 解析全部文件 |
+| 错 5 | `for f in $(git diff --name-only)` 拆词，`core.quotePath` 转义中文，这些文件的行被静默丢掉 | 同上，解析 `+++` 行——只修到空格与中文，第三轮改为 `-z` 取路径 |
 
-4 处不准：文档说按 tool_use_id 配对、demo 却只按线程（边界 8 与同线程重叠）；被打断的调用「等同线程的下一个 pre」
-可能永远等不到（边界 7）；`-M` 不只认移动也认复制，会把复制者写的行归给原作者（边界 9）；「demo 没覆盖的」仍漏了
-上面这些情形。3 个小问题：旧值校验之外登记表也要原子地改；本台账第一版把不准 5 并进了错 4、把 514876d 的日期写成 09-10；
-§3 一处引号里的字不是 spec 原文。
+4 处不准：文档说按 tool_use_id 配对、demo 却只按线程；被打断的调用「等同线程的下一个 pre」可能永远等不到（边界 10）；
+`-M` 不只认移动也认复制，会把复制者写的行归给原作者（边界 12）；「demo 没覆盖的」仍漏了上面这些情形。
+3 个小问题：旧值校验之外登记表也要原子地改；本台账第一版的四处毛病（把不准 5 并进了错 4、说 4 处错「都在 demo 的
+归属逻辑」而错 2 其实在方案原文、「均已改」说满了、把 514876d 的日期写成 09-10）；§3 一处引号里的字不是 spec 原文。
 
-两轮的教训是同一条，第二轮更扎眼：**demo 的场景是照着想证明的结论搭的，恰好绕开了会出错的情形；修复也一样，
-只修到了被指出的那个症状，修法自己带进来的问题（共用 ref、`cp` 丢 mtime）照样没有场景去碰。**
+**第三轮**审修复 `2f6c3a5`：第二轮 12 条里改名、`cp -p`、配对、打断、复制等 9 条修对了；错 2、错 5 **修错了**，
+错 1 修对但验证场景不成立。另有 3 处错、3 处不准、5 个小问题。
+
+| # | 问题（均经实验复现） | 改成 |
+|---|---|---|
+| 错 1 | 第二轮加的「按行文本往回找」对差额上的每一行都做：人在最后一个快照之后补的空行、`return None`，只要历史里出现过同样的行，就被记给别人——gap 被翻成 agent，比第一轮修完时还差 | 删掉按行文本搜；按 blob 查快照日志里的暂存区，定出暂存时的出发点（§4③；边界 9） |
+| 错 2 | 暂存的那一版从没被快照拍到（人改、暂存、再改，都不经过 hook）时，仍记给提交者 | 同上：每次快照顺手记暂存区的 tree（边界 8） |
+| 错 3 | 文件名含 `"`、`\`、tab 时 git 照样加引号，awk 取错路径，`set -e` 让整次归属中止，同一 commit 其他文件的行也丢 | 路径从 `-z` 的 name-status 取，行号用 blob 对 blob 的 diff 取，单个文件出错只跳过它（边界 13） |
+
+3 处不准：边界 5（当时编号）证明不了 worktree 那条修法，换成现在的边界 6，并实测了两种串法各贴成什么；第一轮台账「不准 5」的
+「改成」写成了第二轮之后的状态；本台账说「都已改在正文与 demo 里」又说满了。5 个小问题：第一个快照就是没有 pre 的 post 时
+「起点不明」被根吞掉（已写进 §4②）；racy-git 场景没走 snaptree（改为直接测 snaptree）；按 tool_use_id 配对的前提是
+PreToolUse 也给它（已写进 §4②）；`worktrees/<名>` 的「名」其实是 worktree id；demo 头注释的边界场景数写错。
+
+三轮的教训是同一条，一轮比一轮扎眼：**demo 的场景是照着想证明的结论搭的，恰好绕开了会出错的情形；修复也一样，
+只修到了被指出的那个症状，修法自己带进来的问题（共用 ref、`cp` 丢 mtime、按行文本搜）照样没有场景去碰。**
+第三轮的错 1 最典型：它不是没修，是修的时候为了让新场景通过，引入了一个比原问题更坏的启发式。
