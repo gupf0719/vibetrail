@@ -14,7 +14,7 @@
 #   SubagentStop / SessionEnd 调用，attribute 由 post-commit hook 调用；这里手工调用。
 #   只打印不断言——改成回归测试是 G11 的拆解项之一。
 #
-# 主场景之外的 14 个边界场景，每个对应三轮独立审计（2026-09-11）抓到的一类错，见 TODO.md G11 §11。
+# 主场景之外的 15 个边界场景，每个对应四轮独立审计（2026-09-11）抓到的一类错，见 TODO.md G11 §11。
 # 2026-09-11 在 macOS（git 2.39.5、/bin/bash 3.2）实测，输出见 TODO.md G11 §5。
 
 set -euo pipefail
@@ -46,9 +46,14 @@ in_progress() { # 此刻进行中的工具调用；一个都没有就是 gap（�
 # cp 要带 -p：git 靠 index 文件自身的 mtime 判断哪些条目得重读内容（racy-git），副本的 mtime 变成「现在」
 # 就会漏掉同一秒内被改成同样长度的文件。
 snaptree() {
-    local d w i; d=$(mktemp -d)
+    local d w i e; d=$(mktemp -d)
     cp -p "$(git rev-parse --git-path index)" "$d/index" 2>/dev/null || true
-    i=$(GIT_INDEX_FILE=$d/index git write-tree 2>/dev/null || echo -)      # 有冲突时写不出，记 -
+    if ! i=$(GIT_INDEX_FILE=$d/index git write-tree 2>/dev/null); then
+        # 合并冲突时暂存区写不出 tree：只去掉未合并的路径（它们本来就没有暂存版），别的文件照常记
+        GIT_INDEX_FILE=$d/index git ls-files -u -z | while IFS= read -r -d '' e; do
+            GIT_INDEX_FILE=$d/index git update-index --force-remove -- "${e#*$'\t'}"; done
+        i=$(GIT_INDEX_FILE=$d/index git write-tree 2>/dev/null || echo -)
+    fi
     w=$(GIT_INDEX_FILE=$d/index git add -A && GIT_INDEX_FILE=$d/index git write-tree) || { rm -rf "$d"; return 1; }
     rm -rf "$d"; echo "$w $i"
 }
@@ -88,8 +93,8 @@ blame1() { # rev file line [-M -C] → 「sha␟作者␟正文」
 line_out() { # rev file line → 一行归属。放置者：这一行是谁放到这里的（不带 -M / -C）；
              # 内容来源：带 -M / -C 认出的移动或复制的出处。不同就都标上
     local sha placer text origin label
-    IFS=$US read -r sha placer text < <(blame1 "$1" "$2" "$3")
-    IFS=$US read -r _ origin _ < <(blame1 "$1" "$2" "$3" "-M -C")
+    IFS=$US read -r sha placer text < <(blame1 "$1" "$2" "$3") || return 1
+    IFS=$US read -r _ origin _ < <(blame1 "$1" "$2" "$3" "-M -C") || return 1
     label=$placer; [ "$origin" = "$placer" ] || label="$placer(内容同 $origin)"
     printf '%-10s L%-3s %-8s %s\n' "$2" "$3" "$label" "$text"
 }
@@ -97,10 +102,13 @@ line_out() { # rev file line → 一行归属。放置者：这一行是谁放�
 # 按 blob 找：日志里最后一段连续「暂存区里已经是这一版」的快照，它前面那个快照的工作树就是暂存时的出发点，
 # 差出来的行归给那一段进行中的调用。暂存区在最后一个快照时还不是这一版（提交前一刻才 add 的，或 commit -a），
 # 出发点就是最后一个快照，差出来的行归给此刻进行中的调用。不按行文本搜，同内容的行不会被认到别人头上。
+# 在子 shell 里、|| 的左边跑，set -e 在这里不起作用，所以每一步都显式检查，出错就返回非零让调用方跳过这个文件。
 attr_file() { # commit parent 状态 旧路径 新路径
-    local c=$1 p=$2 st=$3 old=$4 f=$5 b oldspec base="" label="" prev="" tip idx lab s n
-    b=$(git rev-parse "$c:$f")
-    case $st in A*) oldspec=$(git hash-object -w -t blob /dev/null) ;; *) oldspec="$p:$old" ;; esac
+    local c=$1 p=$2 st=$3 old=$4 f=$5 b oldspec ns base="" label="" prev="" tip idx lab
+    b=$(git rev-parse "$c:$f") || return 1
+    case $st in A*) oldspec=$(git hash-object -w -t blob /dev/null) || return 1 ;; *) oldspec="$p:$old" ;; esac
+    ns=$(git diff --numstat --no-color --no-ext-diff "$oldspec" "$c:$f") || return 1
+    case $ns in -*) printf '%s  （二进制文件，不逐行报）\n' "$f"; return 0 ;; esac
     while read -r tip idx lab; do
         if [ "$idx" != - ] && [ "$(git rev-parse -q --verify "$idx:$f" 2>/dev/null || true)" = "$b" ]; then
             if [ -z "$base" ]; then
@@ -108,15 +116,17 @@ attr_file() { # commit parent 状态 旧路径 新路径
             fi
         else base=; fi
         prev=$tip
-    done < "$(log_file)"
-    if [ -z "$base" ]; then base=$(git rev-parse "$SHADOW"); label=$(in_progress); fi
-    tip=$(mkc "$(git rev-parse "$c^{tree}")" "$base" "$label")
-    # 行号用 blob 对 blob 的 diff 取：不解析带路径的 +++ 行，文件名里有什么字符都不影响
-    git diff -U0 "$oldspec" "$c:$f" | sed -nE 's/^@@ -[0-9,]+ \+([0-9]+)(,([0-9]+))? @@.*/\1 \3/p' |
+    done < "$(log_file)" || return 1
+    if [ -z "$base" ]; then base=$(git rev-parse "$SHADOW") || return 1; label=$(in_progress); fi
+    tip=$(mkc "$(git rev-parse "$c^{tree}")" "$base" "$label") || return 1
+    # 行号用 blob 对 blob 的 diff 取：不解析带路径的 +++ 行，文件名里有什么字符都不影响。
+    # --no-color / --no-ext-diff：用户开了 color.diff=always 或 diff.external 时，输出不能变形
+    git diff -U0 --no-color --no-ext-diff "$oldspec" "$c:$f" |
+        sed -nE 's/^@@ -[0-9,]+ \+([0-9]+)(,([0-9]+))? @@.*/\1 \3/p' |
     while read -r s n; do
         n=${n:-1}
-        while [ "$n" -gt 0 ]; do line_out "$tip" "$f" "$s"; s=$((s + 1)); n=$((n - 1)); done
-    done
+        while [ "$n" -gt 0 ]; do line_out "$tip" "$f" "$s" || exit 1; s=$((s + 1)); n=$((n - 1)); done
+    done || return 1
 }
 # post-commit：只报本 commit 相对父提交新增或改动的行。路径从 -z 的 name-status 取：NUL 分隔、从不加引号；
 # 改名与复制带新旧两个路径，-M 认改名（纯改名没有新侧行）；删掉的文件没有新侧行。单个文件出错只跳过它。
@@ -125,11 +135,12 @@ attribute() { # commit
     p=$(git rev-parse "$c^")
     echo "== $(git log -1 --format=%s "$c") —— 本 commit 新增或改动的行 =="
     git rev-parse -q --verify "$SHADOW" > /dev/null || { echo "（这个 worktree 还没有快照）"; return 0; }
-    git diff -M -z --name-status "$p" "$c" | while IFS= read -r -d '' st; do
+    git diff -M -z --name-status --no-color "$p" "$c" | while IFS= read -r -d '' st; do
         IFS= read -r -d '' f; old=$f
         case $st in R*|C*) IFS= read -r -d '' f ;; esac
         case $st in D*) continue ;; esac
-        ( attr_file "$c" "$p" "$st" "$old" "$f" ) < /dev/null || printf '%s  （这个文件归属失败，跳过）\n' "$f"
+        ( attr_file "$c" "$p" "$st" "$old" "$f" ) < /dev/null 2> "$WORK/attr.err" ||
+            printf '%s  （这个文件归属失败，跳过：%s）\n' "$f" "$(head -1 "$WORK/attr.err")"
     done
 }
 sub() { sed -i.bak "$1" "$2" && rm "$2.bak"; }   # 可移植的 sed -i（BSD 与 GNU 都认 -i.bak）
@@ -248,13 +259,17 @@ snap pre A A1; printf 'def f(items):\n    total = compute_total(items, discount_
 snap pre B B1; printf 'def f(items):\n    total = compute_total(items, discount_rate)\n\ndef g(items):\n    total = compute_total(items, discount_rate)\n' > m.py; snap post B B1
 git commit -qam "f and g"; attribute HEAD
 
-echo; echo "######## 边界 13：改名（纯改名不算新增）+ 文件名带空格、中文、双引号、tab，一个出问题也不拖垮别的"
+echo; echo "######## 边界 13：改名、怪文件名、二进制、子模块指针，开着 color.diff=always 与 diff.external；一个出问题也不拖垮别的"
 newrepo rename; printf 'one\ntwo\nthree\n' > a.txt; printf 'ok\n' > ok.txt; git add -A; git commit -qm base
+git config color.diff always; git config diff.external false   # 用户的 diff 配置不能让输出变形
 snap pre A A1
 git mv a.txt "说明 b.txt"; printf 'four\n' >> "说明 b.txt"
 printf 'q\n' > 'say"hi".txt'; printf 't\n' > "$(printf 'tab\there.txt')"; printf 'ok2\n' >> ok.txt
+printf '\000\001\002' > bin.dat
 snap post A A1
-git add -A; git commit -qm "rename and odd names"; attribute HEAD
+git add -A
+git update-index --add --cacheinfo "160000,$(printf '%040d' 1),sub"   # 子模块指针（指向的 commit 不在本仓）：demo 不处理，走「跳过」
+git commit -qm "rename and odd names"; attribute HEAD
 
 echo; echo "######## 边界 14：racy-git——add 之后同一秒改成同长度，隔一秒再拍；snaptree 要拍到工作树里的版本"
 newrepo racy; printf 'return a + b\n' > f; git add f; git commit -qm base
@@ -263,6 +278,15 @@ w=$(snaptree); echo "snaptree 拍到：$(git show "${w% *}:f")（工作树里是
 d=$(mktemp -d); cp "$(git rev-parse --git-path index)" "$d/index"   # 对照：复制时不带 -p
 t=$(GIT_INDEX_FILE=$d/index git add -A && GIT_INDEX_FILE=$d/index git write-tree); rm -rf "$d"
 echo "对照：cp 不带 -p 拍到：$(git show "$t:f")"
+
+echo; echo "######## 边界 15：合并冲突时暂存区写不出 tree → 只去掉冲突的路径；干净合入的文件仍归给做合并的调用"
+newrepo conflict; printf 'a\nb\n' > f.txt; printf 'c0\n' > c.txt; git add -A; git commit -qm base
+git checkout -qb side; printf 'a\nfrom-side\n' > f.txt; printf 'c-side\n' > c.txt; git commit -qam side
+git checkout -q main; printf 'c-main\n' > c.txt; git commit -qam main
+snap pre Z Z0; snap post Z Z0
+snap pre A A3; git merge -q side > /dev/null 2>&1 || true; snap post A A3      # f.txt 干净合入并暂存，c.txt 冲突
+snap pre A A4; printf 'a\nfrom-side\nwt-only\n' > f.txt; snap post A A4        # 只改工作树里的 f.txt，不暂存
+snap pre A A5; printf 'c-resolved\n' > c.txt; git add c.txt; git commit -qm "merge side"; attribute HEAD; snap post A A5
 
 [ "${KEEP:-}" = 1 ] && echo "临时目录保留在 $WORK"
 exit 0
