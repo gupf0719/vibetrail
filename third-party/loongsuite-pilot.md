@@ -18,7 +18,7 @@
 写成经验」，Pilot 读会话是为了「原样搬运」。
 
 对本项目的意义：它是三方里**采集范围**最宽的（扫子 agent、拿 system prompt、取到的字段零截断），
-但会在记录层静默漏东西：被打断时写下的中断记录大多根本不进事件（采集清单 §1.2 实测 265 条进了 5 条）。
+但会在记录层静默漏东西：没等到真实回复的整轮连 prompt 一起丢，轮末的中断记录几乎全丢（采集清单 §1.2b 实测）。
 它也**不做分歧判定**：`cancelled` 在不少链路里出现，只是 turn 或工具的终止状态，没有分歧的分类；
 Claude Code 链路连「中止」这种终止状态都没有。详见对比文档 §1。
 
@@ -276,7 +276,7 @@ stub 插件 filter 的是 `.internal`，而**开源构建根本不 import 那条
 
 | 能力 | LoongSuite Pilot | 依据 |
 |---|---|---|
-| 分歧信号判定 | ❌ 无 | Claude Code 链路的 `STOP_REASON_MAP`（`assets/hooks/claude-code/message-converter.mjs:20-30`）9 个 key 归到 5 个值，没有「用户中断」；被打断时写下的 `[Request interrupted by user]` 大多根本不进事件（采集清单 §1.2 实测 265 条进了 5 条）。`cancelled` 在不少链路里出现，来源和用途都不一：有的照搬宿主记下的中止（Codex 的类型化 `turn_aborted`、Grok、DSH、OpenClaw 等），有的是 Pilot 收尾时自己补的（WorkBuddy、MiMo Code，Codex 的子 agent 也有），Wukong、Hermes 只拿它标工具结果，Qoder 只在白名单里预留。都不是分歧分类 |
+| 分歧信号判定 | ❌ 无 | Claude Code 链路的 `STOP_REASON_MAP`（`assets/hooks/claude-code/message-converter.mjs:20-30`）9 个 key 归到 5 个值，没有「用户中断」；被打断时写下的 `[Request interrupted by user]` 大多根本不进事件（采集清单 §1.2b 实测 265 条进了 5 条）。`cancelled` 在不少链路里出现，来源和用途都不一：有的照搬宿主记下的中止（Codex 的类型化 `turn_aborted`、Grok、DSH、OpenClaw 等），有的是 Pilot 收尾时自己补的（WorkBuddy、MiMo Code，Codex 的子 agent 也有），Wukong、Hermes 只拿它标工具结果，Qoder 只在白名单里预留。都不是分歧分类 |
 | commit ↔ session 关联 | ❌ 未实现，但**设计过** | 见下 |
 | 装 git hook / 改 `core.hooksPath` | ❌ 无 | 全仓 grep `core.hooksPath` / `.git/hooks` / `pre-commit` / `post-commit`，仅命中下面那个死类型 |
 | 往 commit 里写 session id | ❌ 无 | 无 `git commit` / trailer / amend 相关代码；git 交互只有 `src/utils/git-context.ts:68` 一处 `execFile`，**只读** |
