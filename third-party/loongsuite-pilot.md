@@ -5,7 +5,7 @@
 > [teamai-cli-vs-vibetrail.md](teamai-cli-vs-vibetrail.md)（与 teamai-cli、本项目的三方对比）。
 >
 > 扫描对象：`/Users/gupengfei/program/go/src/loongsuite-pilot`，HEAD `d4ab8b6d`（2026-09-08）。
-> 本文所有数字均来自该快照，**引用请带这个日期**——它是个高频迭代的仓：近 30 天 127 个 commit。
+> 本文所有数字均来自该快照，**引用请带这个日期**——它是个高频迭代的仓：快照前 30 天（08-09 至 09-08）148 个 commit。
 > 全部读码所得，本机未装，无实机数据可对照。
 
 ## 0. 一句话
@@ -17,8 +17,10 @@
 **没有一个是价值判断**。这一点决定了它和 teamai 的根本分野：teamai 读会话是为了判断「这次值不值得
 写成经验」，Pilot 读会话是为了「原样搬运」。
 
-对本项目的意义：它是三方里唯一**采集范围**做到位的（扫子 agent、拿 system prompt、全文零截断），
-但它**一个分歧信号都不判**。详见对比文档 §1。
+对本项目的意义：它是三方里**采集范围**最宽的（扫子 agent、拿 system prompt、取到的字段零截断），
+但会在记录层静默漏东西：被打断时写下的中断记录大多根本不进事件（采集清单 §1.2 实测 265 条进了 5 条）。
+它也**不做分歧判定**：`cancelled` 在不少链路里出现，只是 turn 或工具的终止状态，没有分歧的分类；
+Claude Code 链路连「中止」这种终止状态都没有。详见对比文档 §1。
 
 ## 1. 基本盘
 
@@ -28,12 +30,12 @@
 | 发布 | npm 包 `loongsuite-pilot` + 阿里云 OSS 托管的 `installer.sh` / `.ps1` + GitHub Release |
 | 版本 | **工作树的 `package.json` 停在 1.2.0**（最后改动 2026-08-14），最新 tag **v1.8.0**（2026-09-09，commit `280e3d51`，是 HEAD 的直接子提交）。v1.3.0–v1.8.0 的版本号只存在于 `release/*` 分支的发布提交里——**按工作树的 package.json 判断版本会错 6 个小版本** |
 | 规模 | `src/` 非测试 TypeScript **210 文件 / 61,154 行** |
-| 测试 | 全部在 `tests/`（`src/` 内 0 个测试文件）：**342 文件 / 99,876 行**，3,899 个 `it`/`test`、747 个 `describe`。测试:实现 ≈ **1.63:1** |
-| 历史 | **376 commit / 29 贡献者**，首提 **2026-06-09**（三个月的项目），近 30 天 127 个；月度 76→119→142→39 |
+| 测试 | 全部在 `tests/`（`src/` 内 0 个测试文件）：**342 文件 / 99,966 行**，3,899 个 `it`/`test`、747 个 `describe`。测试:实现 ≈ **1.63:1** |
+| 历史 | **376 commit / 29 贡献者**，首提 **2026-06-09**（三个月的项目），快照前 30 天 148 个；月度 76→119→142→39 |
 | CHANGELOG | **无**。发布说明靠 `gh release --generate-notes` |
 | 形态 | 单个 npm CLI（`loongsuite-pilot`）+ 常驻 daemon + 本机 Dashboard（默认 `127.0.0.1:8765`） |
 | 工具链 | esbuild 0.28（5 个入口，非单文件）、`tsc --noEmit` 只做类型检查、vitest 1.6.1 |
-| 支持 Agent | `agents.d/` 下 **20 个** JSON 定义 + Wukong（纯 TS，无 JSON）= 21 家；README 与 docs 列 21–22，见 §5 |
+| 支持 Agent | `agents.d/` 下 **20 个** JSON 定义 + Wukong（纯 TS，无 JSON）= 21 家；README 与 docs 列 21–22，见 §6 末尾 |
 
 三个月、376 commit、29 人、近 10 万行测试——这是个投入很重、推进很快的项目。
 `fix:feat = 181:82`（约 2.2:1）说明**大部分工程量在补真实故障，不在做功能**，这与「对着 21 家
@@ -47,12 +49,12 @@
 部署线   agents.d/*.json → DeploymentManager → 按 deployMode 装 hook / 插件 / patch
 采集线   AgentDiscoveryService → InputManager → 各 Input 实例（归一化在 Input 内部完成）
                                      ↓
-                              11 步串行管线
+                              10 步串行管线
                                      ↓
                               MultiFlusher 扇出到 4 个 sink
 ```
 
-11 步管线在 `src/core/input-manager.ts:333-431`，顺序是：
+10 步管线在 `src/core/input-manager.ts:333-431`，顺序是：
 git 富化 → 计数 → TraceLinker → invocation identity → turn boundary → **content policy** →
 **掩码** → 事件展开 → 字节计量 → dispatch。
 
@@ -63,7 +65,10 @@ git 富化 → 计数 → TraceLinker → invocation identity → turn boundary 
 transport、编解码、失败落盘）。
 
 **另有一条完全独立的旁路**：`PipelineManager`（`src/pipeline/pipeline-manager.ts:16-78`）走
-LoongCollector 式的 `input_file → flusher_sls`，**不经归一化，也不经掩码**。
+LoongCollector 式的 `input_file → flusher_sls`，**不经归一化，也不经掩码**；Qoder 组织 API 那条链路也挂在它下面
+（[采集清单 §5.5](loongsuite-pilot-collection.md)）。它**默认关**：`pipeline.enabled` 默认 `false`
+（`src/core/config-loader.ts:676-691`、`src/core/orchestrator.ts:335-347`），开了之后按
+`configs/local/` 下的配置采指定文件或拉 Qoder 组织 API，不是 agent 会话。
 读这个仓时容易漏掉它——两条路都能把数据送到 SLS，但只有主线受内容策略约束。
 
 `src/` 20 个顶层目录，行数集中在 `inputs/`（21,607）、`deployment/`（6,714）、`core/`（6,477）、
@@ -113,8 +118,8 @@ dispatch 在 `src/deployment/deployment-manager.ts:338-355` 的 `switch (def.dep
 - `openspec/` —— OpenSpec 规范驱动开发目录，只有 1 个 change、4 个文件，已完成未归档。
   被 `.gitignore:62` 忽略却强制入库了。
 - `solutions/` —— 一个 SLS 看板交付工作区（72 文件，含两套 skill 与两个案例）。
-- `assets/skills/loongsuite-pilot-ops/` —— 给 AI agent 用的中文运维 Skill（SKILL.md + 18 个
-  references，4,359 行），随包分发并由 postinstall 拷到 `~/.loongsuite-pilot/skills/`。
+- `assets/skills/loongsuite-pilot-ops/` —— 给 AI agent 用的中文运维 Skill（SKILL.md 354 行 +
+  18 个 references 共 4,359 行），随包分发并由 postinstall 拷到 `~/.loongsuite-pilot/skills/`。
 
 前两个都不进 npm 包（`files` 只有 `dist/ assets/ scripts/ agents.d/`）。
 
@@ -131,7 +136,8 @@ changing the deployment framework」。**只对部署侧成立。**
 
 JSON 里的 `input` 块是**死元数据**：`AgentInputConfig` 全仓只在 `src/types/deployment.ts:144,256`
 出现，没有任何代码读取它；30 个 input 全部硬编码注册在 `src/core/orchestrator.ts`。
-`docs/agent-onboarding.md` 自己列明了新增一个 agent 需要四项：TS 实现、ClientType、启动路径注册、测试。
+`docs/agent-onboarding.md:63-72` 自己列明了新增一个 agent 需要六项：agents.d 定义、hook / 插件 / 轮询源、
+Input 实现、ClientType、启动路径注册、测试——JSON 只是六项之一。
 
 所以 README 那句容易被读成「纯 JSON 接入」，实际不是。Wukong 更直接——**根本没有 agents.d 文件**，
 纯 TS（`orchestrator.ts:1557`）。
@@ -173,20 +179,27 @@ JSON 里的 `input` 块是**死元数据**：`AgentInputConfig` 全仓只在 `sr
 
 ### 4.4 watchdog 自愈：能力与介入边界
 
-`src/core/hook-watchdog.ts` 会持续检查并修复被改坏或删掉的 hook 资产、插件配置、shell rc 块。
-两条克制的设计：
+`src/core/hook-watchdog.ts`（本节无前缀行号都指它）默认每 5 分钟检查一次（`src/core/config-loader.ts:658-669`），
+修复被删掉的 settings hook 条目、插件配置、shell rc 拦截块等。两类目标的规则不一样，别混：
 
-- 健康判定按**内容**而非 marker，所以老版本的块会被识别并迁移。
-- 自愈**每天最多 3 次**，带冷却（`:16,590-600`）——不会和用户的手工修改无限对抗。
+| 目标 | 怎么判健康 | 修复节奏 |
+|---|---|---|
+| settings 里的 hook 条目（hook 模式各家，Grok 除外） | 每个事件下有没有一条命令含它的脚本名（marker 子串，`:447-476`） | 两次至少隔 10 分钟，**不设每日上限**（`:388-411`） |
+| 「拦截类」目标：shell rc 块、Qoder Work 的 launchctl / Windows 环境变量、Grok 的 hook 文件、插件注入 / 目录插件 / DSH 的配置 | 各自的 `check()`；rc 块另按**内容**（`signature`）判是不是旧版，旧版就迁移（`:889-904`） | 10 分钟冷却，且**每天最多 3 次**（`:16,551-611`） |
+
+克制的部分在拦截类目标上：每日上限让它不会和用户的手工删除无限对抗（计数只在内存里，按 UTC 日期清零，
+daemon 重启也清零，`:615-621`）；在 `config.json` 里把某个 agent 的 `agents.<id>.enabled` 设为 `false`，
+它还会顺手把 rc 块等清掉（`:556-573`）。settings 里的 hook 条目没有上限——用户手工删掉，几分钟到十几分钟内
+就会回来，除非同样把这个 agent 关掉。
 
 但要清楚它的介入面比 teamai 大一档：
 
 | | teamai-cli | LoongSuite Pilot |
 |---|---|---|
 | 改 agent settings | ✅ | ✅ |
-| 改 shell rc（`~/.zshrc` / `~/.bashrc`） | ❌ | ✅ 追加 marker 块（只在文件已存在时，`:914` 「never create rc files」） |
+| 改 shell rc（`~/.zshrc` / `~/.bashrc`） | ❌ | ✅ 追加覆盖 `claude`、`qodercli`、`qoderclicn` 命令的 shell 函数，对应 agent 启用且 hook 脚本在时才加（只在文件已存在时，`:914` 「never create rc files」；README 与 docs 零提及） |
 | 注入进 agent 进程 | ❌ | ✅ `BUN_OPTIONS --preload` |
-| 改用户即将执行的命令 | ❌ | ✅ Bash 命令前拼 `export TRACEPARENT=...` |
+| 改用户即将执行的命令 | ❌ | ⚠️ 可选，默认关：`upstreamLink.enabled` 与 `propagateToTools` 都开，且有可传播的上下文（环境里的上游 `TRACEPARENT`，或另开 `generateTraceWhenMissing`）时，Bash 命令前拼 `export TRACEPARENT=...`；Claude Code 进程带着 `LOONGSUITE_PILOT_RESOURCE_ATTRIBUTES` 时还会拼 `export OTEL_RESOURCE_ATTRIBUTES=...`，这一路不需要 trace 上下文 |
 | 装 git hook | ❌ | ❌（但定义了类型，见 §6） |
 
 teamai 的边界是「只用 harness 生命周期 hook，不碰用户的 git、不碰用户的 shell」
@@ -210,26 +223,29 @@ stub 插件 filter 的是 `.internal`，而**开源构建根本不 import 那条
 另外两个文件，它们的实际内容是：
 
 - `alarm-sender.ts` —— `sendAlarm` 与 `sendStatus` **都是空函数**。
-- `statistic.ts` —— **真实现**：每 12 小时向固定的阿里云 SLS
-  （`loongsuite-community-edition` / `loongsuite-online`）POST 一条 `pilot_running_status`，
-  含 `ip`、`hostname`、`os_detail`、`version`、`instance_id`、`metric_json`。
+- `statistic.ts` —— **真实现**：daemon 每次启动时发一条、之后每 12 小时一条，向固定的阿里云 SLS
+  （`loongsuite-community-edition` / `loongsuite-online`）POST `pilot_running_status`，
+  含 `ip`、`hostname`、`os_detail`、`version`、`cpu`、`mem`、`instance_id`、`metric_json`。
 
 **告警和状态上报在开源版都被清空了，唯独留下了这一条。** 无条件调用（`metrics-writer.ts:177`），
-无 opt-out，README 与 docs 零处提及。详细字段与 `instance_id` 的可逆性见
+无 opt-out，README 与 docs 零处提及——代码注释倒不讳言，`src/core/orchestrator.ts:349` 写着
+「→ local JSONL + remote via sender.ts」。详细字段与 `instance_id` 的可逆性见
 [采集清单 §3.5](loongsuite-pilot-collection.md)。
 
 ## 5. 工程质量观察
 
 **好的：**
 
-- **测试量真实**：99,876 行测试 vs 61,154 行实现（1.63:1），3,899 个用例。e2e 分两级，
+- **测试量真实**：99,966 行测试 vs 61,154 行实现（1.63:1），3,899 个用例。e2e 分两级，
   L2 需要真实环境——真 SLS project/AK、各家 agent 的真 API key（`.env.e2e.example:14-38`）。
 - **降级路径分得清**：fail-open 是默认，但有例外且都写了理由——`single-instance-lock.ts:241`
   明确 fail closed，`win-archive.ts:187` 明确故意致命，`deploy-command.ts:128-132` 明确不吞上报错误。
 - **容量上限到处是硬常量**：file-tailer 4 MiB / 100 文件 / 队列 20；multimodal 10 parts / 30 MiB /
   1 GiB pending；日志保留 2 GiB。背压时**不推进窗口**以便下轮重采（`qoder-api-pipeline.ts:163-165`）。
-- **幂等与去重成体系**：确定性 `event.id`（sha256）+ 7 天 highWatermark 快照（`src/checkpoints/`）；
-  marker 块增删幂等；auth 失败直接熔断停止轮询。
+- **幂等与去重成体系**：Codex、Qoder Work SQLite 等轮询类输入用确定性 `event.id`（sha256；Qoder API 是同样确定性的
+  `event_id`）；Qoder IDE 两个输入另有 7 天 highWatermark 快照（`src/checkpoints/`，经 `base-ide-input.ts`）；
+  Claude Code 这类 hook 链路的 `event.id` 是 `randomUUID()`，幂等靠 transcript 的字节 offset；marker 块增删幂等；
+  auth 失败直接熔断停止轮询。
 - **CI 有安全意识**：secret-scan 用 gitleaks，pin 了 action SHA 与二进制 SHA256
   （`.github/workflows/secret-scan.yml:21-27`）。
 - `src/` 下 **TODO / FIXME / HACK / XXX 为 0**；近 30 个 commit 里 26 个是 PR 合并。
@@ -246,10 +262,11 @@ stub 插件 filter 的是 `.internal`，而**开源构建根本不 import 那条
 - **内容策略有两份清单且不一致**，且都漏了 `error.message`（采集清单 §5.2 / §5.3）。
   同一个语义分散在两个文件手工维护——正是 `data-dir.ts` 那句「a comment is not a mechanism」
   批评过的模式，只是这次没有测试守着。
-- **保留策略按类别映射而非按目录枚举**，导致含完整对话正文的
-  `logs/<agent-id>/*.jsonl` 永不删除（采集清单 §2.4）。
-- **卸载目标是手工维护的重复清单**：`deploy/installer-opensource.sh:2269-2278` 硬编码 8 个
-  settings 路径，与 `agents.d/` 的 `settingsPath` 集合没有机制保证一致。
+- **保留策略按类别映射而非按目录枚举**，导致写在日志根目录的那几家（Claude Code 在内）含完整对话正文的
+  `logs/<agent-id>/*.jsonl` 永不删除；写在 `history/` 子目录的六家和自己清理的 Hermes 不受影响（采集清单 §2.4）。
+- **卸载目标是手工维护的重复清单，好在有测试兜着**：`deploy/installer-opensource.sh:2268-2280` 硬编码 11 个
+  配置文件路径，Grok 另写一段（`:2347-2403`）；`tests/unit/deploy/installer-uninstall-cleanup.test.mjs:159-179`
+  从 `agents.d/` 推出全部 hook 配置路径，逐个断言两个安装脚本里都出现过——只查字符串在不在，但漂移会报错。
 - 零碎的：143 处 `homedir()` / `~` 路径拼接；`cursor-cli` 名义上是 hook 模式但 `events: []`
   实际不写文件；`package.json:30` 声明 `types: dist/index.d.ts` 但 build 只跑 esbuild 不产 `.d.ts`；
   根 `SKILL.md` 是**没填的模板占位符**（`:14-16` 仍是 `# TODO: Add quick start commands`）却随仓库分发。
@@ -259,7 +276,7 @@ stub 插件 filter 的是 `.internal`，而**开源构建根本不 import 那条
 
 | 能力 | LoongSuite Pilot | 依据 |
 |---|---|---|
-| 分歧信号判定 | ❌ 无 | `STOP_REASON_MAP`（`assets/hooks/claude-code/message-converter.mjs:20-30`）只有 6 种映射，没有「用户中断」；`cancelled` 只在 Grok / Qoder 链路。它把 `[Request interrupted by user]` 当普通消息全文存下来 |
+| 分歧信号判定 | ❌ 无 | Claude Code 链路的 `STOP_REASON_MAP`（`assets/hooks/claude-code/message-converter.mjs:20-30`）9 个 key 归到 5 个值，没有「用户中断」；被打断时写下的 `[Request interrupted by user]` 大多根本不进事件（采集清单 §1.2 实测 265 条进了 5 条）。`cancelled` 在不少链路里出现，来源和用途都不一：有的照搬宿主记下的中止（Codex 的类型化 `turn_aborted`、Grok、DSH、OpenClaw 等），有的是 Pilot 收尾时自己补的（WorkBuddy、MiMo Code，Codex 的子 agent 也有），Wukong、Hermes 只拿它标工具结果，Qoder 只在白名单里预留。都不是分歧分类 |
 | commit ↔ session 关联 | ❌ 未实现，但**设计过** | 见下 |
 | 装 git hook / 改 `core.hooksPath` | ❌ 无 | 全仓 grep `core.hooksPath` / `.git/hooks` / `pre-commit` / `post-commit`，仅命中下面那个死类型 |
 | 往 commit 里写 session id | ❌ 无 | 无 `git commit` / trailer / amend 相关代码；git 交互只有 `src/utils/git-context.ts:68` 一处 `execFile`，**只读** |
@@ -270,8 +287,10 @@ stub 插件 filter 的是 `.internal`，而**开源构建根本不 import 那条
 **`GitHookEvent` 是本次扫描里最有意思的一处「不做」：**
 
 ```typescript
-// src/types/events.ts:190-201
-/** Git hook event from post-commit / pre-push hooks. */
+// src/types/events.ts:190-200
+/**
+ * Git hook event from post-commit / pre-push hooks.
+ */
 export interface GitHookEvent {
   eventType: 'post-commit' | 'pre-push';
   repoRoot: string;
@@ -293,11 +312,11 @@ export interface GitHookEvent {
 **文档与代码的六处偏离**（写在这里是因为读这个仓时会踩）：
 
 1. `AGENTS.md:37` 指向 `src/file-collection/`，**该目录不存在**——已改名为 `src/pipeline/`。
-   模块清单还漏了 `mask/`、`metrics/`、`multimodal/`、`local-workers/`、`pi-sdk/`、`internal/`、`hooks/`、`cli/`。
+   模块清单还漏了 `mask/`、`metrics/`、`multimodal/`、`local-workers/`、`pi-sdk/`、`internal/`、`hooks/`、`cli/`、`utils/`。
 2. **支持 agent 数三处不一致**：`README.md:55-78` 列 22 个，`docs/agents.md:14-38` 列 22 个，
-   `docs/overview.md:23-43` 列 21 个（是 README 旧拷贝，漏了 DeepSeek Harness），实际 `agents.d/` 只有 20 个文件。
-   差额可解释（Wukong 无 JSON 定义、Qoder CLI 复用 `qoder.json`），但 `README.md:91-99` Windows 表里的
-   「Qoder IDE」在 agents.d 和 ClientType 里都找不到对应 id。
+   `docs/overview.md:23-45` 列 21 个（是 README 旧拷贝，漏了 DeepSeek Harness），实际 `agents.d/` 只有 20 个文件。
+   差额可解释（Wukong 无 JSON 定义、Qoder CLI 复用 `qoder.json`）。另外 `README.md:91-99` Windows 表管它叫
+   「Qoder IDE」，主表和 `agents.d/qoder.json` 叫「Qoder」——是叫法不一，不是缺 id。
 3. **两个被引用的文档不存在**：`docs/E2E-REMOTE-TEST-GUIDE.md`、`docs/EVENT_LOG_TO_TRACE_SPEC.md`。
 4. `README.md:104` 的「无需改动部署框架即可新增 agent」只对部署侧成立，见 §4.1。
 5. **中英文档已分叉**：`docs/zh-CN/` 独有三篇，英文独有三篇。

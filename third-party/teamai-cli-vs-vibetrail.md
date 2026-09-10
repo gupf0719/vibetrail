@@ -6,7 +6,7 @@
 >
 > teamai-cli 快照 HEAD `6ae0619`（2026-09-09；第一版基于同日的 `224c0c4`，之间 10 个 commit，影响本文的只有 ZCode、
 > multi-project P3、self 模式瘦身三项，见附录第 9 条）。LoongSuite Pilot 快照 HEAD `d4ab8b6d`（2026-09-08），
-> 全部读码所得、本机未装，第 11 条并入。判据实测于 **2026-09-09**，语料 **762 个 transcript 文件**。
+> 全部读码所得、本机未装，见附录第 11–14 条。判据实测于 **2026-09-09**，语料 **762 个 transcript 文件**。
 >
 > 本文原名「teamai-cli vs vibetrail」，2026-09-10 扩为三方；文件名保持不变以免打断交叉引用。
 
@@ -29,22 +29,29 @@
 | 主体 | 团队（多人多仓多工具） | Agent 运行时（多 harness） | 代码（一个仓的提交历史） |
 | 数据归属 | 机器本地 + 独立的团队知识仓 | 机器本地 + **可配置的云端**（SLS / HTTP / OTLP） | **随被观测的代码走**（`<repo>/.claude/trace/`） |
 | 内容采集 | 截断文本，默认留本机 | **完整正文，默认开、默认不脱敏** | 结构化字段 + 部分自由文本 |
-| 分歧判定 | ✅ 有判据（4 类信号 + 阈值） | ❌ **完全没有** | ✅ 有判据（6 类 kind） |
-| 规模 | 63.4K 行 TS，695 commit，40 人 | 434 个 TS 源文件，21 个 harness | 一组 shell/jq 工具 |
+| 分歧判定 | ✅ 有判据（4 类信号 + 阈值） | ❌ **没有**（有 turn 终止状态，没有分歧分类，见下） | ✅ 有判据（6 类 kind） |
+| 规模 | 63.4K 行 TS，695 commit，40 人 | 61.2K 行 TS（`src/` 210 个文件），376 commit，29 人，21 个 harness | 一组 shell/jq 工具 |
 
 两处重叠，性质完全不同：
 
 - **与 teamai 的重叠在判据层**：都读 Claude Code 的 transcript，都从里面提取人机分歧信号。
   这是唯一的正面对撞，§3 是逐条实测对比。
 - **与 Pilot 的重叠在采集层**：都要决定扫哪些文件、采多少内容、落在哪。但它**不判定分歧**——
-  `STOP_REASON_MAP`（`assets/hooks/claude-code/message-converter.mjs:20-30`）只有 6 种映射，
-  没有「用户中断」这一类，`cancelled` 只在 Grok / Qoder 链路出现。它把
-  `[Request interrupted by user]` 当普通用户消息全文存下来：**内容在，标记不在**。
+  Claude Code 链路的 `STOP_REASON_MAP`（`assets/hooks/claude-code/message-converter.mjs:20-30`）是 9 个 key
+  归到 5 个值，没有「用户中断」这一类。更要紧的是 `[Request interrupted by user]` 这条记录**大多根本不进事件**：
+  解析器按 promptId 分组，中断记录排在被打断那一轮最后一次模型回复之后，只有同一轮后面还有模型调用才会被带出去
+  （`assets/hooks/claude-code/transcript-parser.mjs:365-460`）。拿它自己的解析器离线跑本机 27 个含中断的主会话，
+  265 条中断记录只有 5 条进了事件——**内容和标记都不在**（[采集清单](loongsuite-pilot-collection.md) §1.2）。
+  `cancelled` 倒是在不少链路里出现，但来源和用途都不一：有的照搬宿主记下的中止（Codex 的类型化 `turn_aborted`
+  最典型，见 §6.2），有的是 Pilot 收尾时自己补的（WorkBuddy、MiMo Code，Codex 的子 agent 也有），Wukong、Hermes
+  只拿它标工具结果，Qoder 只在白名单里预留。它是终止或工具状态，不是分歧分类。
   所以两边在 §3 那张判据表上无从对撞，对照在 §3.2（采集范围）和 §4（落点）。
 
-一个有意思的推论：**Pilot 的数据理论上能反推出本项目的全部判据**（全文都在），
-但它自己不做；teamai 的数据反推不出来（内容已截断）。这正好说明「采集范围」和「判据精度」
-是两个正交维度——§7 第 2 条的教训在三方语料上都成立。
+一个有意思的推论：**Pilot 的数据能反推出本项目的一部分判据**。工具结果按 tool_use id 单独收，人拒绝工具调用的
+那几种大多在（本机 45 条进了 41 条，只是和机器失败一样记成 `ToolError`）；**interrupt 类却基本反推不出来**，
+中断记录大多没进事件（见上）。它自己一样都不判。teamai 的数据两样都反推不出来（内容已截断）。
+这正好说明「采集范围」和「判据精度」是两个正交维度——§7 第 2 条的教训在三方语料上都成立，
+而且采集范围不只看「扫了哪些文件」，还要看「文件里哪些记录真的走到了输出」。
 
 ## 2. 功能面对照
 
@@ -58,13 +65,13 @@
 | **读 transcript 提取人机分歧** | ✅ | ❌ **读但不判** | ✅ | **teamai 与本项目的唯一正面重叠，见 §3** |
 | 纠正话术识别（`correction`） | ✅ 启发式 | ❌ | ❌ 已主动搁置 | 见 §3.4 |
 | 敏感信息脱敏 | ✅ 出口处 `redact()`（本地事件流仍明文） | ⚠️ 有 9 类规则但**默认 `none`** | ❌ **已落自由文本，无脱敏** | 见 §6.1 |
-| 团队看板 / 周报 | ✅ | ✅ 本机 Dashboard + 云端 AgentLoop | ❌ 不做 | |
+| 团队看板 / 周报 | ✅ | ✅ 云端 AgentLoop（外部资料，见 §5.2）+ `solutions/` 的 SLS 看板模板；本机 Dashboard 只看用量汇总（token、会话、请求、工具调用、模型与仓库占比） | ❌ 不做 | |
 | learning 投票飞轮 + 晋升 | ✅ | ❌ 不做 | ❌ 不做 | |
 | CI 上从 MR 提知识（`ci extract-mr`） | ✅ | ❌ 不做 | ❌ 不做 | MR → 知识，非 commit → 会话，见 §5.1 |
-| **commit ↔ session 关联** | ❌ | ⚠️ 仅 Qoder 云端 API 链路 | ✅ trailer 注入 | 见 §5.1 |
-| **行级 AI 代码归属** | ❌ | ⚠️ 仅 Qoder 云端 API 链路 | ❌ | `committed_ai_lines_edit`，见 §5.1 |
+| **commit ↔ session 关联** | ❌ | ❌（Qoder 云端链路有 commit 级 AI 行数，但不关联会话） | ✅ trailer 注入 | 见 §5.1 |
+| **commit 级 AI 行数归属** | ❌ | ⚠️ 仅 Qoder 云端 API 链路，默认关 | ❌ | 逐 commit 按来源拆的增删行数，见 §5.1 |
 | **审计过程留痕** | ❌ | ❌ | ✅ `vibetrail-audit` | 见 §5.2 |
-| 单事件可回跳原文（uuid 指针） | ❌ 只存计数 | ⚠️ 无原文锚点，但**存了全文副本** | ✅ `turn` 字段 | 见 §5.3 |
+| 单事件可回跳原文（uuid 指针） | ❌ 只存计数 | ⚠️ 无逐条指针，有回复 / 工具调用级的 id，且**存了大部分正文的副本** | ✅ `turn` 字段 | 见 §5.3 |
 | 留痕随代码走 | ❌ 默认反向；self 模式知识随 main 走 | ❌ 反向（本机 + 云端） | ✅ D2 | 见 §4 |
 
 Pilot 有而另两家都没有的，单列一组：
@@ -73,10 +80,10 @@ Pilot 有而另两家都没有的，单列一组：
 |---|---|---|---|---|
 | 完整对话正文采集（零截断） | ❌ 截断 200/500/160 字 | ✅ | ❌ | [采集清单](loongsuite-pilot-collection.md) §1.2 |
 | 子 agent transcript | ❌ 看不到 | ✅ `SubagentStop` + 读独立文件 | ✅ 扫全量 | §3.2 |
-| system prompt 采集 | ❌ | ✅ 进程内拦 `/v1/messages` | ❌ | 采集清单 §1.5 |
+| system prompt 采集 | ❌ | ✅ 进程内拦 `/v1/messages`（靠 rc 里一个覆盖 `claude` 的 shell 函数注入） | ❌ | 采集清单 §1.5 |
 | 工具参数与结果正文 | ❌ 明确不采 | ✅ 全文 | ❌ | 采集清单 §1.2 |
 | 图片等多模态 | ❌ | ✅ 传对象存储（仅 Codex/Qoder） | ❌ | 采集清单 §3.4 |
-| **修改用户即将执行的命令** | ❌ | ✅ 注入 `TRACEPARENT` 到 Bash | ❌ | 采集清单 §1.4 |
+| **修改用户即将执行的命令** | ❌ | ⚠️ 可选，默认关：两个开关都开才往 Bash 命令前注入 `TRACEPARENT` | ❌ | 采集清单 §1.4 |
 
 ## 3. 正面对撞：同一份语料，两套判据
 
@@ -204,7 +211,7 @@ LoongSuite Pilot 装了 `SubagentStop`（`agents.d/claude-code.json:11-16`），
 | | 看得到子 agent 文件 | 从中提取分歧信号 |
 |---|---|---|
 | teamai-cli | ❌ 无 `SubagentStop`，无遍历代码 | ❌ 因此漏掉 58% 的人拒 |
-| LoongSuite Pilot | ✅ 读独立文件，只展开一级（`:869`） | ❌ **它不判分歧**，全文存下来但不标记 |
+| LoongSuite Pilot | ✅ 读独立文件，只展开一级（`claude-code-hook-processor.mjs:867-868`） | ❌ **它不判分歧**，正文大多存下来但不标记，轮末的中断记录还会丢 |
 | vibetrail | ✅ 按 worktree 聚合扫全量 | ✅ 6 类 kind |
 
 Pilot 与本项目在发现子 agent 的**手段**上略有不同：它靠 transcript 里的 `toolUseResult.agentId`
@@ -286,8 +293,8 @@ Pilot 在这个轴上离本项目**最远**：它连「跟着人走」都不是�
 数据的归属方既不是代码也不是个人，而是配置了 endpoint 的那个组织。
 
 一条必须补的限定：**Pilot 有一路数据不受这个选择控制。** 默认配置下会话内容一个字都不出本机，
-但 `src/internal/statistic.ts` 每 12 小时把主机指纹（`ip` / `hostname` / `os_detail` /
-可逆的 `instance_id`）直发固定的阿里云 SLS，无条件、无 opt-out、文档零提及
+但 `src/internal/statistic.ts` 在 daemon 每次启动时、之后每 12 小时，把主机指纹（`ip` / `hostname` / `os_detail` /
+可逆的 `instance_id`，后者还含 `user.id` 与数据目录路径）直发固定的阿里云 SLS，无条件、无 opt-out、文档零提及
 （[loongsuite-pilot-collection.md](loongsuite-pilot-collection.md) §3.5）。
 所以「落点由部署方决定」这句话对**业务数据**成立，对**主机标识**不成立。
 
@@ -339,10 +346,12 @@ hook 的政策宣示——「自觉的边界选择」是本文的推断，不是
 
 **LoongSuite Pilot 的情况不一样，值得单独说 —— 它识别到了这个需求，写了类型，然后停在那里。**
 
-`src/types/events.ts:190-201`：
+`src/types/events.ts:190-200`：
 
 ```typescript
-/** Git hook event from post-commit / pre-push hooks. */
+/**
+ * Git hook event from post-commit / pre-push hooks.
+ */
 export interface GitHookEvent {
   eventType: 'post-commit' | 'pre-push';
   repoRoot: string;
@@ -359,22 +368,31 @@ export interface GitHookEvent {
 但这个形状正是本项目需要的：`post-commit` / `pre-push` 事件，带 `commitHash` 与 `changedFiles`。
 **「没人做过」和「有人写下了类型但没做」是两个不同的结论**，本文此前的判断要按后者更新。
 
-另外 Pilot 在一条链路上**确实有** commit 关联，而且比我们多一层：
-`src/pipeline/input/qoder-api/qoder-api-client.ts:278` 拉
-`/v1/organizations/{orgId}/ai-code-tracking/commits`，写出的条目
-（`qoder-api-input.ts:689-729,879-880`）带 `commit_hash` / `commit_ts` / `commit_message`，
-以及 **`committed_ai_lines_edit` / `committed_total_lines_edit`** —— **行级 AI 代码归属**。
+另外 Pilot 在一条链路上**确实有** commit 级的 AI 代码归属，这是我们没有的一层：
+`src/pipeline/input/qoder-api/` 每轮拉十来个组织级接口、写出十四种记录，其中和 commit 有关的是两种：
 
-三条限定，缺一不可：
+- `code.tracking_commit`（接口 `…/ai-code-tracking/commits`，`qoder-api-client.ts:278`；记录 `qoder-api-input.ts:688-729`）
+  —— **逐 commit 一条**，带 `commit_hash` /
+  `commit_ts` / `commit_message`、成员 id 与邮箱，以及按来源拆开的增删行数：`non_ai_added`、
+  `ide_agent_added`、`cli_agent_added`、`plugin_agent_added`、`ide_inline_chat_added` 等。
+- `code.stats_overview`（接口 `…/ai-code/stats/overview`，`qoder-api-client.ts:379-392`；记录 `qoder-api-input.ts:866-881`）
+  —— 组织在一个时间窗内的聚合，
+  `committed_ai_lines_edit` / `committed_total_lines_edit` 在这里，不在逐 commit 记录上。
+
+四条限定，缺一不可：
 
 1. 它是从 **Qoder 组织级服务端 API 拉的**，不是本机采集——所以本质上是 Qoder 云端已经算好了，
    Pilot 只是搬运。
 2. 只在 Qoder 生态内，**Claude Code 链路完全没有**。
-3. 方向是 commit → 统计聚合，不是 commit → **这次会话**；`ai-code-tracking` 回答的是
-   「这个组织的 AI 代码占比多少」，不是「这个 commit 是哪次会话写的」。
+3. 归属到的是**来源类别的行数**，不是具体哪几行，更不是哪次会话——逐 commit 记录里没有任何会话字段。
+4. 整条链路挂在 `PipelineManager` 下，`pipeline.enabled` 默认 `false`（`config-loader.ts:676-691`），
+   还要配组织 `OrgId` 与 `ApiKey`，**默认安装不会有这批数据**。
 
-所以本项目 CAPABILITIES 里「commit ↔ session 关联无先例」的判断**仍然成立**，
-但措辞要收紧：**行级 AI 归属有先例（Qoder 云端），commit ↔ 单次会话的关联仍然没有。**
+所以准确的说法是：**三方之中，commit ↔ 单次会话的关联只有本项目有；Pilot 补的是另一种能力，
+commit 级的 AI 行数统计。** 出了三方的范围，commit ↔ session 关联和逐行归属都有先例——
+git-ai 两样都做，本项目实装后否决了它（[DESIGN.md](../DESIGN.md) §2.5，否决的是 833MB 常驻库，不是能力本身）；
+[CAPABILITIES](../CAPABILITIES.md) §2.4c 本来就说「审计过程留痕」才是本项目唯一没有先例可抄的部分。
+本文此前写的「CAPABILITIES 里 commit ↔ session 关联无先例」是转述错了。
 
 ### 5.2 审计过程留痕
 
@@ -388,21 +406,29 @@ LoongSuite Pilot 连名字像的都没有：grep `code.?review` / `审查` / `�
 
 **「记录审计本身」这件事仍然没有先例**——本项目 CAPABILITIES §2.4c 的判断经这次扫描
 再次确认，可以把 teamai 与 LoongSuite Pilot 都列进「审的都是代码，没有一个记审计本身」那份名单。
-需要注意的是 AgentLoop（Pilot 的云端消费方）的官方材料确实讲「审计」——但那是
-「agent 执行了哪些高危命令」的**安全审计**，不是「一次代码评审的过程」，两者同名不同物。
+需要注意的是 AgentLoop（Pilot 的云端消费方，阿里云云监控 2.0 里的控制台）的官方材料确实讲「审计」：
+控制台的「审计 > AI Agent Insights」看的是 AI Agent 日志、会话记录和工具调用审计数据
+（[阿里云帮助中心：接入 AI 编程助手](https://www.alibabacloud.com/help/zh/cms/cloudmonitor-2-0/access-the-loongsuite-pilot-application)）。
+那是「agent 执行了什么」的**安全审计**，不是「一次代码评审的过程」，两者同名不同物。
+这一段是外部资料：Pilot 仓内没有 AgentLoop 这个词，只在 `solutions/` 看板模板的 SLS project 占位名
+`agentloop-xxx` 里出现。
 
 ### 5.3 单事件可回跳
 
 我们每条 diverge 带 `turn`（原始消息 uuid），transcript 还在就能跳回现场看上下文。
 teamai 只存聚合计数和脱敏摘要，**没有回跳锚点**——它的用途不需要。
 
-Pilot 是第三种情况，值得单独记：**它没有指回原始 transcript 记录的锚点**
-（`event.id` 是 collector 自己生成的确定性 sha256，`gen_ai.session.id` / `turn.id` / `step.id`
-也都是它自己的体系），**但它把原文整份复制了一份**。
+Pilot 是第三种情况，值得单独记：**它没有逐条记录的指针，只有粗一级的 id，但把原文的大部分复制了一份**（轮末的中断记录这类人类消息会丢，
+采集清单 §1.2）。
+Claude Code 链路上 `event.id` 是 hook 每次现生成的 `crypto.randomUUID()`（`claude-code-hook-processor.mjs:973` 等 7 处），
+`turn.id` / `step.id` 是它自己编的序号；transcript 记录自己的 `uuid` 解析出来了（`transcript-parser.mjs:349`）
+却不写进事件。能指回原文的是宿主自己的几个 id：`gen_ai.session.id` 就是 Claude 的 session_id（`claude-code-hook-processor.mjs:955`），
+`gen_ai.response.id` 就是 Anthropic 的 message id（同文件 `:838,1023`），工具事件带 transcript 里的 tool_use id。
+粒度到「一轮模型回复 / 一次工具调用」，人类输入没有对应的锚点。
 
-所以「可回跳」这个需求对它不成立——不是做不到，是不需要：指针的价值在于「原文太大不便存」，
-而它选择了存原文。代价写在 [采集清单](loongsuite-pilot-collection.md) §2.4：
-那份含完整对话正文的 `logs/<agent-id>/*.jsonl` 不被任何保留策略覆盖，永不删除。
+所以「可回跳」这个需求对它不迫切：指针的价值在于「原文太大不便存」，而它选择了存原文。
+代价写在 [采集清单](loongsuite-pilot-collection.md) §2.4：Claude Code 那份含完整对话正文的 hook 日志
+（`logs/claude-code/*.jsonl`）不被任何保留策略覆盖，永不删除。
 
 **三种取法对应三种成本**：teamai 存计数（最省，不可回溯）、vibetrail 存指针（省，可回溯但依赖原文还在）、
 Pilot 存副本（最贵，自足但无限增长）。本项目选指针是因为 trace 要随仓走，体积是硬约束——
@@ -471,7 +497,7 @@ teamai 对等的字段（`promptSummary`、`firstPrompt`）**全部强制过 `re
 但它的三个教训比模型本身更值钱，因为三条我们都可能犯：
 
 1. **出口那层要有测试守着，否则就是死代码。** 它的出站兜底 `redactCodeGenerationFields()`
-   删的正好是全部内容字段，而 `endpoint.redact` 全仓硬编码 `false`——函数永不执行
+   删的是大部分内容字段（却漏了 system prompt），而 `endpoint.redact` 全仓硬编码 `false`——函数永不执行
    （[采集清单](loongsuite-pilot-collection.md) §5.1）。写了、也合理、就是不生效。
 2. **字段清单要有单一真相源。** 内容策略有**两份** `MESSAGE_CONTENT_FIELDS`（hook 侧 14 项、
    daemon 侧 17 项），手工维护、已经分叉，而且**两份都漏了 `error.message`**——
@@ -519,21 +545,23 @@ Pilot 这个做法是对的，理由不只是隐私：**失败诊断的用途是
 可做的只有一件：把 fixture 的来源从「见过的」换成「从全语料里聚类出的」，
 让新形态出现时至少有机会被抓到。已立为 [OPEN-ISSUES G6](../OPEN-ISSUES.md)。
 
-**LoongSuite Pilot 也没解**，但它贡献了一条方向性的提醒：`docs/codex-aborted-turn-recovery.md:12,64-67`
-判「用户打断」用的是类型化记录 `event_msg:turn_aborted`，**不是 UI 字符串**，输出再归一到固定词表。
+**LoongSuite Pilot 也没解**，但它贡献了一条方向性的提醒：`docs/codex-aborted-turn-recovery.md:11-12,64-67`
+判「用户打断」用的是类型化记录 `event_msg:turn_aborted`，**不是 UI 字符串**，输出再归一到固定词表（`finish_reasons = ["cancelled"]`）。
 能拿到类型化信号的 harness 就不该匹配字符串——Claude Code 的 transcript 在这一点上不给类型
 （`[Request interrupted by user` 只有正文），所以三方在这条路上被迫一致。
 提醒本身值得留：**每次上游更新都该查一遍有没有新增的类型化字段能替掉硬编码串。**
 
-### 6.2b 采集范围的钉子 —— 三方全都没有，但 Pilot 有现成零件
+### 6.2b 采集范围的钉子 —— 我们和 teamai 都没有，Pilot 有现成零件
 
-对比文档 §7 第 2 条一直提这个问题（判据有测试、范围没有），这次在 Pilot 里找到了三种可用的形态，
+本文 §7 第 2 条一直提这个问题（判据有测试、范围没有），这次在 Pilot 里找到了三种可用的形态，
 分别对应「范围会怎么缩」的三种成因：改代码改缩了（基线 digest diff）、运行时环境变了（四阶段漏斗）、
 I/O 失败被静默吞掉（显式的 scan-completeness 信号）。
 
 **已立为 [OPEN-ISSUES G10](../OPEN-ISSUES.md)，细节与行号在那里，此处不重复。**
-需要在这里记一句的是：Pilot 自己**也没有**钉住「必须覆盖子 agent」——它装了 `SubagentStop`
-是产品选择，不是回归保护。**三方在这条上全都裸奔**，只是我们和 teamai 已经因此付过代价。
+需要在这里记一句的是：Pilot 在提取层**有**钉子——`tests/unit/hooks/claude-code/hook-processor.test.mjs`
+的「claude-code 一级子 Agent 上报」一组用例（`:725` 起）断言导出记录里必须有 `gen_ai.agent.scope = subagent`，
+删掉子 agent 展开就红；它缺的是部署层，没有测试断言 `agents.d/claude-code.json` 必须注册 `SubagentStop`。
+**三方里只有它守住了一半**，我们和 teamai 两层都没有，而且都已经因此付过代价。
 
 ### 6.2c 两个写法 —— 建议抄进 spec 与审计台账
 
@@ -548,13 +576,15 @@ I/O 失败被静默吞掉（显式的 scan-completeness 信号）。
 > **Requirement: Performance validation uses the actual pipeline**
 > The implementation SHALL reuse precomputed event sizes and **SHALL NOT add file rereads, event
 > serialization, CPU profiling or heap snapshots for diagnostics.** Before delivery it SHALL compare
-> baseline and modified processing on the same synthetic input through the real converter…
+> baseline and modified processing on the same synthetic input through InputManager, MultiFlusher and
+> the real converter with network exports substituted.
 
 「验证方式」不是留给实现者临场发挥的，而是和功能需求同级写死；`SHALL NOT` 那半句约束的是
-**测量不得改变被测对象**——`input-runtime-metrics` 那句「不为统计再次读取、不保存正文」正是从这里来的。
+**测量不得改变被测对象**——和 `docs/zh-CN/input-runtime-metrics.md` 那句「不为统计再次读取、不保存正文」
+是同一个口径（那篇 09-02 先合并，这份 spec 09-04，谁出自谁看不出来）。
 本项目 spec §5 稳定面目前只约束数据格式，不约束「这条断言该怎么验」。
 
-另外它 10 个 Scenario **几乎全是负例与边界**：「测量不可用」「转换完成前 buffer 被移除」
+另外它 11 个 Scenario **几乎全是负例与边界**：「测量不可用」「转换完成前 buffer 被移除」
 「维度上限打满」「pending 范围被解读」「诊断上报失败」「两次采样之间结束的短 turn 没有 ID」。
 等于把 K 系列（已知缺陷）**提前写在实现之前**，而不是等出事了再记进 OPEN-ISSUES。
 
@@ -585,9 +615,9 @@ I/O 失败被静默吞掉（显式的 scan-completeness 信号）。
   `CLAUDE_CODE_SESSION_ID` 逐字等于 transcript 文件名）是 Claude Code 特有的实测结论，
   摊到 11 个 harness 上等于重做地基。Pilot 用 21 家 × 6 种 deployMode 证明了这条路要付的价钱：
   `fix:feat = 181:82`，三分之一的代码在 `inputs/` 适配各家格式。
-- **进程内注入**（Pilot）：`BUN_OPTIONS --preload` 注入 agent 进程、往 Bash 命令前拼
-  `export TRACEPARENT=...`、往 `~/.zshrc` / `~/.bashrc` 追加 marker 块并由 watchdog 自动修复
-  （[采集清单](loongsuite-pilot-collection.md) §1.4 / §1.5）。这是**进入被观测者的执行路径**，
+- **进程内注入**（Pilot）：往 `~/.zshrc` / `~/.bashrc` 写一个覆盖 `claude` 命令的 shell 函数，借它用
+  `BUN_OPTIONS --preload` 注入 agent 进程，watchdog 自动修复；外加可选的往 Bash 命令前拼 `export TRACEPARENT=...`
+  （默认关）（[采集清单](loongsuite-pilot-collection.md) §1.4 / §1.5）。这是**进入被观测者的执行路径**，
   拿到的东西确实更多（system prompt 就只有这条路能拿），但本项目的定位是留痕，
   不该为此承担改写用户命令的风险。teamai 那条「只用 harness 生命周期 hook」的边界更适合我们。
 - **存全文副本**（Pilot）：见 §5.3。trace 随仓走，体积是硬约束，存副本这条路对我们直接关闭。
@@ -605,8 +635,8 @@ vibetrail 是「AI 写的代码怎么查回去」。**
 同时也证明**对方并不因此有 bug**——这些误差在它自己的阈值判断里基本被吸收了，
 实测没有一个有分歧的会话在分数口径上被它彻底漏掉（`toolCount` 硬门槛未建模，见 §3.4）。
 
-与 Pilot 则**根本不在判据层撞车**：它采集范围三方最强（扫子 agent、拿 system prompt、全文零截断），
-却**一个分歧信号都不判**。它把原料完整搬走，判断留给下游平台。
+与 Pilot 则**根本不在判据层撞车**：它采集范围三方最宽（扫子 agent、拿 system prompt、取到的字段零截断），
+却**不做分歧判定**，只标 turn 的终止状态。它把原料大体完整地搬走（轮末的中断记录会丢），判断留给下游平台。
 
 真正的教训不是「谁更准」，而是三条：
 
@@ -616,13 +646,15 @@ vibetrail 是「AI 写的代码怎么查回去」。**
    差距的一多半却来自「只扫了一个文件」这种与判据无关的地方。
    本项目按 worktree 聚合扫全量是对的，但这条**没有回归钉子守着**——
    哪天采集范围缩了，判据测试全绿，数字静默减半。
-   三方在这一条上**全都没有守卫**：Pilot 装了 `SubagentStop` 也只是恰好装了，
-   同样没有测试钉住「必须覆盖子 agent」。
+   三方里只有 Pilot 守住了一半：它有测试钉住提取层的子 agent 覆盖，
+   但 Claude Code 这边没有测试钉住部署层必须注册 `SubagentStop`；我们和 teamai 两层都没有。
+   而且它的钉子钉的是「子 agent 展开了」，没钉「每类记录走到了输出」——中断记录在主会话里就被静默丢了
+   （[采集清单](loongsuite-pilot-collection.md) §1.2），文件级的钉子抓不到这种缩水。
    **已立为 [OPEN-ISSUES G10](../OPEN-ISSUES.md)**，可用的三种钉子形态见 §6.2b。
 3. **采集能力越强，治理缺口的代价越大。** Pilot 是三方里唯一采到全文的，
    于是它的每一个治理疏漏都变成实打实的暴露面：出站兜底是死代码（§6.1 教训 1）、
    内容策略两份清单分叉且都漏了 `error.message`（教训 2）、
-   含完整正文的日志永不删除（[采集清单](loongsuite-pilot-collection.md) §2.4）、
+   Claude Code 等写在日志根目录的、含完整正文的日志永不删除（[采集清单](loongsuite-pilot-collection.md) §2.4）、
    还有一条未声明的主机指纹回传（§4 末尾）。
    **teamai 犯同类错误的代价小得多，因为它手里只有 200 字截断。**
    本项目的 trace 随仓走、会推到远端，暴露面更接近 Pilot 而不是 teamai——
@@ -637,14 +669,16 @@ vibetrail 是「AI 写的代码怎么查回去」。**
 推翻 1 处「其余目录一律早退」（第 10 条）。**第五轮（2026-09-10）扩为三方，加入 LoongSuite Pilot，
 推翻 1 处隐含推广、收紧 1 处措辞（第 11 条）；同轮第二部分通读对方 `docs/` 剩余篇目与
 `openspec/` / `solutions/`，产出 [OPEN-ISSUES G10](../OPEN-ISSUES.md) 与 §6.1b / §6.2b / §6.2c，
-另有 1 处自我推翻（第 12 条）。**
+另有 1 处自我推翻（第 12 条）。第六轮（同日）对 Pilot 三份文档做独立逐行复核，推翻或收窄 8 处、
+补口径 9 处、改数字与行号 20 余处（第 13 条）；第七轮（同日）对第六轮的修正再做三路独立复核，
+推翻 3 处、收紧十来处（第 14 条）。**
 均已改在正文里，此处只留台账——这份文档自己也该有留痕。
 
 **第四轮的第二部分没跑完**：改完前九条之后照惯例（见本项目 memory「修完再全新审计」）另起了一个
 独立只读 agent，对三份文档做逐 hunk 的全新复核，但会话预算耗尽，用户在它读完第一批 diff、
 尚未产出结论前中止了它。**这份文档目前只经过「自己动手复核 + 抽查」，没有第 1-3 轮那种完整的
 独立第二意见。** 后续如果再碰这几份文档，应当先补跑一次完整的独立复核，而不是默认第 9/10 条
-已经是终态。
+已经是终态。（2026-09-10 第六轮给 Pilot 相关部分补了独立复核，见第 13 条；teamai 部分仍然欠着。）
 
 | # | 初稿的错误断言 | 核实结果 | 落在 |
 |---|---|---|---|
@@ -658,14 +692,14 @@ vibetrail 是「AI 写的代码怎么查回去」。**
 | 8 | 「`isSidechain` 在子 agent 文件里根本不出现，靠目录区分」 | **错，方向反了**。728 个文件 119,969 条记录全是 `true` 并带 `agentId`；主会话文件全是 `false`。同轮限定了 4 条：提示还有 `toolCount >= 15` 硬门槛（§3.4 验算未建模）；git commit 降权常量为 0；脱敏在出口而非全链路（本地 events.jsonl 明文）；「业务仓零残留」只是默认模式，self 模式知识随 main 走 | 两份 §3.2 / §3.4 / §4 / §5.1 / §6.1 |
 | 9 | 第三轮（对方 HEAD `6ae0619`）：①「硬门槛 / 降权为 0 / 本地明文，官方文档都有明写」；②「直接引用判据常量的 4 个测试」；③「零残留只是默认模式」；④「README 矩阵 10 个 harness」；⑤「`projects set/members` 尚未落地」 | ① **错**：只有 self 模式在官方文档里，另三条只在代码注释，指南 `:1160` 对明文这条还写的是反话；② **口径错**：0 个测试 import 判据常量，4 个是把字面串硬编码进 fixture；③ **过期**：P2 瘦身后 self 模式机器数据也入分区；④ **过期**：ZCode 加入后 11 个；⑤ **过期**：P3 已落地。另补 5 条口径：`--project` 不进采集且分发层 fail-open（没 init 的目录照采，OPEN-ISSUES G8 的「其余目录早退」同日改正）；HTTP 同步四个事件都跑；contribute 提示三级开关；`git.ts` 那句注释是 `--no-verify` 作用域而非 hook 政策；recall 命中加的是 `recalled_count` 不是 upvote | 三份 + OPEN-ISSUES G8 |
 | 10 | OPEN-ISSUES G8 转述「hook-dispatch 按 cwd 门控……其余目录一律早退」 | **错**。`hook-dispatch-cli.ts:185` 取不到 config（没 init 过 / 解析失败）时 `filterHandlersForConfig()` 按注释「fail-open by design」原样放行全部 19 条 handler；`dashboardReportHandler` 本身也不查 config。teamai 有的是**上报限定**（`filterEventsByScope` 按 cwd 决定哪个团队仓收哪些会话），不是「采集限定在指定项目」这个能力 | OPEN-ISSUES G8 / 三份 |
-
 | 11 | 第五轮（2026-09-10，加入 LoongSuite Pilot HEAD `d4ab8b6d`）：① §3.2 的行文把「看不到子 agent」写成了三方通例；② §5.1「commit ↔ session 关联无先例」 | ① **错**：Pilot 装了 `SubagentStop` 并直接读 `subagents/agent-*.jsonl`，那节结论只对 teamai 成立，已加限定表；② **措辞过宽**：Pilot 的 `GitHookEvent`（`src/types/events.ts:190-201`）定义了 `post-commit`/`pre-push` 事件带 `commitHash` 与 `changedFiles`，**零引用未实现**——「没人做过」应改为「有人写下类型但没做」；且 Qoder 云端 API 链路有 `committed_ai_lines_edit` **行级 AI 归属**，所以准确的说法是「行级归属有先例，commit ↔ 单次会话仍没有」 | §3.2 / §5.1 / §2 表 |
+| 12 | 第五轮第二部分：「Pilot 的 `resource-context.mjs` 有两份副本、注释要求保持一致，**又漂移了**」 | **错，是我想多了。** 注释要求对齐的三项（`DEFAULT_RESOURCE_ENV_FIELD_MAP`、`SENSITIVE_FIELD_NAME_RE`、`MAX_RESOURCE_FIELD_VALUE_LENGTH`）逐字相同；两份的差异是 hook 版多出 85 行按次调用属性功能，plugin 版本来就不需要。**真正分叉的只有内容策略那两份 `MESSAGE_CONTENT_FIELDS`**（14 vs 17 项），已记在 [采集清单 §5.3](loongsuite-pilot-collection.md) | 未写入正文 |
+| 13 | 第六轮（2026-09-10，同一快照 `d4ab8b6d`）：三个独立 agent 逐行复核三份 Pilot 文档，我逐条回查源码后才改正文（⑧ 来自之后对修正的复核）。推翻或收窄 8 处：①「三方都没有测试钉住子 agent 覆盖」；②「往 Bash 命令前拼 `TRACEPARENT`」写成默认行为；③ watchdog「按内容判健康、每天最多修 3 次」；④「`event.id` 是确定性 sha256，没有指回原文的锚点」；⑤「`cancelled` 只在 Grok / Qoder」「`STOP_REASON_MAP` 6 种映射」；⑥ 把 `committed_ai_lines_edit` 放在逐 commit 记录上、称「行级归属有先例」，并说 CAPABILITIES 写过「commit ↔ session 关联无先例」；⑦「含完整正文的 hook 日志永不删除」写成通例；⑧ 把 `replaceHookCommands` 删掉的 `otel-claude-hook` 等条目当成「别家」，据此在 OPEN-ISSUES G7 ⑥ 推出「settings 是多方争抢的位置」 | ① **错**：`hook-processor.test.mjs` 有一组用例断言导出记录必须含子 agent，Pilot 守住了提取层，缺的只是部署层；② **漏了默认值**：`upstreamLink.enabled` 与 `propagateToTools` 默认都 `false`，两个都开才注入；③ **张冠李戴**：每天最多 3 次管的是 rc 块等「拦截类」目标，按内容判只用于 rc 块；settings 里的 hook 条目按 marker 子串判、只有 10 分钟冷却、不设每日上限；④ **错**：Claude Code 链路是 `randomUUID()`，sha256 只在 Codex / Qoder 等轮询类输入；且有回复 / 工具调用级的 id 能指回原文；⑤ **错**：Codex、WorkBuddy、Wukong、DSH 和几个插件都有，来源和用途都不一，有照搬宿主的、有 Pilot 收尾时补的、有只标工具结果的；9 个 key 归 5 个值；⑥ **混了两种记录，也转述错了本项目**：逐 commit 那条是分来源的增删行数，`committed_*_lines_edit` 在组织时间窗聚合里，都是行数不是「哪几行」，且整条链路默认关；CAPABILITIES 从没写过那句，它说的是审计留痕才无先例，git-ai 本来就是 commit ↔ session 与逐行归属的先例（DESIGN §2.5）；⑦ **只对写在日志根目录的成立**：Qoder 系、Qwen Work CN、Cursor 写在 `history/`，受 `hookHistoryDays` 管；Hermes 插件自己删 7 天前的；反过来又查出 Qoder CLI / Qoder Work 系落在 `logs/` 根下的拦截文件不归保留服务管，只有 10 MB 轮转；⑧ **错**：那是 Pilot 自家上一代 Claude 插件的残留（`plugin-migration.ts:2`「清理老 Claude/Codex plugin 残留」，卸载脚本把它算作 `isOurs`），是迁移不是抢占，「多方争抢」在 Pilot 这里没有证据。另补 9 条口径：启动即回传一次；rc 块只写 `$SHELL` 那一个，遇到用户自己的 `claude` alias 或函数就跳过、只在安装时打一行警告；三类拦截文件不受内容开关约束；`SubagentStop` 也写盘；`acp-correlate/` 有条件清理；Claude Code 的 hook 侧 JSONL 没有 `git.*` / `workspace.*`、`host.ip` 无人写入；PipelineManager 旁路默认关；本地 JSONL 就是它文档化的「看」；AgentLoop 与 openspec 出处两句要标来源。数字与行号 20 余处（快照前 30 天 commit、测试行数、管线步数、Skill 行数、接入所需项、卸载清单、Scenario 数、「434 个 TS 文件」的口径等） | 三份 + OPEN-ISSUES K1 / K6 / G6 / G7 / G9 / G10 |
+| 14 | 第七轮（2026-09-10，对第六轮的修正再做三路独立复核）：①「它把 `[Request interrupted by user]` 当普通用户消息全文存下来：内容在，标记不在」「Pilot 的数据理论上能反推出本项目的全部判据（全文都在）」；② 分析文档「卸载清单与 `agents.d` 没有机制保证一致」；③ 采集清单 §6「两边都没有测试守住采集范围」 | ① **错，而且是反的**：解析器按 promptId 分组，中断记录排在被打断那一轮最后一次模型回复之后，只有同一轮后面还有模型调用才会带出去（`transcript-parser.mjs:365-460`）。用它的解析器离线跑本机 27 个主会话，265 条中断记录只进了 5 条，内容和标记都不在；拒绝工具调用的 45 条进了 41 条。interrupt 类判据从它的数据里基本反推不出来；② **错**：`installer-uninstall-cleanup.test.mjs:159-179` 从 `agents.d` 推出路径逐个断言；③ **错**：Pilot 有提取层测试，Codex 还有部署层测试钉住 `SubagentStop`。另把第六轮修正里写过头的十来处收紧：`cancelled` 的来源与用途、`host.name` 与 SLS 每批带的本机 IP、hook 侧不带 `git.*` 只对 Claude Code 成立、Qoder API 实际有十四种记录、Bash 改写还有资源属性一路、`replaceHookCommands` 是精确匹配而真正删旧条目的是迁移脚本、Dashboard 是用量汇总 | 三份 + OPEN-ISSUES K6 / G7 / G9 / G10 |
 
 第 7 条连带出了本次审计**最有价值的一条**：它的测试不是缺失，是
 **靠 fixture 选择恒绿**——全套件 `Permission to use` 出现 0 次。
 这比「它没写测试」有意思得多，也更值得我们警惕。
-
-| 12 | 第五轮第二部分：「Pilot 的 `resource-context.mjs` 有两份副本、注释要求保持一致，**又漂移了**」 | **错，是我想多了。** 注释要求对齐的三项（`DEFAULT_RESOURCE_ENV_FIELD_MAP`、`SENSITIVE_FIELD_NAME_RE`、`MAX_RESOURCE_FIELD_VALUE_LENGTH`）逐字相同；两份的差异是 hook 版多出 85 行按次调用属性功能，plugin 版本来就不需要。**真正分叉的只有内容策略那两份 `MESSAGE_CONTENT_FIELDS`**（14 vs 17 项），已记在 [采集清单 §5.3](loongsuite-pilot-collection.md) | 未写入正文 |
 
 第 11 条的教训和第 4 条同款，但方向不同：第 4 条是**把已知的事当新发现**，
 第 11 条是**把对一个样本的观察写成了通例**。§3.2 原文并没有明说「三方都如此」，
@@ -677,7 +711,25 @@ vibetrail 是「AI 写的代码怎么查回去」。**
 再看到第三处同形状的注释，「同一个仓里又犯一次」这个说法太顺手了。核实之后是相反的结论。
 **手上的叙事越顺，越要在写下之前多跑一条命令**——这次拦住了，是因为写进文档前先 diff 了一遍。
 
-**LoongSuite Pilot 这部分的证据等级低于 teamai 部分**：全部读码所得，本机未装
+第 13 条的八处分三类。**没查就说没有**（①）：写「没有测试钉住子 agent」时没去翻对方的 `tests/`，和第 1、8 条同款。
+**把一条链路写成全体**（④⑤⑦）：和第 11 条同款，只是样本从「三方工具」换成了「Pilot 的 21 条链路」——
+Claude Code 的日志在根目录，就默认都在根目录；Codex 的 id 是 sha256，就默认都是。
+**读到机制就写结论，没查开关、作用范围和出处**（②③⑥⑧）：采集清单初稿的局限说明里原本写着「关键断言（TRACEPARENT 注入……）由我逐条回查原文」，
+查的是注入代码本身，恰恰漏了决定它会不会发生的那两个开关；⑥ 则连本项目自己的 CAPABILITIES 都没回头看一眼；
+⑧ 看到删条目就当成抢占别家，没去翻那两个字符串是谁的——是 Pilot 自己的上一代插件。
+复核本身也差点犯一次：一度认定「卸载清单漏了 Grok」，写进正文前再看一眼，是安装器另有一段单独清理 Grok
+（`installer-opensource.sh:2347-2403`）——与第 12 条同一个教训。
+这一轮的修正写完后又过了一遍独立复核，抓出十来处**修正本身新写错或写过头的**：Hermes 其实自己删 7 天前的日志、
+Qoder 的拦截文件有 10 MB 轮转、关 agent 要改 `config.json` 而不是 `agent-control.json`、`stats_overview` 来自另一个接口、
+MiMo Code / WorkBuddy 的 `cancelled` 有一部分是 Pilot 自己收尾时补的，以及几处行号前缀。都在进正文前改掉了，没有单列台账行；
+⑧ 也是这次复核翻出来的。**修正同样要复核**，否则就是拿新错换旧错。
+
+第 14 条的 ① 是整个 Pilot 部分分量最重的一次推翻，也是第一次靠**跑代码**而不是读代码推翻的。前面每一轮都在核
+`:976-978`「prompt 全文」、`:1071`「input delta 全文」这些取值点，逐字段确认了「零截断」，却没人问哪些记录根本走不到
+这些取值点。读码能证明一个字段取了什么，证明不了分组逻辑漏掉了哪些记录——**逐字段核对不等于逐记录核对**。
+这条对我们自己同样适用：本项目的提取器也是按规则挑记录，G10 的钉子因此不能只钉「扫了哪些文件」。
+
+**LoongSuite Pilot 这部分的证据等级低于 teamai 部分**：除第 14 条那次用它的解析器离线跑本机 transcript 之外，全部读码所得，本机未装
 （`~/.loongsuite-pilot` 不存在），**没有任何实机数据**。§3 那种「同一份语料跑两套判据」的
 正面对撞对它做不了，也不需要做——它根本没有判据。所有关于它的运行时行为（发送周期、
 清理时机、watchdog 修复）都是从代码推的。详见
