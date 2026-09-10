@@ -1,7 +1,8 @@
 # teamai-cli 采集清单
 
 > 三方项目分析，**不是**本项目的一部分。配套文档：[teamai-cli.md](teamai-cli.md)（项目分析）、
-> [teamai-cli-vs-vibetrail.md](teamai-cli-vs-vibetrail.md)（与本项目对比）。
+> [teamai-cli-vs-vibetrail.md](teamai-cli-vs-vibetrail.md)（三方对比：teamai / LoongSuite Pilot / vibetrail）、
+> [loongsuite-pilot-collection.md](loongsuite-pilot-collection.md)（另一家的采集清单，可对照阅读）。
 >
 > 快照 HEAD `6ae0619`（2026-09-09），仓在 `/Users/gupengfei/program/code/teamai-cli`，行号均指向该快照，
 > **引用请带日期**。第一版基于同日的 `224c0c4`；两者之间 10 个 commit（ZCode、multi-project P3、self 模式瘦身），

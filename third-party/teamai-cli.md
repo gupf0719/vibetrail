@@ -1,8 +1,10 @@
 # teamai-cli 项目分析
 
 > 三方项目分析，**不是**本项目的一部分。配套文档：
-> [teamai-cli-vs-vibetrail.md](teamai-cli-vs-vibetrail.md)（与本项目对比）、
-> [teamai-cli-collection.md](teamai-cli-collection.md)（采集清单：采什么、落哪、什么出本机）。
+> [teamai-cli-collection.md](teamai-cli-collection.md)（本项目的采集清单：采什么、落哪、什么出本机）、
+> [teamai-cli-vs-vibetrail.md](teamai-cli-vs-vibetrail.md)（三方对比：teamai / LoongSuite Pilot / vibetrail）、
+> [loongsuite-pilot.md](loongsuite-pilot.md) 与 [loongsuite-pilot-collection.md](loongsuite-pilot-collection.md)
+> （阿里云 LoongSuite Pilot，另一家三方实现）。
 >
 > 扫描对象：`/Users/gupengfei/program/code/teamai-cli`（原在 `program/go/src/`，已迁），HEAD `6ae0619`（2026-09-09）。
 > 本文所有数字均来自该快照，**引用请带这个日期**——它是个每天都在动的仓：第一版基于同日的 `224c0c4`，
