@@ -28,9 +28,9 @@
 
 ### 3. Pilot 全采能补多少
 
-按源码核对：本机 `~/program/code/loongsuite-pilot`，HEAD `4e59a5bc`（2026-09-10）。它比
+按源码核对：MacBook 上的 `~/program/code/loongsuite-pilot`，HEAD `4e59a5bc`（2026-09-10；机器名见 §4 开头）。它比
 [三方文档](third-party/loongsuite-pilot-collection.md)的快照 `d4ab8b6d` 新 7 个 commit，但下列文件在两者之间没有改动，
-行号两边一致。无前缀的行号指 `assets/hooks/claude-code-hook-processor.mjs`。以下说的都是 **Claude Code 链路**。
+行号两边一致（第六轮在 C02FM 的 `~/program/go/src/loongsuite-pilot` @ `d4ab8b6d` 上逐行复核，14 处全部对上）。无前缀的行号指 `assets/hooks/claude-code-hook-processor.mjs`。以下说的都是 **Claude Code 链路**。
 
 | 能给 | 出处 |
 |---|---|
@@ -49,13 +49,63 @@
 命中的是精确归属；Bash 改的只能列出命令里出现过这个文件名的会话作候选（spec §4.5 第二档，原话是「哪些 session
 碰过这个文件」）；人改的无从归属。
 
-判责要用的对话证据，Pilot 在人类这一侧也会漏（[采集清单 §1.2b](third-party/loongsuite-pilot-collection.md)）：
+判责要用的对话证据，Pilot 在人类这一侧也会漏（[采集清单 §1.2b](third-party/loongsuite-pilot-collection.md)，语料在 C02FM 上）：
 主会话的中断记录 265 条（含 111 MB 那份）只进了 5 条；50 MB 以下的 37 个主会话里，每轮第一条人类输入
 1,599 条丢了 154 条，都是没等到真实回复的整轮。
 
-### 4. 方案：工具调用前后快照工作树，在影子历史上跑 `git blame`
+### 4. 方案
 
-spec §4.5 写过这条路：「要做到任何改动都能精确归属，必须在每次工具调用前后快照工作树自己算 diff」。
+**第六轮审计之后改（2026-09-11，用户：「按审计结果改 TODO 吧」）：主方案走「worktree + 规矩 + 接手时拍一次快照」（4.1），
+逐次工具调用前后拍快照（原来的主方案，4.2）降为可选加强。**理由三条：
+
+1. **要的是会话。** §1 的原话是「回溯到当时那个 session」。一个会话一个 worktree、改动由它自己提交时，trailer 就是
+   会话级的归属；要到轮、到调用，只翻这一个会话的 transcript：Edit / Write 直接对上，Bash 只在这一个会话的命令里找，
+   候选很少。
+2. **原先说 worktree 管不到串行，依据看错了。** 旧 §10 拿「main 上 09-09 一天有 5 个会话先后在同一条分支上提交」论证
+   同一分支多会话串行是常态。main 的 reflog 显示，那天 15 次直接提交全出自一个会话，另外 4 个会话各在自己的 worktree
+   分支里提交，再快进合进 main 6 次——恰好说明 worktree 隔离起了作用（§11 第六轮错 1）。
+3. **4.2 还有 7 处错没修**：影子历史会被别的 worktree 的 gc 回收，快照失败时会贴错，打断与权限被拒都没有结束事件，
+   删行的起点、merge、跨仓都会归错；代价也只在干净工作树上量过（§11 第六轮）。
+
+下文「MacBook」指写前五轮的那台机器（提交作者 `@gupengfeideMacBook-Pro.local`），「C02FM」指第六轮审计所在的这台
+（hostname `C02FM3DTQ05N`）。两台的语料不同，数字不能混用。
+
+#### 4.1 主方案：worktree + 规矩 + 接手检测
+
+**规矩**，要写进团队约定：
+
+1. **一件事一个 worktree。** desktop 给每个新会话自动开一个；CLI 要显式 `claude -w <名字>`。官方文档把 worktree
+   列为「并行跑多个会话」的做法，不是默认。
+2. **同一件事接着干，用 resume**，沿用原会话的 session id。fork 也可以：fork 带着父会话的全部历史（C02FM 上 agentDock
+   的 `eb44dfd4` 被 fork 两次，两个 fork 各带着它的 1405 条记录），trailer 记的是 fork，翻 fork 的 transcript 照样找得到
+   父会话写的那几次 Edit；只是父子别同时在一个 worktree 里改。
+3. **会话的改动由它自己提交。**
+4. **不把会话挪进别的 worktree 接着干**；要挪，先把那边的改动提交掉。
+5. **不在已有 worktree 里切分支**——没提交的改动会跟着带到新分支上。
+
+**接手检测**，代替逐次快照：SessionStart 与 CwdChanged（hooks 文档：给 `old_cwd` / `new_cwd`）时，如果所在 worktree
+有未提交的改动、而且最后一个在这里活动的不是本会话（resume 回到自己的会话不算接手），就按 4.2① 的做法拍一次快照，
+记下「接手时已在工作树里」，并提醒一句。提交时把「父提交 → 接手快照 → 本 commit」接成三步的影子历史跑 blame：
+接手快照里已有、父提交里没有的行标「接手前已有」，之后才变的行归 trailer 上的会话。「接手前已有」的行再按时间回到
+上一个在这个 worktree 里干活的会话，用 Edit / Write 内容匹配定位。每个会话每进一个 worktree 最多拍一次，代价可以忽略。
+影子提交挂在共享命名空间 `refs/vibetrail/…` 下，不用 `refs/worktree/`（第六轮错 4）。
+
+**前置**：agentDock 先装 trailer（`vibetrail-install` 装 `prepare-commit-msg`）。C02FM 上 agentDock 当前分支 1608 个
+commit，没有一个带 `Claude-Session`（2026-09-11 查）。
+
+**实际用法离规矩有多远**（C02FM 上的 transcript，按每条消息记的 cwd 与分支算，2026-09-11）：vibetrail 的 10 个会话，
+启动目录、实际 cwd、分支三者全对得上。agentDock 的 26 个会话（全是 desktop）里，9 个直接跑在主 checkout；10 个中途
+离开了启动目录，多数进了别的会话开的 worktree；11 个干活的 worktree 目录里签出的分支与目录名对不上，也就是在已有
+worktree 里切过或新建过分支；`core-code-review-checklist-01abed` 这一个目录前后有 5 个会话、4 个分支在里面干过活。
+所以规矩要写下来，接手检测不能省。
+
+#### 4.2 可选加强：逐次工具调用前后快照，在影子历史上跑 `git blame`
+
+原来的主方案。现在只在要「到调用」、或要把会话之内的人手改分出来时才做。**第六轮实测出的 7 处错都还没修**，做之前
+先修：影子历史的 ref、快照失败、打断、权限被拒、删行起点、merge、跨仓（§11 第六轮错 4–10）。下面的文字与 demo
+保持一致，只改了事实性的说法，并在出错的地方标了第六轮的编号。
+
+spec §4.5 写过这条路：「要做到『任何改动都能精确归属』，必须在每次工具调用前后快照工作树自己算 diff」。
 思路与 git-ai 的 checkpoint 相同（[DESIGN §2.2](DESIGN.md)），当时按 git-ai 的代价否掉了
 （[DESIGN §2.5](DESIGN.md)：833MB 常驻库、完整 prompt 排队待上传、跑一次二进制就起守护进程）。
 其中上传 prompt 与常驻守护进程都不是快照必需的；占盘快照也有，要实测（§7）。否决的另一半理由是价值，见 §8。
@@ -79,11 +129,15 @@ rm -rf "$d"
   就在副本里去掉未合并的路径（它们本来就没有暂存版）再写，别的文件照常记（demo 边界 15）。
 - 不需要常驻进程，不存 prompt。PostToolUse 的 stdin 实测直接给 `session_id` 与 `tool_use_id`
   （[DESIGN §2.1](DESIGN.md)）。PreToolUse 的字段集与子 agent 的区分，官方 hooks 文档（2026-09-11 查）有答案、
-  **一手实测还没做**：PreToolUse 与 PostToolUse 字段集相同，都给 `tool_use_id` 与 `prompt_id`；子 agent 里的工具调用
-  触发同一套 hook，stdin 多 `agent_id` / `agent_type`；PreToolUse 在权限确认**之前**触发。嵌套起一个 `claude -p` 去实测，
-  desktop 附带的二进制脱离宿主没有登录态，跑不起来；一手证据按 [experiments/hook-probe.sh](experiments/hook-probe.sh)
+  **一手实测还没做**：两个事件都给 `tool_use_id` 与 `prompt_id`（后者是所有事件共有的字段，指「当前这句人话」）；
+  字段集并不相同，PostToolUse 另有 `tool_response`、`duration_ms`，PostToolUseFailure 给 `error`、`is_interrupt`、
+  `duration_ms`，没有 `tool_response`（第六轮不准 5）；子 agent 里的工具调用触发同一套 hook，只有 `agent_id` 能说明
+  是子 agent（主线程用 `--agent` 启动时也带 `agent_type`）；PreToolUse 在权限确认**之前**触发。嵌套起一个 `claude -p`
+  去实测，desktop 附带的二进制脱离宿主没有登录态，跑不起来；一手证据按 [experiments/hook-probe.sh](experiments/hook-probe.sh)
   的路子注入 PreToolUse 探针即可。
-- hook 里跑的 git 命令都带 `-c gc.auto=0`，别让快照顺手触发一次 gc 把工具调用卡住。
+- 快照用到的 `add` / `write-tree` / `commit-tree` / `update-ref` 本身不会触发 gc（第六轮用 `GIT_TRACE` 实测），原先
+  「都带 `-c gc.auto=0`，别让快照顺手触发 gc」的理由不成立。反过来，快照堆出的松散对象会让用户下一次 commit
+  触发 `gc --auto`，影子对象要定期打包或截断（第六轮不准 7）。
 
 **② 每一段差分归给当时进行中的工具调用。** 上一个快照到这个快照之间的差分：
 
@@ -99,15 +153,29 @@ rm -rf "$d"
   （demo 边界 3）。前提是 PreToolUse 也给 tool_use_id（待实测）；不给的话只能按线程配对，同线程重叠就分不开。
 - 配不上 pre 的 post（pre 那次快照丢了，比如 hook 失败）：这一步标「起点不明」，不能落成 gap。例外：第一个快照
   就是这样的 post 时，没有更早的快照可比，这次调用的改动并进根里，标成「快照开始前已在工作树里」。
+  **第六轮错 5**：demo 里快照失败时登记、注销照做——一个读不了的未跟踪文件就能让 `add -A` 失败。pre 那次快照丢了，
+  post 找得到登记，不会标起点不明，之前的人手改记给了这次调用；post 那次丢了，调用的改动在下一次快照里落成 gap。
+  要在快照失败时留标记，下一次成功的快照把受影响的调用带上、标起点或终点不明；`add -A --ignore-errors` 能让一个
+  读不了的文件不拖垮整次快照。
 - 被打断的调用等不到 post，也未必等得到同线程的下一个 pre（子 agent、会话就此结束），所以在**一轮结束时**关：
-  下一次 UserPromptSubmit、Stop、SubagentStop、SessionEnd 到来时先拍一次，把到此为止的改动记给它、标「未完成」，
-  再注销。被打断时 Stop 是否触发待实测。
-- **失败的调用没有 PostToolUse。** 文档写 PostToolUse 只在工具成功后触发，失败另有 `PostToolUseFailure`（字段集相同）。
-  Bash 非零退出很常见（grep 无命中、测试失败都是），只挂 PostToolUse 的话这些调用会一直「进行中」到一轮结束，
-  同一轮里后面所有调用的改动都被标成与它并列。两个事件都要挂；Bash 非零退出算不算这里的「失败」待实测。
+  下一次 UserPromptSubmit、Stop、StopFailure（API 出错结束的轮只发它）、SubagentStop、SessionEnd 到来时先拍一次，
+  把到此为止的改动记给它、标「未完成」，再注销。只关本线程的：主线程的事件只关没有 `agent_id` 的调用，SubagentStop
+  只关那个子 agent 的——后台子 agent 会活过主线程的 Stop（第六轮不准 5）。**用户打断时 Stop 不触发**（hooks 文档：
+  用户中断造成的停止不跑 Stop；C02FM 上的 Claude Code 2.1.260 里中断直接返回，PostToolUseFailure 也不发），被打断的调用
+  要挂到下一次 UserPromptSubmit，人打断之后去手改的那段全记给它（第六轮错 6）。
+- **失败的调用没有 PostToolUse。** 文档写 PostToolUse 只在工具成功后触发，失败另有 `PostToolUseFailure`。
+  Bash 非零退出走它（`error` 首行是 `Exit code N`），测试失败很常见；但 grep、rg、find、diff、test 与 `git diff` 退出码
+  为 1 不算失败。只挂 PostToolUse 的话失败的调用会一直「进行中」到一轮结束，同一轮里后面所有调用的改动都被标成
+  与它并列，所以两个事件都要挂。**权限被拒两者都不发**：手动拒绝、命中 deny 规则、被别的 hook 拦下，都只有
+  PreToolUse；`PermissionDenied` 只在 auto 模式发。要加挂它与 PostToolBatch——后者在下一次调用模型前发，列出本批
+  每个 tool_use_id 及结果，含被拒的（第六轮错 7）。
 - 每次快照顺手记下 HEAD：agent 在工具调用里 checkout / rebase / pull 时工作树整片变化，看日志时能把这类步骤
   与真正的改动分开（demo 没覆盖，见 §5）。
 - 登记表与快照日志都放在 `git rev-parse --git-path` 解析出的本 worktree 私有目录里，每个 worktree 一份。
+  **第六轮错 10**：hook 在会话当前 cwd 所在的 worktree 拍快照。Edit / Write 用绝对路径改别的 worktree 或别的仓
+  （OPEN-ISSUES K2，本项目自己就这样），那边前后都没有快照，改动记给那边碰巧在跑的别的会话、或者成 gap；执行 cd 或
+  EnterWorktree 的那次调用，pre 与 post 会落进两个 worktree 的登记表。要按 `file_path` 找所在 worktree 拍快照，挂
+  CwdChanged，并加一份会话级索引记下每次 pre 落在哪个 worktree。
 
 **③ 影子历史每个 worktree 一条、跨提交连续，post-commit 时只报本 commit 的行。**
 
@@ -116,6 +184,10 @@ rm -rf "$d"
   别的 worktree 的快照或调用会串进来贴错标签（demo 边界 6 的标题写了两种串法各自贴成什么，已实测）。
   别的 worktree 要读，用 `main-worktree/refs/worktree/…` 或 `worktrees/<id>/refs/worktree/…`——`<id>` 是
   worktree 的 id（`.git/worktrees/` 下的目录名），不一定等于它的目录名。默认 refspec 不推送这些 ref。
+  **第六轮错 4**：在一个 worktree 里跑 gc，不会把别的 worktree 的 `refs/worktree/` 当成可达的起点。别处一次
+  `gc --prune=now` 就把这条影子历史的对象回收了，之后这个 worktree 里 `git gc`、`git log --all` 都报 `bad object`；
+  默认 gc 下闲置两周就没了（C02FM，git 2.37.1 实测；MacBook 的 2.39.5 待复测）。`main-worktree/refs/worktree/…`
+  在 2.37.1 上也解析不了。要换成共享命名空间 `refs/vibetrail/shadow/<worktree-id>`（实测 gc 之后还在），demo 还是旧写法。
 - 第一个快照是根，其中已有的内容记为「快照开始前已在工作树里」。
 - **不在每次提交时从父提交重开**——否则上一次提交没带走、留在工作树里的改动，会在下一次提交里被当成 gap。
 - post-commit 时逐个文件做：先定一个**出发点快照**，在它后面临时接上真 commit 的 tree，出发点的工作树与提交内容
@@ -132,20 +204,28 @@ rm -rf "$d"
   不解析带路径的 `+++` 行，也不受用户的 `color.diff` / `diff.external` 配置影响。部分暂存时被「改回去」的行不在
   diff 里，不会被报；删掉的文件没有新侧行；二进制文件只提示、不逐行报。单个文件出错只跳过它，并打出第一行报错
   （边界 13 的子模块指针）——它在子 shell 里跑，`set -e` 不起作用，所以每一步都显式检查。
+- **第六轮补的两处，未修。** 用户配置还会让输出变形：`textconv` 让 diff 与 blame 都按转换后的文本算行号（两处都要加
+  `--no-textconv`），带 `-diff` 属性的文本文件被当成二进制，`blame.ignoreRevsFile` 指向不存在的文件时每个文件都归属
+  失败（不准 6）。merge 只对第一父提交做 diff：冲突 merge 会把侧分支的行整片记给跑 merge 的调用，干净 merge 与 pull
+  又只跑 post-merge、一行不报；要改成多父提交只报 `diff-tree --cc` 的新行，与 `vibetrail-audit` 的 `--cc` 口径一致（错 9）。
 - 每行给两个答案：**放置者**（不带 `-M` / `-C` 的 blame：这一行是谁放到这里的）与**内容来源**（带 `-M` / `-C`：
   认出的移动或复制的出处）。不同就都标上——复制别人的代码，放置者负责把它放在这里，内容却出自原作者（边界 12）。
   `-M` / `-C` 是带阈值的启发式。
 - **删掉的行也要出记录。** 上面只报新侧的行，「B 删掉了零检查」这类改动在记录里没有对应项，而删检查正是典型 bug。
   `git blame --reverse <根>..<末端> -- <文件>` 给出根版本每一行最后出现在哪一步，它在影子历史上的子提交就是删它的
-  那次调用（边界 16 实测）；落地时对本 commit diff 里的 `-` 行也走这一条，出发点与上面相同。
+  那次调用（边界 16 实测）。**第六轮错 8**：原先写「落地时对本 commit diff 里的 `-` 行也走这一条，出发点与上面相同」
+  不成立。影子历史跨提交连续，根里未必有这个文件（`blame --reverse` 直接报 `no such path`），根之后才加、本 commit
+  删掉的行也追不到；按正向的出发点起算，连边界 16 自己的 check 都不在起点里。要改成：起点取工作树里该文件还是
+  父提交那一版的最后一个快照，终点取接上真 commit 的那一步，只查父版里被删的那些行（三个场景实测都找到了删它的调用）。
 
 **④ 落盘只存指针。** 文件、行范围、行内容哈希、会话、tool_use_id，锚在 `Vibetrail-Id` trailer 上——
-与审计记录同锚，rebase / cherry-pick 下不变（[spec §4.0](spec/trace-v1.md)）。每个 commit KB 级，符合 D2。
+与审计记录同锚，rebase / cherry-pick 下不变（[spec §4.0](spec/trace-v1.md)）。每个 commit KB 级，符合 [DESIGN D2](DESIGN.md)（「约 KB 级/session」）。
 影子历史和快照日志与 transcript 一样只留本机。
 
 ### 5. 验证：demo（2026-09-11）
 
-脚本 [experiments/attrib-demo.sh](experiments/attrib-demo.sh)：在临时目录建一次性仓库，不碰当前仓库，本机十几秒。
+脚本 [experiments/attrib-demo.sh](experiments/attrib-demo.sh)：在临时目录建一次性仓库，不碰当前仓库，MacBook 上十几秒
+（C02FM 约 25 秒）。它验证的是 4.2；4.1 的接手检测还没有 demo。
 
 主场景（BASE 之前还有历史，分两次提交）：
 
@@ -262,23 +342,30 @@ f.txt      L3   rest     最后见于 B:B1 → 仍在末端
 
 **demo 没覆盖的**：搬运（`git stash pop`、`cherry-pick -n`、跨 worktree `cp`）；agent 在工具调用里移动 HEAD
 （checkout / rebase）；内容改走又改回之后 `commit -a`（§7）；子模块指针只跳过、不归属；影子历史的并发追加
-（demo 是串行的）；hook 里怎么区分子 agent、PreToolUse 给哪些字段（文档答案见 §4①，一手未测）；`PostToolUseFailure` 是否覆盖 Bash 非零退出；
-真实仓库规模下的耗时与占盘（本机初量见 §7，agentDock 未量）；删掉的行还没做进 attribute（边界 16 只演示了反向 blame）。
+（demo 是串行的）；hook 里怎么区分子 agent、PreToolUse 给哪些字段（文档答案见 4.2①，一手未测）；
+真实仓库规模下的耗时与占盘（MacBook 初量与第六轮补量见 §7，agentDock 未量）；删掉的行还没做进 attribute（边界 16 只演示了反向 blame）。
 场景是照已知的错搭的，没见过的错照样测不到。它也只打印、不断言。
+
+**第六轮复跑**（C02FM，git 2.37.1）：输出与上面逐字一致。但第六轮在 demo 没搭过的路径上实测出 7 处错（§11），场景本身
+也有两处问题：边界 10 演的顺序与真实相反——打断时不发 Stop，人打断后的手改发生在收尾之前，那一行会标成
+`S:S1(未完成)` 而不是 gap；边界 14 的对照行依赖秒边界，跑 60 次有 1 次对不上，强制跨秒跑 8 次全对不上。
 
 ### 6. 判责：从 bug 回到对话
 
 1. **定位出错的行。** 从修复 commit 出发：它删掉或改掉的行就是出错的行。在修复 commit 的父提交上
    对这些行跑 blame，找到引入它们的 commit（学术上叫 SZZ 算法）。
-2. **查归属。** 引入 commit 的 `Vibetrail-Id` → 归属记录 → 会话 + tool_use_id；放置者与内容来源不同时两个都要看。
-3. **还原现场。** 回**原始 transcript**（不用 Pilot 事件，理由见 §3 末），沿 `parentUuid` 往上找到触发这次
+2. **查归属。** 4.1：引入 commit 的 trailer 就是会话，「接手前已有」的行按下表另查；要到调用，翻这个会话的
+   transcript。做了 4.2 的话：`Vibetrail-Id` → 归属记录 → 会话 + tool_use_id，放置者与内容来源不同时两个都要看。
+3. **还原现场。** 回**原始 transcript**（不用 Pilot 事件，理由见 §3 末；怎么留存见 §10），沿 `parentUuid` 往上找到触发这次
    工具调用的人类消息。证据包：人的指令、模型的 thinking、工具调用本身、同会话前后的分歧事件（L3 已有）、
    这个 commit 的审计记录（`vibetrail-audit`）。
 4. **判断**，大致口径：
 
 | 情形 | 归到 |
 |---|---|
-| 归属为 gap | 不是 agent 工具调用做的。本工作流里人基本不碰文件（[DESIGN §2.4](DESIGN.md)），先排除格式化器、文件监听、后台进程（§7），再归人或人跑的工具 |
+| 归属为「接手前已有」（4.1） | 不是提交它的会话写的。按时间回到上一个在这个 worktree 里干活的会话，Edit / Write 能直接对上；对不上的是那个会话的 Bash 或人 |
+| 归属为 gap（4.2） | 不是 agent 工具调用做的。本工作流里人基本不碰文件（[DESIGN §2.4](DESIGN.md)），先排除格式化器、文件监听、后台进程（§7），再归人或人跑的工具 |
+| 标「未完成」（4.2） | 按歧义看：被打断的调用一直挂到下一句人话，其间可能有人手改（§11 第六轮错 6） |
 | 指令本身要求了错误行为 | 人 |
 | 指令对、实现错 | 模型 |
 | 模型提示过风险、人坚持要做 | 人的决定 |
@@ -288,23 +375,43 @@ f.txt      L3   rest     最后见于 B:B1 → 仍在末端
 
 ### 7. 已知限制与处理
 
-- **并发。** 两个工具调用同时进行时（包括同一会话里并行的子 agent），各自独占的时段按 §4② 归得开（demo 边界 1），
+**主方案（4.1）的限制：**
+
+- **规矩靠人守，只能查违规。** 接手检测只在 SessionStart 与 CwdChanged 时看；用绝对路径或 `git -C` 直接改、提交
+  别的 worktree，不触发它。
+- **会话之内分不出人手改。** 会话进行中人在它的 worktree 里改的，都算这个会话的。要分，就在 4.2 里按轮拍（§10）；
+  但人打断 agent 之后、说下一句话之前的手改，哪种快照都分不开——打断没有任何事件（第六轮错 6）。C02FM 上 vibetrail
+  的 10 个会话里 5 个有过调用中途被打断，共 12 次，从打断到下一句人话中位数约 5 分钟。
+- **「接手前已有」只说明不是提交者写的。** 定到具体会话要靠内容匹配，Bash 改的对不上。
+- **fork 的 trailer 记的是 fork。** 父会话写的内容要在 fork 的 transcript 里往前翻。
+- **跨仓（OPEN-ISSUES K2）。** 会话在别的仓启动、改本仓并提交，trailer 照样对；但 `vibetrail-sync` 按 transcript 里
+  第一条 cwd 认领会话，认不到它。
+
+**逐次快照（4.2）另有的限制：**
+
+- **并发。** 两个工具调用同时进行时（包括同一会话里并行的子 agent），各自独占的时段按 4.2② 归得开（demo 边界 1），
   重叠时段里的改动只能标并列（边界 2）。Edit / Write 的精确改动可以从 hook 的 `tool_input`（old / new string、全文）
   拿到，据此把并列拆开；Bash 之间的重叠拆不开。「拍快照 → 算标签 → 追加影子历史 → 改登记表」这一整段要串行：
   加一把 worktree 级的锁，或者追加时用 `update-ref` 带旧值校验、失败就重拍重算——光有旧值校验不够，登记表也得原子地改。
+- **嵌套。** 如果连 Agent 工具也挂，前台子 agent 运行期间外层那次调用一直「进行中」，子 agent 的改动全和它并列，
+  两次调用之间的人手改也记给它。v2.1.198 起子 agent 默认在后台跑，外层调用一启动就结束，没有这个问题。挂的话要么
+  排除 Agent，要么约定内层调用优先（第六轮不准 4）。
 - **调用进行中的人手改会记给这次调用。** 快照只看得出「这段时间里谁在跑」，看不出是谁动的手；PreToolUse 在权限确认之前触发，人在等确认时的手改也算进这次调用；被打断的调用
-  到一轮结束之前一直算进行中，其间的人手改同样记给它（边界 10 标了「未完成」，要按歧义看待）。暂存也一样：
-  §4③ 里出发点的工作树还没有、暂存时才带进来的那些行，归给暂存那一段进行中的调用，它未必是写这几行的人
+  到下一次 UserPromptSubmit 之前一直算进行中（打断时不发 Stop，第六轮错 6），其间的人手改同样记给它（边界 10 标了
+  「未完成」，要按歧义看待；它演的顺序与真实相反，见 §5）。暂存也一样：
+  4.2③ 里出发点的工作树还没有、暂存时才带进来的那些行，归给暂存那一段进行中的调用，它未必是写这几行的人
   （出发点工作树里已有的行照常往前追，边界 7 的 v1 归给写它的 A1，不是暂存它的 A2）。
-- **改走又改回。** A2 暂存了 v，B1 在工作树里改走，B2 又改回 v，然后 `commit -a`：暂存区一直是 v，按 §4③ 会记给
+- **改走又改回。** A2 暂存了 v，B1 在工作树里改走，B2 又改回 v，然后 `commit -a`：暂存区一直是 v，按 4.2③ 会记给
   最早写 v 的 A1；只看工作树历史的话，放置者是最后改回来的 B2。内容相同，偏差只在「记给谁」（第四轮审计实测）。
 - **搬运。** `git stash pop`、`cherry-pick -n`、从别的 worktree `cp` 过来的改动，会记在执行搬运的那次调用上。
   要追到源头，得按行内容哈希在各 worktree 的影子历史里找最早出现的地方：它们共享同一个对象库（git-common-dir），
-  ref 按 §4③ 的写法跨 worktree 可读，做得到，要多写一段。
-- **后台运行的 Bash。** `run_in_background` 的命令在 PostToolUse 之后还在写文件，之后的改动会落进 gap 或记给下一次调用。
-  快照日志里给这类调用打标，它之后同一轮里的 gap 按歧义看。
+  ref 按 4.2③ 的写法跨 worktree 可读，做得到，要多写一段。
+- **后台运行的 Bash。** 提前返回、进程还在跑的不止 `run_in_background`，还有用户按 Ctrl+B、超时自动转后台、为送达
+  排队的消息转后台的；PostToolUse 在工具返回时就发了，之后的改动会落进 gap 或记给下一次调用。要看 PostToolUse 里的
+  `tool_response.backgroundTaskId` 打标；这类任务会跨轮，歧义要一直算到它结束（看 Stop 输入里的 `background_tasks`），
+  不止「同一轮里的 gap」（第六轮不准 5）。
 - **快照看不见的改动。** 复制真 index 会连带 `assume-unchanged` / `skip-worktree` 标记，这类文件的改动快照看不到（少见）。
-- **代价只在本机初量过，agentDock 未量。** 2026-09-11，本机 SSD，工作树干净、index 热，进程内计时取 10 次平均：
+- **代价只在干净工作树上量过，agentDock 未量。** 2026-09-11，MacBook SSD，工作树干净、index 热，进程内计时取 10 次平均：
 
   | 仓 | 跟踪文件 | `add -A` | `write-tree` | 对照 `git status` | 首次冷 `add -A` |
   |---|---:|---:|---:|---:|---:|
@@ -312,7 +419,13 @@ f.txt      L3   rest     最后见于 B:B1 → 仍在末端
   | loongsuite-pilot | 928 | 14ms | 11ms | 15ms | 152ms |
   | 合成 30k 文件 | 30000 | 56ms | 12ms | 54ms | 2.2s |
 
-  热态一次快照（两次 `write-tree` 加一次 `add -A`）约等于两次 `git status`，工具调用前后各一次；冷的只有第一次。
+  热态一次快照（两次 `write-tree` 加一次 `add -A`）在 2.6k 文件的仓里约等于两次 `git status`，30k 文件时是 80ms 对
+  108ms；工具调用前后各一次。**第六轮补量**（C02FM，1000 个文件的仓）：未跟踪、没被 ignore 的文件不在真 index 里，
+  副本用完就丢，每次快照都要从头读、哈希一遍——加 5000 个未跟踪小文件时每次快照 0.84s（`git status` 0.02s）；
+  一个 200MB 的未跟踪文件首次 4.3s、之后每次 0.19s，对象库涨 214MB；一个 20MB 的日志每步追加一行，10 次快照对象库
+  涨 67MB。所以「冷的只有第一次」不成立，占盘也没系统量过。post-commit 的归属也没量过：日志 2000 行、一个 commit
+  改 10 个文件各 10 行，demo 的写法要 282s，其中每个文件逐行跑 `rev-parse` 占 27s（换成一次 `cat-file --batch-check`
+  只要 0.25s），逐行各跑两次 blame 也得改成每个文件一次。SessionEnd 的 hook 全部加起来只有 1.5 秒，装不下冷的 `add -A`。
   影子历史跨提交连续，要定截断策略，中间 blob 堆在本地 `.git/objects`，截断后让 gc 回收。没进 `.gitignore` 的
   未跟踪文件（比如 `.env`）也会写进本地对象库——不出本机，但要知道。
 - **gap 不等于人。** 格式化器、文件监听、构建工具在工具调用之外改的文件也会落进 gap。
@@ -320,65 +433,98 @@ f.txt      L3   rest     最后见于 B:B1 → 仍在末端
 
 ### 8. 对现有文档的影响（落地时再改，现在不动）
 
-- [DESIGN §2.5](DESIGN.md)：否决行级归属是代价与价值两头算的。价值那头的理由是，行级归属对应的文件侧分歧
-  在本工作流接近空（§2.4 实测）；而「多个会话之间谁写的」是另一个维度，不空。代价那头（git-ai 的 833MB 常驻库等）
-  不变，但 Q5 里「我们只需要它的 commit ↔ session 关联」这句不再成立。
-- [spec §4.5](spec/trace-v1.md) 的标题「已知做不到」与结论「本格式不提供代码归属」，以及 §7 第三条：改成指向新的归属记录。
-- [spec §4.4](spec/trace-v1.md)：有了逐行归属，Agent Trace 的 `files[].conversations[].ranges[]` 填得出来了，
-  「不声称合规」的理由消失，可重新评估。
-- [CAPABILITIES §1](CAPABILITIES.md) 的「行级归属 ❌ 已否决」、[FLOW.md](FLOW.md) 的五段图：加上「快照 → 归属」这一段。
+- [DESIGN §2.5](DESIGN.md)：否决行级归属是代价与价值两头算的。主方案（4.1）不做逐次快照，这个否决基本仍成立，
+  只需补一句：「多个会话之间谁写的」是另一个维度，由规矩与接手检测管；Q5 里「我们只需要它的 commit ↔ session 关联」
+  也基本成立，多出的只是「接手前已有」这一类标注。做 4.2 时再按原来的两头重评（价值那头：文件侧分歧在本工作流
+  接近空，§2.4 实测；代价那头：git-ai 的 833MB 常驻库等）。
+- [spec §4.5](spec/trace-v1.md)：结论「本格式不提供代码归属」之后补上「接手前已有」的标注与归属记录；§7 第三条同。
+- [spec §4.4](spec/trace-v1.md)：做了 4.2 才填得出 Agent Trace 的 `files[].conversations[].ranges[]`，到那时再评估「不声称合规」。
+- [CAPABILITIES §1](CAPABILITIES.md)、[FLOW.md](FLOW.md) 的五段图：加上「接手检测 → 提交时标注」这一段；做了 4.2 再加
+  「快照 → 归属」。
 
 ### 9. 拆解
 
 勾选只记拆解项做没做完，G11 整体的状态以中心表为准。
 
-- [ ] **测量（先做）**，三个数，在 agentDock 那台机器上量：
-  1. **这件事发生得多不多**：commit 的文件在父提交到本提交的窗口内被 trailer 之外的会话 Edit / Write 过的比例，
-     [experiments/multi-session-commits.sh](experiments/multi-session-commits.sh) 直接出（第一档内容匹配，Bash 改的看不到，
-     是下界）。本机语料只有 6 个主会话，只能看个样子：本仓最近 40 个 commit 里有 transcript 可查的 7 个，2 个确定多会话
-     （`514876d` 被 3 个会话改过；`d298f87` 的 trailer 会话与改文件的会话不同），5 个没有 trailer 比不了——最新的 6 个
-     commit 都是从本机这个没装 hook 的 clone 提交的（`vibetrail-doctor` 报致命）。这个数决定 §10 里走规矩还是走机制。
-  2. 不拍快照、只做 Edit / Write 内容匹配能覆盖多少行——spec §4.5 的「约 3%」只来自一个会话。
-  3. 一次快照（两次 `write-tree` 加一次 `add -A`）在 agentDock 上的耗时，本机初量见 §7。
-- [ ] **快照 hook**：PreToolUse / PostToolUse / **PostToolUseFailure**，fail-open、不阻断宿主；UserPromptSubmit / Stop /
-  SubagentStop / SessionEnd 关未完成的调用；先定粒度（§10）；定下围哪些工具（Bash / Edit / Write / NotebookEdit 与会写文件的
-  MCP 工具，还是全部）；一手实测 PreToolUse 的字段集与子 agent 的区分方式（文档答案见 §4①）、被打断时 Stop 是否触发、
-  Bash 非零退出走哪个事件。
-- [ ] **post-commit 归属**：影子历史 + 快照日志 + blame → 归属记录，锚 `Vibetrail-Id`；删掉的行走 `blame --reverse`（§4③）；
-  和 `prepare-commit-msg` 一起由 `vibetrail-install` 装。
-- [ ] **查询**：`vibetrail blame <file>:<line>` → commit → 会话 + tool_use_id → transcript 回跳；
+- [ ] **前置：agentDock 装 trailer。** `vibetrail-install` 装 `prepare-commit-msg`。C02FM 上 agentDock 当前分支 1608 个
+  commit 没有一个带 `Claude-Session`；装之前谈不上「trailer 就是归属」，也量不了多会话。
+- [ ] **重写测量脚本再量**（第六轮错 3）。[experiments/multi-session-commits.sh](experiments/multi-session-commits.sh)
+  现在两个方向都偏，出的数不能拿来做决定：只比路径后缀，别的 worktree、别的 clone 里的同名文件都算进来；失败的 Edit
+  照算；只找现存 worktree 对应的项目目录，存放在已删 worktree 目录下、或从别的仓启动的会话都漏；时间窗从父提交算起，
+  漏掉 G11 要抓的「A 改了没提交、B 后来一起提交」。重写：像 `vibetrail-sync` 那样扫全部项目目录、按每条消息记的 cwd
+  归到 worktree；用 reflog 定 commit 是在哪个 worktree 提交的；只算成功的调用；时间窗取「这个 worktree 上一次提交
+  之后」；「无匹配」拆成「没有 transcript」与「有 transcript 但没有 Edit」。要量的：
+  1. **多会话 commit 占多少。** C02FM 上用旧脚本重跑本仓最近 40 个 commit：多会话 0、单会话 1、无匹配 39。前五轮写的
+     「7 个可查、2 个确定多会话」是在 MacBook 上另一个 clone 里跑的：`d298f87` 是跨 clone 的误报，`514876d` 没有
+     trailer、时间窗 6 小时，谈不上「确定」（第六轮错 2）。
+  2. **接手有多频繁**：会话进入有未提交改动的 worktree 的次数。要等接手检测装上才有记录；在那之前只能从 transcript
+     里的 cwd 变化估个上限（4.1 末的数）。
+  3. **Edit / Write 内容匹配能对上多少行**，决定「接手前已有」的行能不能定到会话。spec §4.5 的「约 3%」是调用次数
+     之比（10 次 Edit 对 318 条改文件的 Bash），不是行覆盖率，也只来自一个会话。
+- [ ] **接手检测 hook**：SessionStart / CwdChanged，按 4.1 拍快照、提醒；影子提交挂 `refs/vibetrail/…`。hook 一律 `exit 0`、
+  stdout 不输出任何东西——exit 2 在 PreToolUse 会拦下工具、在 UserPromptSubmit 会吞掉用户的提示、在 Stop 会阻止停止，
+  而 `set -e` 下 grep 读一个不存在的文件退出码就是 2（§11 第六轮）。每个 hook 显式设 timeout。挂在哪（我们自己还是
+  改造 Pilot）见 §10。
+- [ ] **post-commit 归属**：「父提交 → 接手快照 → 本 commit」跑 blame，标「接手前已有」，其余归 trailer；归属记录锚
+  `Vibetrail-Id`；和 `prepare-commit-msg` 一起由 `vibetrail-install` 装。
+- [ ] **规矩写进团队约定**；`vibetrail-doctor` 报最近 N 个 commit 里有几个带「接手前已有」的行。
+- [ ] **查询**：`vibetrail blame <file>:<line>` → commit → 会话（「接手前已有」的行再往前找）→ transcript 回跳；
   另加一个从修复 commit 出发的 SZZ 入口。
-- [ ] **限制处理**：整段加锁或旧值校验、搬运按内容哈希回溯、截断策略。
-- [ ] **回归**：把 demo 改成 `tools/test-*.sh` 那样带断言的测试，补上 §5「demo 没覆盖的」各场景。
+- [ ] **测试**：接手检测与提交时的标注，照 `tools/test-*.sh` 写带断言的测试。
+- [ ] **可选：4.2 逐次快照。** 先修第六轮的 7 处错与 6 处不准；再定粒度（§10）与围哪些工具（Bash / Edit / Write /
+  NotebookEdit 与会写文件的 MCP 工具，还是全部；挂 Agent 工具见 §7「嵌套」）；一手实测 PreToolUse 的字段与子 agent 的
+  区分（文档答案见 4.2①）；把 demo 改成带断言的测试，补上 §5「demo 没覆盖的」；整段加锁或旧值校验、搬运按内容哈希
+  回溯、截断策略。
 - [ ] **回写文档**：§8 列的各处。
 
 ### 10. 待定（先记录、暂不定）
 
 - 归属记录落哪：`.claude/trace/attributions/<vibetrailId>.jsonl`（随仓，与审计记录同锚，倾向这个），
-  还是 git notes（不进 tree，但要单独配 push / fetch refspec）。两条路都要过一关：post-commit 写出的记录要到下一个
-  commit 才入仓，与 sessions 投影「事后写」是同一个问题（`vibetrail-sync` 头注释）；随 sync 一起落，或者 notes 直接挂在 commit 上。
-- 影子历史与快照日志保留多久、怎么截断。
-- 放置者与内容来源都存，还是只存一个；判责默认看哪个。
+  还是 git notes（不进 tree，但要单独配 push / fetch refspec）。落进 `.claude/trace/` 的话，post-commit 写出的记录要到
+  下一个 commit 才入仓；这和 sessions 的「事后投影」（`vibetrail-sync` 头注释，是有意的选择：只要求在 transcript 消失
+  之前写下来）是同一类取舍，随 sync 一起落即可。git notes 直接挂在 commit 上，没有这一关。
+- 影子历史与快照日志保留多久、怎么截断（4.1 只有接手快照，量小；4.2 才要认真定）。
+- 放置者与内容来源都存，还是只存一个；判责默认看哪个（4.2）。
 - 判责口径（§6 的表）是固化成字段，还是只作为复盘时的人工指引。
-- 是否和 G7（装一次、自动上报）一起做：快照 hook 与 G7 计划的 `.claude/settings.json` hooks 是同一个挂载点。
+- 是否和 G7（装一次、自动上报）一起做：接手检测的 SessionStart / CwdChanged hook 与 G7 计划的 `.claude/settings.json`
+  hooks 是同一个挂载点。
 - 是否也给 Pilot 的数据做一版纯内容匹配的归属：不拍快照、覆盖面小，但不用装任何东西。
-- **规矩还是机制。** 用户 2026-09-11：「有 worktree，如果大家都规范使用的话，其实不太会出现多个 session 同时一个改一个东西」。
-  worktree 规范消掉的是**并发**那一类（§7 第一条的跨会话部分随之消失，同一会话里并行的子 agent 还在）；G11 的原始场景
-  是**串行**的——同一个 worktree 上一条分支活过几个会话（compact、重开、隔天接着做），最后一个提交——worktree 管不到，
-  能管到的是另一条规矩：**会话结束前把自己的改动提交掉**。立了这条，trailer 就是归属，G11 缩成检测违规：Stop / SessionEnd
-  时工作树脏就提醒，doctor 报最近 N 个 commit 里几个的文件被别的会话改过，比快照便宜两个数量级。本仓自己的样本：
-  main 上 09-09 一天有 5 个会话先后在同一条分支上提交（两个会话交替出现），同一分支多会话串行是常态；一个 commit 里
-  混几个会话改动的有多少，看 §9 第 1 个数，它决定走哪条。
-- **粒度：轮还是工具调用。** 判责（§6）问的是「指令对不对、实现错没错」，这是**轮**的粒度，hook 给 `prompt_id`。
-  UserPromptSubmit 与 Stop 各拍一次，就把「agent 这一轮改的」和「两轮之间人改的」分开，快照次数少一到两个数量级，
-  §7 里并发与嵌套的问题大半消失；轮内要到具体调用时，Edit / Write 从 transcript 直接有，只有 Bash 需要再细。
-  倾向：轮为默认，工具调用粒度作为 Bash 上的可选加强。
+- **~~规矩还是机制~~——已定（2026-09-11）**：主方案走规矩加接手检测（4.1），逐次快照降为可选（4.2）。用户 09-11：
+  「有 worktree，如果大家都规范使用的话，其实不太会出现多个 session 同时一个改一个东西」。原文认为 worktree 只消掉
+  **并发**、管不到**串行**，依据是「main 上 09-09 一天有 5 个会话先后在同一条分支上提交……同一分支多会话串行是常态」，
+  第六轮查实是把快进合并看错了（错 1）。串行由 4.1 的规矩 2–5 与接手检测管。还开着的只有：要不要做 4.2、做到哪一层，
+  看 §9 的测量。
+- **粒度：轮还是工具调用（只关 4.2）。** 判责（§6）问的是「指令对不对、实现错没错」，这是**轮**的粒度。hook 给的
+  `prompt_id` 是所有事件共有的字段，指「当前这句人话」，不是这次调用出自哪一轮。UserPromptSubmit 与 Stop 各拍一次，
+  能把大部分「agent 这一轮改的」与「两轮之间人改的」分开，快照次数少一到两个数量级；轮内要到具体调用时，Edit / Write
+  从 transcript 直接有，只有 Bash 需要再细。原文说「§7 里并发与嵌套的问题大半消失」不对（第六轮不准 3）：§7 当时没讲
+  嵌套；按轮拍时两个会话的轮一重叠，改动全标并列，轮中间的人手改也记给 agent，并发反而更重；打断时不发 Stop，后台
+  子 agent 与后台 Bash 会跨轮，「Stop 到下一次 UserPromptSubmit 之间就是人」这个前提也不成立。倾向不变：做 4.2 时
+  轮为默认，工具调用粒度作为 Bash 上的可选加强。
+- **快照挂在哪：我们自己挂，还是改造 Pilot。** 用户 2026-09-11：「肯定不止靠pilot，我知道他做不到，要改造」。
+  这是上面「是否和 G7 一起做」的另一种答案。主方案改成 4.1 之后，要挂的只剩 SessionStart / CwdChanged 与 git 的
+  `prepare-commit-msg` / post-commit，改造的量比原先小得多；下面按要做 4.2 的情形列。Pilot 缺的不是字段，是看工作树的
+  能力（§3 的「缺」表：Bash 改了什么、人改了什么，事件里本来就没有，只能拍快照）。改造要加：4.2① 的快照与一轮收尾时的关闭；跨 hook 事件的调用登记表，
+  每个 worktree 一份、加锁；每次快照记 HEAD 与所在 worktree；归属计算，挂 post-commit，或者不挂、事后按快照里记的
+  HEAD 找出 commit 落在哪两次快照之间再离线算（推出来的，未验证）；只上传归属记录；补上 §3 末人这一侧的漏采。
+  会多出来的问题：影子历史写进被观测仓的 `.git`，等于采集器往用户仓里写对象和 ref，放 Pilot 自己的目录则要实测
+  对象复用、会不会被仓的 gc 连累——放在被观测仓里也一样会被连累，`refs/worktree/` 会被别的 worktree 的 gc 回收
+  （第六轮错 4），只能用共享命名空间；pre 那次快照要拍完工具才开始跑，每次工具调用都多出这段耗时（§7）；`Vibetrail-Id`
+  要装我们的 `prepare-commit-msg`，没装的仓只能锚 commit sha 一类，rebase 后会变；只对工具调用前后有同步 hook 的
+  agent 成立，靠事后读日志接入的拍不到调用前后的快照。
+- **对话证据怎么留。** 用户 2026-09-11：「为什么要会话还在，不是会全采上传么，或者我们干脆把transcript也定期保存一份呢」。
+  §6 第 3 步回原始 transcript，它只在开发者本机。C02FM 上 Claude Code 2.1.260 的设置说明（2026-09-11 查）：transcript
+  按 `cleanupPeriodDays` 清理、默认 30 天；desktop 与 Cowork 创建或最后写入的不在其内，另由
+  `desktopSessionCleanupPeriodDays` 管，默认 0、不设上限。两条路：Pilot 全采上传，前提是先补上 §3 末的漏采——
+  中断记录与每轮第一条人类输入正是判责最要紧的证据；或者定期把原始 transcript 存一份，最全，要连
+  `<会话id>/subagents/` 一起存，单个能到上百 MB，含代码与 thinking 全文，存到哪、谁能看与 G9 是同一个问题，
+  且得赶在清理之前。
 
 ### 11. 审计记录
 
 四轮独立审计，都在合并之后跑，每轮的发现在下一轮之前改进正文与 demo；demo 的边界场景就是照这些发现搭的。
-另有一轮与之并行的独立复核（第五轮，见末尾）。
-下面的「改成」写的是**那一轮修完时**的做法，后一轮又改过的另行标出。
+另有一轮与之并行的独立复核（第五轮）；第六轮换到另一台机器上，把全部六个 commit 审了一遍（见末尾）。前五轮都在 MacBook 上。
+下面的「改成」写的是**那一轮修完时**的做法，后一轮又改过的另行标出。前五轮说的 §4①–④，第六轮之后是 4.2①–④。
 
 **第一轮**审第一版 `514876d`（2026-09-11 00:13）：4 处错、8 处不准、6 个小问题。
 
@@ -392,7 +538,7 @@ f.txt      L3   rest     最后见于 B:B1 → 仍在末端
 
 其余 7 处不准是措辞过度或转述不准：「大头」只有一个会话的依据、「代价都不在快照本身」说满了、DESIGN 引文不是逐字、
 OPEN-ISSUES 的 G11 行复述过多并把 demo 结论写成一般结论、没写行移动要靠 `-M` / `-C`、「demo 没覆盖的」漏了前提。
-6 个小问题是口径与引文细节，外加删掉的文件会让 demo 直接中止。
+6 个小问题是口径与引文细节，删掉的文件会让 demo 直接中止也在其中。
 
 **第二轮**审修复 `224b884`：上一轮 18 条的原症状全部不再出现，但**修法本身引入或留下了 5 处错**、4 处不准、3 个小问题。
 
@@ -435,7 +581,7 @@ PreToolUse 也给它（已写进 §4②）；`worktrees/<名>` 的「名」其�
 3 处不准：「单个文件出错只跳过它」只在最后那条管道失败时成立——子 shell 里 `set -e` 不起作用，前面的步骤失败会打出空行，
 改为每步显式检查，并在边界 13 加了一个必然失败的子模块指针来走这条路；§4③ 写的「或 `commit -a`」与代码不符，代码只看
 快照时的暂存区，已改写规则描述，并把改走又改回的偏差写进 §7；第一轮错 3 的「改成」后来又被替换过却没标出（已补标）。
-3 个小问题：§7「按暂存发生在哪一段归属」说宽了，只有出发点工作树里没有的行才归给那一段（已改）；标签「快照开始前已在
+3 个小问题：§7「按『暂存发生在哪一段』归属」说宽了，只有出发点工作树里没有的行才归给那一段（已改）；标签「快照开始前已在
 暂存区里」TODO 里没提（已写进 §4③）；`e2abcd4` 说明的漏数（见上）。另补：二进制文件原来静默不报，现在给一行提示。
 
 四轮的教训是同一条，一轮比一轮扎眼：**demo 的场景是照着想证明的结论搭的，恰好绕开了会出错的情形；修复也一样，
@@ -448,11 +594,55 @@ PreToolUse 也给它（已写进 §4②）；`worktrees/<名>` 的「名」其�
 
 | # | 问题 | 改成 |
 |---|---|---|
-| 错 1 | 失败的工具调用没有 PostToolUse（文档：失败走 `PostToolUseFailure`）。Bash 非零退出很常见，只挂 PostToolUse 会让它们一直「进行中」，同一轮后面的改动全被标并列 | 两个事件都挂（§4②、§9） |
-| 错 2 | 只报新侧的行，删掉的行没有记录，而删检查正是典型 bug | `blame --reverse` 找删它的那一步（§4③；边界 16 实测） |
+| 错 1 | 失败的工具调用没有 PostToolUse（文档：失败走 `PostToolUseFailure`）。Bash 非零退出很常见，只挂 PostToolUse 会让它们一直「进行中」，同一轮后面的改动全被标并列 | 两个事件都挂（§4②、§9）——第六轮：打断与权限被拒两者都不发（错 6、7） |
+| 错 2 | 只报新侧的行，删掉的行没有记录，而删检查正是典型 bug | `blame --reverse` 找删它的那一步（§4③；边界 16 实测）——第六轮：起点不对（错 8） |
 | 补 1 | 后台运行的 Bash 在 PostToolUse 之后还在写文件，改动落进 gap | 打标、之后的 gap 按歧义看（§7） |
-| 补 2 | PreToolUse 字段集、子 agent 区分、权限前触发：官方文档有答案，一手未测 | §4①、§7 |
-| 补 3 | 代价初量：热态一次快照约等于两次 `git status`（2.6k 文件 ~45ms，30k 文件 ~80ms），冷只在第一次 | §7 表 |
-| 补 4 | 先量「多会话 commit 有多少」再决定走规矩还是走机制（用户提的 worktree 规范）；本仓样本 2/7 确定多会话、5 个没 trailer 比不了 | §9 第 1 个数、§10 |
-| 补 5 | 粒度可能选细了：判责要的是轮，UserPromptSubmit + Stop 就够分「agent 改的」与「人改的」 | §10 |
-| 补 6 | §6「gap 基本是人」与 §7「gap 不等于人」口径不一；归属记录 post-commit 写、下个 commit 才入仓 | §6 表、§10 |
+| 补 2 | PreToolUse 字段集、子 agent 区分、权限前触发：官方文档有答案，一手未测 | §4①、§7——第六轮：「字段集相同」不对（不准 5） |
+| 补 3 | 代价初量：热态一次快照约等于两次 `git status`（2.6k 文件 ~45ms，30k 文件 ~80ms），冷只在第一次 | §7 表——第六轮：只在干净工作树上成立（不准 2、11） |
+| 补 4 | 先量「多会话 commit 有多少」再决定走规矩还是走机制（用户提的 worktree 规范）；本仓样本 2/7 确定多会话、5 个没 trailer 比不了 | §9 第 1 个数、§10——第六轮：样本不成立（错 1、2），脚本两头偏（错 3） |
+| 补 5 | 粒度可能选细了：判责要的是轮，UserPromptSubmit + Stop 就够分「agent 改的」与「人改的」 | §10——第六轮：「并发与嵌套大半消失」说错了（不准 3） |
+| 补 6 | §6「不是 agent 写的，基本是人」与 §7「gap 不等于人」口径不一；归属记录 post-commit 写、下个 commit 才入仓 | §6 表、§10——第六轮：「事后写」不是 sync 的原话，notes 也没有这一关（不准 9） |
+
+**第六轮**（2026-09-11 下午，在另一台机器 C02FM 上；四路并行：demo 与算法、测量脚本与样本、hook 文档、引文与台账）
+审 `514876d`–`26a21d1` 全部六个 commit：错 10 处、不准 11 处、小问题 8 个，都经实验或一手出处复现——demo 类在 C02FM
+的 git 2.37.1 上跑，hook 类对 hooks 文档（code.claude.com/docs/en/hooks）与 C02FM 上的 Claude Code 2.1.260。
+**处理**：前 3 处错动摇的是「要不要做快照」，主方案随之改为 4.1；4.2 的 7 处错先记在这里，做 4.2 时再修，正文只改了
+事实性的说法，demo 没动。
+
+| # | 问题 | 处理 |
+|---|---|---|
+| 错 1 | 旧 §10「main 上 09-09 一天有 5 个会话先后在同一条分支上提交……同一分支多会话串行是常态」：main 的 reflog 是 15 次直接提交（全出自一个会话）加 6 次从 `claude/*` worktree 分支快进合并，另外 4 个会话各在自己的 worktree 里提交 | 删掉，改作 worktree 隔离起作用的证据（§4 开头） |
+| 错 2 | 旧 §9「7 个可查、2 个确定多会话」复现不出：数出自 MacBook 上另一个 clone；`d298f87` 在 C02FM 上是单会话（`3962d775`×33），那边把父提交时间窗里另一个 clone 同名文件的改动算了进来；`514876d` 没有 trailer、窗口 6 小时 | 改写（§9）；C02FM 重跑：多会话 0、单会话 1、无匹配 39 |
+| 错 3 | 测量脚本两个方向都偏，不是下界：别的 worktree / clone 的同名文件、失败的 Edit（C02FM 上 4925 次 Edit / Write 里 167 次失败）都算；从别处启动的会话扫不到（最近 40 个 commit 里 19 个出自这样的会话）；窗口从父提交算起，漏掉 G11 的核心场景；C02FM 上 32 个有 transcript 的 commit 只命中 1 个（多数改动走 Bash） | 脚本头与输出里的错话已改；重写列进 §9 |
+| 错 4 | `refs/worktree/` 上的影子历史会被别的 worktree 的 gc 回收，之后那边 `git gc`、`git log --all` 报 `bad object`；`main-worktree/refs/worktree/…` 在 2.37.1 上解析不了 | 4.1 用共享命名空间 `refs/vibetrail/…`（实测 gc 后还在）；4.2 未改，MacBook 的 2.39.5 待复测 |
+| 错 5 | 快照失败时登记照做：pre 那次失败，之前的人手改记给这次调用、不标起点不明；post 那次失败，调用的改动落成 gap | 未修（4.2② 写了改法） |
+| 错 6 | 用户打断时 Stop 不触发、PostToolUseFailure 也不发，被打断的调用挂到下一次 UserPromptSubmit，人打断后的手改全记给它；边界 10 演的顺序正好相反。C02FM 上 vibetrail 10 个会话里 5 个有过调用中途被打断，共 12 次，到下一句人话中位数约 5 分钟 | 事实已改进 4.2②、§5、§7；demo 未改 |
+| 错 7 | 权限被拒（手动拒绝、deny 规则、别的 hook 拦下）只有 PreToolUse，没有任何结束事件，这一轮后面的改动全变并列；`PermissionDenied` 只在 auto 模式发 | 未修（4.2②：加挂 PermissionDenied 与 PostToolBatch） |
+| 错 8 | 删行的反向 blame 从影子历史的根起算：根里没有这个文件就报错，根之后才加、本 commit 删掉的行追不到；「出发点与上面相同」连边界 16 自己都过不了 | 未修（4.2③ 写了改法，三个场景实测通过） |
+| 错 9 | merge 只对第一父提交做 diff：冲突 merge 把侧分支的行整片记给跑 merge 的调用；干净 merge 与 pull 只跑 post-merge，一行不报 | 未修（4.2③：多父提交只报 `diff-tree --cc` 的新行） |
+| 错 10 | 跨仓、跨 worktree 的改动（OPEN-ISSUES K2，本项目自己就这样）记给那边碰巧在跑的别的会话、或成 gap、或那边根本没快照 | 4.1 的限制写进 §7；4.2 未修（4.2② 写了改法） |
+
+11 处不准：① 旧 §9「在 agentDock 上量」——agentDock 当前分支没有 trailer，比不出「trailer 之外的会话」（§9 前置）；
+② §7 代价表只在干净工作树上量，未跟踪文件每次快照都重哈希，冷的不只第一次，占盘与 post-commit 归属都没量（§7 已补数）；
+③ §10「按轮拍，§7 里并发与嵌套的问题大半消失」——§7 当时没讲嵌套，按轮拍时两个会话的轮一重叠就全并列（已改）；
+④ 挂 Agent 工具时，前台子 agent 的改动全和外层调用并列（§7 已补「嵌套」）；⑤ hook 字段与事件：「字段集相同」不对，
+Bash 非零退出文档已答、grep 类退出码 1 不算失败，收尾事件漏了 StopFailure，后台任务不止 `run_in_background`，轮末只能
+关本线程的（4.2 已改）；⑥ 用户的 git 配置仍会让输出变形：textconv、`-diff` 属性、`blame.ignoreRevsFile`（4.2③ 已记）；
+⑦ `-c gc.auto=0` 的理由反了（已改）；⑧「最新的 6 个 commit 都是从本机这个没装 hook 的 clone 提交的（vibetrail-doctor
+报致命）」——doctor 报致命是因为本仓从来没有 vendored 运行时，与 hook 无关；「本机」时指 MacBook、时指 C02FM（已标明）；
+⑨ §10「与 sessions 投影『事后写』是同一个问题」——sync 头注释的原话是「事后投影」，是有意的选择，notes 也没有
+「下个 commit 才入仓」（已改）；⑩ §9 把 spec §4.5 的「约 3%」当行覆盖率，原文是调用次数之比（已改）；
+⑪「约等于两次 git status」只在小仓成立，30k 文件时是 80ms 对 108ms（已改）。
+
+8 个小问题：引号里的字不逐字 3 处（§4 引 spec §4.5 丢了内层引号，第四轮、第五轮台账各一处转述，已改）；「符合 D2」
+指的是 DESIGN 的 D2（已改）；OPEN-ISSUES 引言漏了 G10（已改）；第一轮台账「外加」应为「也在其中」（已改）；边界 14 的
+对照行依赖秒边界（§5 已记）；在根提交上跑 attribute 直接中止（`HEAD^` 报错）；测量脚本的目录名映射（Claude Code 把
+所有非字母数字字符换成 `-`，超过 200 字符截断）、merge 被跳过、改名只看新路径；hook 实现要点——`exit 0` 且不输出、
+显式超时、SessionEnd 只有 1.5 秒、子 agent 只看 `agent_id`（已写进 §9、4.2）。
+
+核过没有问题的：demo 输出与 §5 逐字一致；§3 的 14 处 Pilot 行号（C02FM 的 `~/program/go/src/loongsuite-pilot` @
+`d4ab8b6d`，`d4ab8b6d...4e59a5bc` 只改了 4 个 qoder-trace 文件）；DESIGN §2.1–2.5 与 Q5、spec 各节、采集清单 §1.2b
+的数字；前五轮的计数；所有「边界 N」的指向。
+
+第六轮的教训和前四轮是同一个毛病换了地方：前五轮都在一台机器上，**样本结论没在另一台机器上复现过就进了决策依据**；
+测量脚本也从没拿它要量的那个场景（同一个 worktree 里 A 改、B 提交）试过——「照想证明的结论搭场景」从 demo 挪到了测量上。

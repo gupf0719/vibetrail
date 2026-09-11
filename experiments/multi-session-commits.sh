@@ -1,19 +1,24 @@
 #!/bin/bash
 # 量「多个会话改、一个会话提交」在真实历史里发生得多不多——G11 值不值得做，先看这个数（TODO.md G11 §9）。
 #
+# ⚠️ 第六轮审计（2026-09-11）：这一版两个方向都偏，出的数不能拿来做决定，重写之前只当草稿（TODO.md G11 §9、§11）。
+#   多算：只比路径后缀，别的 worktree / 别的 clone 里的同名文件都算进来；失败的 Edit 照算。
+#   少算：Bash 改的看不到；只找现存 worktree 对应的项目目录，已删 worktree 目录下的、从别的仓启动的会话都漏；
+#         时间窗从父提交算起，漏掉「A 改了没提交、B 后来一起提交」——正是 G11 要抓的场景。
+#
 # 做法：对最近 N 个 commit，取父提交到本提交的时间窗，在本仓全部 worktree 的 Claude Code transcript 里找这段时间内
 # 对本 commit 改过的文件做过 Edit / Write / MultiEdit / NotebookEdit 的会话（spec §4.5 的第一档内容匹配），
 # 与 commit 的 Claude-Session trailer 比：候选里有 trailer 之外的会话 → 多会话 commit。
 #
 # 口径：
-#   - 只认 Edit / Write 这类工具的 file_path，Bash 里 sed / heredoc 改的看不到 → 「多会话」是下界；
+#   - 只认 Edit / Write 这类工具的 file_path，Bash 里 sed / heredoc 改的看不到 → 这一头会少算（另一头见上）；
 #   - transcript 不在本机（另一台机器提交的）→ 「无匹配」，不代表单会话；
 #   - 子 agent 的 transcript（<sid>/subagents/*.jsonl）并进父会话；
 #   - 多会话 = trailer 之外还有会话改过，或改过的会话不止一个；没有 trailer 又只有一个候选时比不了，单列；
 #   - 时间窗前后各放宽 60s / 5s，容忍时钟与提交延迟。
 # 用法：bash experiments/multi-session-commits.sh [N=40] [rev=HEAD]   在被观测仓的任一 worktree 里跑
-# 2026-09-11 在本仓实测（本机只有 6 个主会话的 transcript）：最近 40 个 commit 里有 transcript 可查的 7 个，
-# 2 个确定多会话（一个被 3 个会话改过、一个 trailer 会话与改文件的会话不同），5 个没有 trailer 比不了。
+# 2026-09-11 在 MacBook 上跑出「7 个可查、2 个确定多会话」，第六轮在 C02FM 上复现不出（多会话 0、单会话 1、无匹配 39）：
+# 其中 d298f87 是跨 clone 的误报，514876d 没有 trailer、时间窗 6 小时，谈不上确定（TODO.md G11 §11 第六轮错 2）。
 set -uo pipefail
 N=${1:-40}; REV=${2:-HEAD}
 PROJ="$HOME/.claude/projects"
@@ -88,5 +93,5 @@ for line in open(sys.argv[2], encoding="utf-8"):
     c = " ".join(f"{s[:8]}×{n}" for s, n in sorted(cands.items(), key=lambda x: -x[1]))
     print(f"{sha[:7]} trailer={trailer[:8] or '-':8s} {flag}  {c}")
 print(f"\n有父提交且有文件改动的 commit {tot}：多会话 {multi}、单会话 {single}、无 trailer 且只有一个候选（比不了）{nocmp}、无匹配 {nomatch}；没有 trailer 的共 {notrailer}")
-print("多会话是下界（Bash 改的看不到）；无匹配多半是 transcript 不在本机。")
+print("口径两头都偏：Bash 改的看不到（少算），别的 worktree / clone 的同名文件与失败的 Edit 会算进来（多算），见脚本头。")
 PY
