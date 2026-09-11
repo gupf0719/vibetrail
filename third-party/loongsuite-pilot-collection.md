@@ -8,6 +8,10 @@
 > 里没有它的 hook），没有实机数据可对照。
 >
 > 无前缀的行号指 `assets/hooks/claude-code-hook-processor.mjs`；其余均带文件名。
+>
+> **实跑样例**（2026-09-11）：一段编出来的示例会话实际过一遍 Pilot（断网），本机落了什么、配了远端会发出去什么，见
+> [loongsuite-pilot-collection-sample.md](loongsuite-pilot-collection-sample.md)。上面「没有实机数据可对照」从这天起不再成立；
+> 样例 §5 列了与本文对不上的 3 处和本文没写到的 6 条，尚未改进本文。
 
 本文只回答一个问题：**它采了什么、落在哪、什么出本机。** 与本项目和 teamai 的三方对比见
 [teamai-cli-vs-vibetrail.md](teamai-cli-vs-vibetrail.md)，此处不重复。

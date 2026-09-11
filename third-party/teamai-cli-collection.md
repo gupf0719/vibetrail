@@ -8,6 +8,10 @@
 > **引用请带日期**。第一版基于同日的 `224c0c4`；两者之间 10 个 commit（ZCode、multi-project P3、self 模式瘦身），
 > 采集代码本身一行没动，只有 `types.ts` / `builtin-hooks.ts` / `pull.ts` / `init.ts` 与使用指南的行号平移，本文已对齐。全部读码所得；
 > 本机未装 teamai（`~/.teamai` 不存在），没有实机数据可对照。
+>
+> **实跑样例**（2026-09-11）：同一段示例会话实际过一遍 teamai（`224c0c4`，断网），本机落了什么、会推出去什么，见
+> [teamai-cli-collection-sample.md](teamai-cli-collection-sample.md)。上面「没有实机数据可对照」从这天起不再成立；
+> 样例 §5.1 列了与本文对不上的 10 处，尚未改进本文。
 
 本文只回答一个问题：**它采了什么、落在哪、什么出本机。** 摩擦判据的精度问题不在这里重复，
 见 [teamai-cli.md §4.1](teamai-cli.md) 与 [对比文档 §3](teamai-cli-vs-vibetrail.md)。
