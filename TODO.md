@@ -358,6 +358,7 @@ f.txt      L3   rest     最后见于 B:B1 → 仍在末端
    transcript。做了 4.2 的话：`Vibetrail-Id` → 归属记录 → 会话 + tool_use_id，放置者与内容来源不同时两个都要看。
 3. **还原现场。** 回**原始 transcript**（不用 Pilot 事件，理由见 §3 末；怎么留存见 §10），沿 `parentUuid` 往上找到触发这次
    工具调用的人类消息。证据包：人的指令、模型的 thinking、工具调用本身、同会话前后的分歧事件（L3 已有）、
+   当时的 system prompt 与加载的 CLAUDE.md（2.1.258 起 transcript 自带快照，见 [DESIGN §2.6](DESIGN.md)）、
    这个 commit 的审计记录（`vibetrail-audit`）。
 4. **判断**，大致口径：
 

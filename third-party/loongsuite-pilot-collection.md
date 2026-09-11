@@ -231,7 +231,9 @@ command: `${exports.join('; ')};\n${toolInput.command}`
 取三样（`:6-18`）：
 
 - `system_instructions` —— 从**出站请求 body** 的 `system` 字段解析，滤掉首个计费头标记块。
-  **transcript 里没有这个东西**，只有拦流量才拿得到。
+  **transcript 里没有这个东西**，只有拦流量才拿得到。（2026-09-11 补：Claude Code 2.1.258 起不成立，transcript 自带
+  `prompt_snapshot`，含 system prompt 与全部工具定义，见 [DESIGN §2.6](../DESIGN.md)；Pilot 的解析不读它。拦截器仍多拿到
+  逐次请求的原样、desktop 追加的部分和子 agent 的 prompt。）
 - `response_id` —— 首个 SSE `message_start` 的 `message.id`，与 hook 侧 1:1 join。
 - `ttft_ns` —— 首个 `content_block_delta` 到达时刻。
 

@@ -123,6 +123,34 @@ Q5 曾倾向采纳。**实际安装后否决**，理由是代价结构不适合�
 
 已完整卸载并逐项核对还原（hooks / 二进制 / 本地库 / 全局 settings / Cursor 侧）。
 
+### 2.6 system prompt：新版 transcript 自带快照（2026-09-11 补测，C02FM）
+
+判责要看模型当时收到了什么指令。LoongSuite Pilot 靠往 Claude Code 进程注入 fetch 拦截器拿 system prompt，
+它的采集清单写「transcript 里没有」（[Pilot 采集清单 §1.5](third-party/loongsuite-pilot-collection.md)）。新版本上不再成立：
+
+- **hook 的输入里没有。** desktop 附带的 2.1.260 共 33 种 hook 事件、34 处构造 hook 输入，没有一处带 system prompt（查 bundle）。
+- **transcript 里有，从 2.1.258 起。** 新增一种 `attachment` 条目 `prompt_snapshot`：`cliPrefix`（开头那句「You are Claude Code…」）、
+  `systemPrompt`（12 段，约 8.3k 字）、`tools`（全部工具定义：名字、描述、参数 schema；取样会话 41 个，描述约 5.2 万字）。
+  会话开始时写一份，prompt 变了再写；取样会话 `2b2cd276` 里 3 份（02:14、02:15、08:54 UTC），system prompt 的 sha1 相同，
+  只有第一份还没带 tools。按版本数本机全部 39 个会话：
+
+  | 版本 | 会话 | 带 `prompt_snapshot` |
+  |---|---:|---:|
+  | 2.1.142 – 2.1.247（13 个版本） | 25 | 0 |
+  | 2.1.258 | 2 | 2 |
+  | 2.1.260 | 12 | 12 |
+
+  所以**只靠 hook 就能采**：每个 hook 的输入都有 `transcript_path`，读出 `prompt_snapshot` 即可，不要拦截器，也不要常驻进程。
+- **不等于发给模型的那一份。** desktop 追加的安全规则那段不在快照里；MCP 说明、skill 列表、环境信息、加载的 CLAUDE.md
+  是 transcript 里另外几种条目（`mcp_instructions_delta`、`skill_listing`、`environment`、`instructions`、`session_context` 等），
+  要自己拼。逐次请求的原样只有拦截器拿得到。
+- **子 agent 没有。** 取样会话的 8 个子 agent transcript 一份都没有。
+- **CLAUDE.md 另有 hook。** `InstructionsLoaded` 每加载一个 CLAUDE.md 或规则文件触发一次，给 `file_path`、`memory_type`、
+  `load_reason` 等，当场把文件内容存下来即可。判责最用得上的是这部分（项目给模型定的规矩）；基础 prompt 同一版本人人一样，
+  记下版本号就对得上。
+- **限制**：老会话补不回来；CLI 本机没有样本，未测；transcript 格式官方不公开，升级后可能改名或去掉，读之前先判断版本。
+  Pilot 的解析不读这个条目（源码 grep 0 命中）。
+
 ## 3. 分层方案
 
 | # | 内容 | 状态 |
