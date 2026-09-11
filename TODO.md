@@ -4,7 +4,70 @@
 > 每条的一句话与状态只记在那里；本文记其中**已经有方案、还没开工**的需求的细节——
 > 需求原话、方案、验证、限制、拆解。做完一条就删掉它的小节，并在中心表关闭对应 ID。
 
+## G7 hook 采两路数据：全量 + 人机分歧（当前先做）
+
+### 1. 需求
+
+用户原话（2026-09-11，看完 Pilot / teamai 实跑样例与 G11 第六轮审计之后）：
+
+> todo需求要调整一下，然后目前先做hook采集两类数据，一类是是pilot全量的这种，但是要采全，可能有些还要补充，然后另一类是人机分歧这种关键数据。
+
+定下了 G7 里一直「暂不定」的「两路」，就是 09-10 用户提的第三种读法；顺序也变了：先做这件，G11 往后排。
+
+### 2. 两路
+
+| 路 | 采什么 | 现状 |
+|---|---|---|
+| **全量** | 像 Pilot 那样的会话全量：prompt、回复、thinking、工具调用参数与结果、token、会话 / 轮 / 调用 id；**要采全**，Pilot 漏的补上（§3） | 我们还没有这一路。Pilot 采到什么见 [Pilot 采集样例](third-party/loongsuite-pilot-collection-sample.md) |
+| **人机分歧** | 打断、拒绝工具调用这类关键数据，每条带 `human` 区分人的决定与机器 / 基础设施行为 | `tools/extract-diverge.jq` 已认打断、拒绝等 5 类，`vibetrail-sync` 手动投影进 `sessions/`（CAPABILITIES §2.2）；缺 hook 自动跑 |
+
+两路按 Claude Code 会话 id 关联。分歧这一路在本机从原始 transcript 提取，不从全量事件里扫：Pilot 的事件里打断记录
+265 条只进了 5 条（OPEN-ISSUES G7）。
+
+### 3. 「采全」要补的（对照 Pilot 实跑，C02FM，2026-09-11）
+
+出处：[Pilot 采集样例 §4](third-party/loongsuite-pilot-collection-sample.md)、[采集清单 §1.2b](third-party/loongsuite-pilot-collection.md)、G11 §3。
+
+- **打断记录**：265 条只进 5 条；样例里排在一轮最后一次模型调用之后的那条也没进。
+- **每轮第一条人类输入**：没等到真实回复的整轮会丢，1,599 条丢了 154 条。
+- **被拒与执行失败分不开**：Pilot 都记成 ToolError。
+- **结构化结果**：Edit 的 `structuredPatch`、改前的 `originalFile`，Bash 的 `stdout` / `stderr` / `interrupted` 都不采。
+- **指回原文的锚**：transcript 的 `uuid`、`promptId`、`requestId` 不采，事后跳不回 transcript 的那一行。
+- **system prompt 与工具定义**：Pilot 靠拦截器拿；2.1.258 起 transcript 自带 `prompt_snapshot`（[DESIGN §2.6](DESIGN.md)），
+  它不读。CLAUDE.md 另挂 `InstructionsLoaded` 当场存。
+- **git 状态**：只有仓根、分支、remote，没有 HEAD，也没有逐次调用时的工作树（G11 §3）。
+
+最省事的「全」是把原始 transcript（连 `<会话id>/subagents/`）增量存一份，上面各项天然都在；代价是体积（单个上百 MB）
+与隐私（含代码与 thinking 全文），与 G11 §10「对话证据怎么留」、G9 是同一个问题。
+
+### 4. 只用 hook 怎么采
+
+- 挂 SessionStart / UserPromptSubmit / Stop / StopFailure / SubagentStop / SessionEnd；Stop 时增量读 transcript，记下读到哪。
+- 打断没有事件（G11 §11 第六轮错 6），在下一次 UserPromptSubmit / SessionStart 补读；agent 崩溃或被杀时 Stop / SessionEnd
+  都不来，所以每次 SessionStart 先补一遍「上次处理到哪」之后变过的 transcript。
+- hook 一律 `exit 0`、stdout 不输出；重活放后台子进程（SessionEnd 的 hook 全部加起来只有 1.5 秒）；几个会话同时写要加锁，
+  或写临时文件再原子改名。
+- 上传先落本地待发目录，每次 hook 顺手发一批，失败下次再发。
+- 只靠 hook 做不到的：hook 被删后自动装回（折中：git hook 或 SessionStart 顺手检查）；没有 hook 的 agent 只能搭车扫。
+
+### 5. 待定（先记录、暂不定）
+
+- 全量一路的格式：原样存 transcript，还是像 Pilot 那样规范化成事件。
+- 我们自己挂 hook，还是改造 Pilot（同 G11 §10）。
+- 传到哪、谁能看：与 G8（限定项目）、G9（本地展示）、K6（自由文本没脱敏）一起定。
+- hook 挂用户级还是入仓的项目级 `.claude/settings.json`（OPEN-ISSUES G7 ④：项目级是否要用户确认一次，待实测）。
+- Codex、Cursor 要不要一起采。
+
+### 6. 拆解
+
+- [ ] 定 §5 的格式与去向。
+- [ ] 分歧一路：`extract-diverge.jq` 挂到 hook 上自动跑，带增量与补做。
+- [ ] 全量一路：按 §3 逐项补齐，先做 Claude Code。
+- [ ] 回归：两路各有带断言的测试，输入用 [experiments/collect-demo/scenario.json](experiments/collect-demo/scenario.json) 这类示例会话。
+
 ## G11 多个会话改、一个会话提交：追回每一行出自哪个会话
+
+> 顺序：2026-09-11 用户定先做 G7 的两路采集（上一节），G11 往后排。
 
 ### 1. 需求
 
@@ -48,6 +111,23 @@
 所以只靠 Pilot 能做的是**内容匹配**：拿 commit 的新增行去匹配各会话 Edit / Write 的 `new_string` 与全文。
 命中的是精确归属；Bash 改的只能列出命令里出现过这个文件名的会话作候选（spec §4.5 第二档，原话是「哪些 session
 碰过这个文件」）；人改的无从归属。
+
+**按文件找会话，第六轮审计实际碰到五个问题。**4.1 里「接手前已有」的行、装 hook 之前的老 commit、§9 的测量脚本，
+走的都是这条路：从 commit 改到的文件出发，找改过这些文件的会话。
+
+1. **同名文件。** 只比相对路径，别的 worktree、别的 clone 里改同名文件的会话也会被算进来，`d298f87` 那个误报就是这么来的
+   （§11 第六轮错 2）。要按绝对路径比，再用 reflog 定出这个 commit 是在哪个工作目录里提交的。
+2. **时间窗从哪算起。** 没提交的改动可能是几天前留下的。从父提交算起，最典型的「A 改了没提交、B 后来一起提交」会整个漏掉；
+   窗口放宽，候选又变多。
+3. **失败的调用也会算进来。** 失败、被拒、改了又改回的 Edit 都在 transcript 里，也都会成为候选。C02FM 上 Edit / Write
+   共 5081 次，失败 166 次、没有结果 11 次（2026-09-11 重数，主会话加子 agent；审计时是 4925 次里 167 次失败）。
+4. **transcript 找不全。** 会话存放的目录不一定是它干活的目录：agentDock 26 个会话里有 10 个中途离开了启动目录（4.1 末）；
+   从别的仓启动的会话，transcript 存在那个仓的目录下（本仓最近 40 个 commit 里 19 个出自这样的会话）；CLI 起的会话
+   默认 30 天就被清掉（§10）。
+5. **同一个目录里几个会话同时改同一批文件，按文件分不开是谁。** 不用 worktree 时，同时开着的几个会话必然共用一个目录。
+   C02FM 上 agentDock 主 checkout 的 9 个会话，两两比起止时间，重叠的有 17 对（desktop 会话一开就是几周），所以按会话的
+   起止时间当窗口分不开，得看每次调用的时间戳。其中 2 对改过同一个文件，但前后相隔一个多月，还没抓到真正同一时段
+   改同一文件的实例。
 
 判责要用的对话证据，Pilot 在人类这一侧也会漏（[采集清单 §1.2b](third-party/loongsuite-pilot-collection.md)，语料在 C02FM 上）：
 主会话的中断记录 265 条（含 111 MB 那份）只进了 5 条；50 MB 以下的 37 个主会话里，每轮第一条人类输入
@@ -450,7 +530,7 @@ f.txt      L3   rest     最后见于 B:B1 → 仍在末端
 - [ ] **前置：agentDock 装 trailer。** `vibetrail-install` 装 `prepare-commit-msg`。C02FM 上 agentDock 当前分支 1608 个
   commit 没有一个带 `Claude-Session`；装之前谈不上「trailer 就是归属」，也量不了多会话。
 - [ ] **重写测量脚本再量**（第六轮错 3）。[experiments/multi-session-commits.sh](experiments/multi-session-commits.sh)
-  现在两个方向都偏，出的数不能拿来做决定：只比路径后缀，别的 worktree、别的 clone 里的同名文件都算进来；失败的 Edit
+  现在两个方向都偏（按文件找会话本身的问题汇总在 §3 末），出的数不能拿来做决定：只比路径后缀，别的 worktree、别的 clone 里的同名文件都算进来；失败的 Edit
   照算；只找现存 worktree 对应的项目目录，存放在已删 worktree 目录下、或从别的仓启动的会话都漏；时间窗从父提交算起，
   漏掉 G11 要抓的「A 改了没提交、B 后来一起提交」。重写：像 `vibetrail-sync` 那样扫全部项目目录、按每条消息记的 cwd
   归到 worktree；用 reflog 定 commit 是在哪个 worktree 提交的；只算成功的调用；时间窗取「这个 worktree 上一次提交
