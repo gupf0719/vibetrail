@@ -14,7 +14,7 @@
 #   SubagentStop / SessionEnd 调用，attribute 由 post-commit hook 调用；这里手工调用。
 #   只打印不断言——改成回归测试是 G11 的拆解项之一。
 #
-# 主场景之外的 15 个边界场景，每个对应四轮独立审计（2026-09-11）抓到的一类错，见 TODO.md G11 §11。
+# 主场景之外的 16 个边界场景：1–15 对应四轮独立审计（2026-09-11）抓到的一类错，16 是第五轮补的删行，见 TODO.md G11 §11。
 # 2026-09-11 在 macOS（git 2.39.5、/bin/bash 3.2）实测，输出见 TODO.md G11 §5。
 
 set -euo pipefail
@@ -287,6 +287,21 @@ snap pre Z Z0; snap post Z Z0
 snap pre A A3; git merge -q side > /dev/null 2>&1 || true; snap post A A3      # f.txt 干净合入并暂存，c.txt 冲突
 snap pre A A4; printf 'a\nfrom-side\nwt-only\n' > f.txt; snap post A A4        # 只改工作树里的 f.txt，不暂存
 snap pre A A5; printf 'c-resolved\n' > c.txt; git add c.txt; git commit -qm "merge side"; attribute HEAD; snap post A A5
+
+echo; echo "######## 边界 16：删掉的行——attribute 只报新侧的行，B 删掉的 check 没有对应项；反向 blame 找得到删它的那一步（还没做进 attribute）"
+newrepo deleted; printf 'keep\ncheck\nrest\n' > f.txt; git add -A; git commit -qm base
+snap pre A A1; printf 'keep\ncheck\nrest\nmore\n' > f.txt; snap post A A1
+snap pre B B1; printf 'keep\nrest\nmore\n' > f.txt; snap post B B1                # B 删掉 check
+git commit -qam "delete check"; attribute HEAD
+# 反向 blame：根版本的每一行最后出现在哪一步；它在影子历史上的子提交就是删它的那一步。这里末端的 f.txt 与提交的一致
+root=$(git rev-list --max-parents=0 "$SHADOW")
+git blame --reverse --line-porcelain "$root..$SHADOW" -- f.txt |
+    awk '/^[0-9a-f]+ [0-9]+ [0-9]+/ { sha = $1; ln = $3 } /^\t/ { print sha, ln, substr($0, 2) }' |
+while read -r sha ln text; do
+    child=$(git rev-list --children "$SHADOW" | awk -v s="$sha" '$1 == s { print $2 }')
+    if [ -n "$child" ]; then how="删它的一步：$(git log -1 --format=%an "$child")"; else how="仍在末端"; fi
+    printf '%-10s L%-3s %-8s 最后见于 %s → %s\n' f.txt "$ln" "$text" "$(git log -1 --format=%an "$sha")" "$how"
+done
 
 [ "${KEEP:-}" = 1 ] && echo "临时目录保留在 $WORK"
 exit 0

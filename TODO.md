@@ -78,7 +78,12 @@ rm -rf "$d"
 - 暂存区那份 tree 是给 ③ 定「提交进去的那一版是什么时候暂存的」用的。合并冲突时暂存区写不出 tree，
   就在副本里去掉未合并的路径（它们本来就没有暂存版）再写，别的文件照常记（demo 边界 15）。
 - 不需要常驻进程，不存 prompt。PostToolUse 的 stdin 实测直接给 `session_id` 与 `tool_use_id`
-  （[DESIGN §2.1](DESIGN.md)）；PreToolUse 的字段集、以及怎么区分子 agent，**待实测**。
+  （[DESIGN §2.1](DESIGN.md)）。PreToolUse 的字段集与子 agent 的区分，官方 hooks 文档（2026-09-11 查）有答案、
+  **一手实测还没做**：PreToolUse 与 PostToolUse 字段集相同，都给 `tool_use_id` 与 `prompt_id`；子 agent 里的工具调用
+  触发同一套 hook，stdin 多 `agent_id` / `agent_type`；PreToolUse 在权限确认**之前**触发。嵌套起一个 `claude -p` 去实测，
+  desktop 附带的二进制脱离宿主没有登录态，跑不起来；一手证据按 [experiments/hook-probe.sh](experiments/hook-probe.sh)
+  的路子注入 PreToolUse 探针即可。
+- hook 里跑的 git 命令都带 `-c gc.auto=0`，别让快照顺手触发一次 gc 把工具调用卡住。
 
 **② 每一段差分归给当时进行中的工具调用。** 上一个快照到这个快照之间的差分：
 
@@ -97,6 +102,11 @@ rm -rf "$d"
 - 被打断的调用等不到 post，也未必等得到同线程的下一个 pre（子 agent、会话就此结束），所以在**一轮结束时**关：
   下一次 UserPromptSubmit、Stop、SubagentStop、SessionEnd 到来时先拍一次，把到此为止的改动记给它、标「未完成」，
   再注销。被打断时 Stop 是否触发待实测。
+- **失败的调用没有 PostToolUse。** 文档写 PostToolUse 只在工具成功后触发，失败另有 `PostToolUseFailure`（字段集相同）。
+  Bash 非零退出很常见（grep 无命中、测试失败都是），只挂 PostToolUse 的话这些调用会一直「进行中」到一轮结束，
+  同一轮里后面所有调用的改动都被标成与它并列。两个事件都要挂；Bash 非零退出算不算这里的「失败」待实测。
+- 每次快照顺手记下 HEAD：agent 在工具调用里 checkout / rebase / pull 时工作树整片变化，看日志时能把这类步骤
+  与真正的改动分开（demo 没覆盖，见 §5）。
 - 登记表与快照日志都放在 `git rev-parse --git-path` 解析出的本 worktree 私有目录里，每个 worktree 一份。
 
 **③ 影子历史每个 worktree 一条、跨提交连续，post-commit 时只报本 commit 的行。**
@@ -125,6 +135,9 @@ rm -rf "$d"
 - 每行给两个答案：**放置者**（不带 `-M` / `-C` 的 blame：这一行是谁放到这里的）与**内容来源**（带 `-M` / `-C`：
   认出的移动或复制的出处）。不同就都标上——复制别人的代码，放置者负责把它放在这里，内容却出自原作者（边界 12）。
   `-M` / `-C` 是带阈值的启发式。
+- **删掉的行也要出记录。** 上面只报新侧的行，「B 删掉了零检查」这类改动在记录里没有对应项，而删检查正是典型 bug。
+  `git blame --reverse <根>..<末端> -- <文件>` 给出根版本每一行最后出现在哪一步，它在影子历史上的子提交就是删它的
+  那次调用（边界 16 实测）；落地时对本 commit diff 里的 `-` 行也走这一条，出发点与上面相同。
 
 **④ 落盘只存指针。** 文件、行范围、行内容哈希、会话、tool_use_id，锚在 `Vibetrail-Id` trailer 上——
 与审计记录同锚，rebase / cherry-pick 下不变（[spec §4.0](spec/trace-v1.md)）。每个 commit KB 级，符合 D2。
@@ -142,7 +155,7 @@ rm -rf "$d"
 3. 会话 B 用 `sed -i` 把 `calc.py` 的 `add` 改错（B1）；
 4. 会话 C 用 Edit 给 `util.py` 加函数（C1），然后删掉 `legacy.py`、提交全部（C2）。
 
-第二次提交的 trailer 上只会有 C。另有 15 个边界场景，每个对应四轮审计抓到的一类错（§11），预期写在各自的标题里。
+第二次提交的 trailer 上只会有 C。另有 16 个边界场景：1–15 各对应四轮审计抓到的一类错，16 是第五轮补的删行（§11），预期写在各自的标题里。
 输出（`←` 之后是注释）：
 
 ```
@@ -234,6 +247,13 @@ snaptree 拍到：return a - b（工作树里是 return a - b）
 == merge side —— 本 commit 新增或改动的行 ==
 c.txt      L1   A:A5     c-resolved
 f.txt      L2   A:A3     from-side
+
+######## 边界 16：删掉的行——attribute 只报新侧的行，B 删掉的 check 没有对应项；反向 blame 找得到删它的那一步（还没做进 attribute）
+== delete check —— 本 commit 新增或改动的行 ==
+f.txt      L3   A:A1     more                                    ← 正向只报得出这一行
+f.txt      L1   keep     最后见于 B:B1 → 仍在末端
+f.txt      L2   check    最后见于 A:A1 → 删它的一步：B:B1        ← 反向 blame 找到删它的调用
+f.txt      L3   rest     最后见于 B:B1 → 仍在末端
 ```
 
 主场景两次提交新增或改动的行全部归对：两处 bug 分别落在 B 的 sed 和人的手改上；第一次提交没带走的改动，
@@ -242,7 +262,8 @@ f.txt      L2   A:A3     from-side
 
 **demo 没覆盖的**：搬运（`git stash pop`、`cherry-pick -n`、跨 worktree `cp`）；agent 在工具调用里移动 HEAD
 （checkout / rebase）；内容改走又改回之后 `commit -a`（§7）；子模块指针只跳过、不归属；影子历史的并发追加
-（demo 是串行的）；hook 里怎么区分子 agent、PreToolUse 给哪些字段；真实仓库规模下的耗时与占盘。
+（demo 是串行的）；hook 里怎么区分子 agent、PreToolUse 给哪些字段（文档答案见 §4①，一手未测）；`PostToolUseFailure` 是否覆盖 Bash 非零退出；
+真实仓库规模下的耗时与占盘（本机初量见 §7，agentDock 未量）；删掉的行还没做进 attribute（边界 16 只演示了反向 blame）。
 场景是照已知的错搭的，没见过的错照样测不到。它也只打印、不断言。
 
 ### 6. 判责：从 bug 回到对话
@@ -257,7 +278,7 @@ f.txt      L2   A:A3     from-side
 
 | 情形 | 归到 |
 |---|---|
-| 归属为 gap | 不是 agent 写的，基本是人，或人跑的工具 |
+| 归属为 gap | 不是 agent 工具调用做的。本工作流里人基本不碰文件（[DESIGN §2.4](DESIGN.md)），先排除格式化器、文件监听、后台进程（§7），再归人或人跑的工具 |
 | 指令本身要求了错误行为 | 人 |
 | 指令对、实现错 | 模型 |
 | 模型提示过风险、人坚持要做 | 人的决定 |
@@ -271,7 +292,7 @@ f.txt      L2   A:A3     from-side
   重叠时段里的改动只能标并列（边界 2）。Edit / Write 的精确改动可以从 hook 的 `tool_input`（old / new string、全文）
   拿到，据此把并列拆开；Bash 之间的重叠拆不开。「拍快照 → 算标签 → 追加影子历史 → 改登记表」这一整段要串行：
   加一把 worktree 级的锁，或者追加时用 `update-ref` 带旧值校验、失败就重拍重算——光有旧值校验不够，登记表也得原子地改。
-- **调用进行中的人手改会记给这次调用。** 快照只看得出「这段时间里谁在跑」，看不出是谁动的手；被打断的调用
+- **调用进行中的人手改会记给这次调用。** 快照只看得出「这段时间里谁在跑」，看不出是谁动的手；PreToolUse 在权限确认之前触发，人在等确认时的手改也算进这次调用；被打断的调用
   到一轮结束之前一直算进行中，其间的人手改同样记给它（边界 10 标了「未完成」，要按歧义看待）。暂存也一样：
   §4③ 里出发点的工作树还没有、暂存时才带进来的那些行，归给暂存那一段进行中的调用，它未必是写这几行的人
   （出发点工作树里已有的行照常往前追，边界 7 的 v1 归给写它的 A1，不是暂存它的 A2）。
@@ -280,10 +301,20 @@ f.txt      L2   A:A3     from-side
 - **搬运。** `git stash pop`、`cherry-pick -n`、从别的 worktree `cp` 过来的改动，会记在执行搬运的那次调用上。
   要追到源头，得按行内容哈希在各 worktree 的影子历史里找最早出现的地方：它们共享同一个对象库（git-common-dir），
   ref 按 §4③ 的写法跨 worktree 可读，做得到，要多写一段。
+- **后台运行的 Bash。** `run_in_background` 的命令在 PostToolUse 之后还在写文件，之后的改动会落进 gap 或记给下一次调用。
+  快照日志里给这类调用打标，它之后同一轮里的 gap 按歧义看。
 - **快照看不见的改动。** 复制真 index 会连带 `assume-unchanged` / `skip-worktree` 标记，这类文件的改动快照看不到（少见）。
-- **代价没量。** 大仓里每次快照要两次 `write-tree` 加一次 `add -A`，耗时要在 agentDock 上实测。影子历史跨提交连续，
-  要定截断策略，中间 blob 堆在本地 `.git/objects`，截断后让 gc 回收。没进 `.gitignore` 的未跟踪文件（比如 `.env`）
-  也会写进本地对象库——不出本机，但要知道。
+- **代价只在本机初量过，agentDock 未量。** 2026-09-11，本机 SSD，工作树干净、index 热，进程内计时取 10 次平均：
+
+  | 仓 | 跟踪文件 | `add -A` | `write-tree` | 对照 `git status` | 首次冷 `add -A` |
+  |---|---:|---:|---:|---:|---:|
+  | cadvisor | 2658 | 22ms | 11ms | 21ms | 188ms |
+  | loongsuite-pilot | 928 | 14ms | 11ms | 15ms | 152ms |
+  | 合成 30k 文件 | 30000 | 56ms | 12ms | 54ms | 2.2s |
+
+  热态一次快照（两次 `write-tree` 加一次 `add -A`）约等于两次 `git status`，工具调用前后各一次；冷的只有第一次。
+  影子历史跨提交连续，要定截断策略，中间 blob 堆在本地 `.git/objects`，截断后让 gc 回收。没进 `.gitignore` 的
+  未跟踪文件（比如 `.env`）也会写进本地对象库——不出本机，但要知道。
 - **gap 不等于人。** 格式化器、文件监听、构建工具在工具调用之外改的文件也会落进 gap。
 - **squash 合流**下与 trailer 一样会丢（[spec §7](spec/trace-v1.md)）。
 
@@ -301,14 +332,20 @@ f.txt      L2   A:A3     from-side
 
 勾选只记拆解项做没做完，G11 整体的状态以中心表为准。
 
-- [ ] **测量（先做）**：在 agentDock 那台机器上挑几个真实的多会话 commit，只用现有 transcript 做 Edit / Write
-  内容匹配，量出不拍快照能覆盖多少行——spec §4.5 的「约 3%」只来自一个会话。同时量一次快照（两次 `write-tree`
-  加一次 `add -A`）在 agentDock 上的耗时。这两个数决定快照值不值得上。
-- [ ] **快照 hook**：PreToolUse / PostToolUse，fail-open、不阻断宿主；UserPromptSubmit / Stop / SubagentStop /
-  SessionEnd 关未完成的调用；定下围哪些工具（Bash / Edit / Write / NotebookEdit 与会写文件的 MCP 工具，还是全部）；
-  实测 PreToolUse 的字段集（有没有 tool_use_id）、子 agent 的区分方式、被打断时 Stop 是否触发。
-- [ ] **post-commit 归属**：影子历史 + 快照日志 + blame → 归属记录，锚 `Vibetrail-Id`；和 `prepare-commit-msg`
-  一起由 `vibetrail-install` 装。
+- [ ] **测量（先做）**，三个数，在 agentDock 那台机器上量：
+  1. **这件事发生得多不多**：commit 的文件在父提交到本提交的窗口内被 trailer 之外的会话 Edit / Write 过的比例，
+     [experiments/multi-session-commits.sh](experiments/multi-session-commits.sh) 直接出（第一档内容匹配，Bash 改的看不到，
+     是下界）。本机语料只有 6 个主会话，只能看个样子：本仓最近 40 个 commit 里有 transcript 可查的 7 个，2 个确定多会话
+     （`514876d` 被 3 个会话改过；`d298f87` 的 trailer 会话与改文件的会话不同），5 个没有 trailer 比不了——最新的 6 个
+     commit 都是从本机这个没装 hook 的 clone 提交的（`vibetrail-doctor` 报致命）。这个数决定 §10 里走规矩还是走机制。
+  2. 不拍快照、只做 Edit / Write 内容匹配能覆盖多少行——spec §4.5 的「约 3%」只来自一个会话。
+  3. 一次快照（两次 `write-tree` 加一次 `add -A`）在 agentDock 上的耗时，本机初量见 §7。
+- [ ] **快照 hook**：PreToolUse / PostToolUse / **PostToolUseFailure**，fail-open、不阻断宿主；UserPromptSubmit / Stop /
+  SubagentStop / SessionEnd 关未完成的调用；先定粒度（§10）；定下围哪些工具（Bash / Edit / Write / NotebookEdit 与会写文件的
+  MCP 工具，还是全部）；一手实测 PreToolUse 的字段集与子 agent 的区分方式（文档答案见 §4①）、被打断时 Stop 是否触发、
+  Bash 非零退出走哪个事件。
+- [ ] **post-commit 归属**：影子历史 + 快照日志 + blame → 归属记录，锚 `Vibetrail-Id`；删掉的行走 `blame --reverse`（§4③）；
+  和 `prepare-commit-msg` 一起由 `vibetrail-install` 装。
 - [ ] **查询**：`vibetrail blame <file>:<line>` → commit → 会话 + tool_use_id → transcript 回跳；
   另加一个从修复 commit 出发的 SZZ 入口。
 - [ ] **限制处理**：整段加锁或旧值校验、搬运按内容哈希回溯、截断策略。
@@ -318,16 +355,29 @@ f.txt      L2   A:A3     from-side
 ### 10. 待定（先记录、暂不定）
 
 - 归属记录落哪：`.claude/trace/attributions/<vibetrailId>.jsonl`（随仓，与审计记录同锚，倾向这个），
-  还是 git notes（不进 tree，但要单独配 push / fetch refspec）。
+  还是 git notes（不进 tree，但要单独配 push / fetch refspec）。两条路都要过一关：post-commit 写出的记录要到下一个
+  commit 才入仓，与 sessions 投影「事后写」是同一个问题（`vibetrail-sync` 头注释）；随 sync 一起落，或者 notes 直接挂在 commit 上。
 - 影子历史与快照日志保留多久、怎么截断。
 - 放置者与内容来源都存，还是只存一个；判责默认看哪个。
 - 判责口径（§6 的表）是固化成字段，还是只作为复盘时的人工指引。
 - 是否和 G7（装一次、自动上报）一起做：快照 hook 与 G7 计划的 `.claude/settings.json` hooks 是同一个挂载点。
 - 是否也给 Pilot 的数据做一版纯内容匹配的归属：不拍快照、覆盖面小，但不用装任何东西。
+- **规矩还是机制。** 用户 2026-09-11：「有 worktree，如果大家都规范使用的话，其实不太会出现多个 session 同时一个改一个东西」。
+  worktree 规范消掉的是**并发**那一类（§7 第一条的跨会话部分随之消失，同一会话里并行的子 agent 还在）；G11 的原始场景
+  是**串行**的——同一个 worktree 上一条分支活过几个会话（compact、重开、隔天接着做），最后一个提交——worktree 管不到，
+  能管到的是另一条规矩：**会话结束前把自己的改动提交掉**。立了这条，trailer 就是归属，G11 缩成检测违规：Stop / SessionEnd
+  时工作树脏就提醒，doctor 报最近 N 个 commit 里几个的文件被别的会话改过，比快照便宜两个数量级。本仓自己的样本：
+  main 上 09-09 一天有 5 个会话先后在同一条分支上提交（两个会话交替出现），同一分支多会话串行是常态；一个 commit 里
+  混几个会话改动的有多少，看 §9 第 1 个数，它决定走哪条。
+- **粒度：轮还是工具调用。** 判责（§6）问的是「指令对不对、实现错没错」，这是**轮**的粒度，hook 给 `prompt_id`。
+  UserPromptSubmit 与 Stop 各拍一次，就把「agent 这一轮改的」和「两轮之间人改的」分开，快照次数少一到两个数量级，
+  §7 里并发与嵌套的问题大半消失；轮内要到具体调用时，Edit / Write 从 transcript 直接有，只有 Bash 需要再细。
+  倾向：轮为默认，工具调用粒度作为 Bash 上的可选加强。
 
 ### 11. 审计记录
 
 四轮独立审计，都在合并之后跑，每轮的发现在下一轮之前改进正文与 demo；demo 的边界场景就是照这些发现搭的。
+另有一轮与之并行的独立复核（第五轮，见末尾）。
 下面的「改成」写的是**那一轮修完时**的做法，后一轮又改过的另行标出。
 
 **第一轮**审第一版 `514876d`（2026-09-11 00:13）：4 处错、8 处不准、6 个小问题。
@@ -392,3 +442,17 @@ PreToolUse 也给它（已写进 §4②）；`worktrees/<名>` 的「名」其�
 只修到了被指出的那个症状，修法自己带进来的问题（共用 ref、`cp` 丢 mtime、按行文本搜、丢掉的 diff 选项）照样没有场景去碰。**
 第三轮的错 1 最典型：它不是没修，是修的时候为了让新场景通过，引入了一个比原问题更坏的启发式。第四轮的发现少了、
 且都在边角；还没搭过场景的情形见 §5「demo 没覆盖的」，那里照样可能藏着错。
+
+**第五轮**（另一会话从第一版 `514876d` 独立起审，与前四轮并行，2026-09-11 上午；修到 `02e3685` 后再对表）：
+4 条与前四轮重合、已被修掉（父提交重开、部分暂存、共用 index 撞锁、并发窗口），另有 2 处错、6 处补充，都已写进正文。
+
+| # | 问题 | 改成 |
+|---|---|---|
+| 错 1 | 失败的工具调用没有 PostToolUse（文档：失败走 `PostToolUseFailure`）。Bash 非零退出很常见，只挂 PostToolUse 会让它们一直「进行中」，同一轮后面的改动全被标并列 | 两个事件都挂（§4②、§9） |
+| 错 2 | 只报新侧的行，删掉的行没有记录，而删检查正是典型 bug | `blame --reverse` 找删它的那一步（§4③；边界 16 实测） |
+| 补 1 | 后台运行的 Bash 在 PostToolUse 之后还在写文件，改动落进 gap | 打标、之后的 gap 按歧义看（§7） |
+| 补 2 | PreToolUse 字段集、子 agent 区分、权限前触发：官方文档有答案，一手未测 | §4①、§7 |
+| 补 3 | 代价初量：热态一次快照约等于两次 `git status`（2.6k 文件 ~45ms，30k 文件 ~80ms），冷只在第一次 | §7 表 |
+| 补 4 | 先量「多会话 commit 有多少」再决定走规矩还是走机制（用户提的 worktree 规范）；本仓样本 2/7 确定多会话、5 个没 trailer 比不了 | §9 第 1 个数、§10 |
+| 补 5 | 粒度可能选细了：判责要的是轮，UserPromptSubmit + Stop 就够分「agent 改的」与「人改的」 | §10 |
+| 补 6 | §6「gap 基本是人」与 §7「gap 不等于人」口径不一；归属记录 post-commit 写、下个 commit 才入仓 | §6 表、§10 |
