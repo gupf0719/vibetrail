@@ -8,62 +8,316 @@
 
 ### 1. 需求
 
-用户原话（2026-09-11，看完 Pilot / teamai 实跑样例与 G11 第六轮审计之后）：
+用户原话两次：
 
-> todo需求要调整一下，然后目前先做hook采集两类数据，一类是是pilot全量的这种，但是要采全，可能有些还要补充，然后另一类是人机分歧这种关键数据。
+- 2026-09-11（看完 Pilot / teamai 实跑样例与 G11 第六轮审计之后）：
 
-定下了 G7 里一直「暂不定」的「两路」，就是 09-10 用户提的第三种读法；顺序也变了：先做这件，G11 往后排。
+  > todo需求要调整一下，然后目前先做hook采集两类数据，一类是是pilot全量的这种，但是要采全，可能有些还要补充，然后另一类是人机分歧这种关键数据。
 
-### 2. 两路
+- 2026-09-14（要求整理需求，看有没有问题和要补充的）：
 
-| 路 | 采什么 | 现状 |
+  > 希望和teamai一样，用hook的方式，一个命令实现安装，然后会自动采集数据。数据包含两类，一类是pilot这种全采，还有一类是人机分歧这种关键信息。
+
+- 2026-09-14，追问「不能进仓是什么意思」之后定了去向：
+
+  > 我从来没说要放git，我会用hook把他用http的方式传云端
+
+- 2026-09-14，脱敏：
+
+  > 暂时先不考虑脱敏
+
+- 2026-09-14，看完「装几次 / 装了什么 / 数据去哪」的 teamai 对照表之后，一次定了五件：
+
+  > 项目级和用户级都要，可配置的，参考teamai，不存git了，不要clone一次装一次，未来会push云端，暂时先缓存本地文件让我看输出内容，保留push动作。然后和teamai一样，装一次就行。
+
+定下了 G7 里一直「暂不定」的「两路」，就是 09-10 用户提的第三种读法（原话「分两路上传，或者在云上从全量数据里扫出分歧」）；
+顺序也变了：先做这件，G11 往后排。去向也定了：hook 经 HTTP 传云端，不进 git，本机只是缓冲。脱敏（K6）暂不做，不挡上传。
+最后一条原话定的五件：① hook 用户级与项目级都做、可配置（§4）；② 两路数据都**不进 git**，仓内 `sessions/` 投影停用（§6）；
+③ 不再每个 clone 装一次，机器级装一次（§4）；④ 现阶段云端还没有：本机 spool 里的文件就是将来 push 的内容，先让人看；push 动作从第一版
+就保留，端点没配置时不发（§6）；⑤ 整体照 teamai：`init` 一次、hook 分发、机器数据在 HOME。
+本节 09-14 整理成需求；§8 是这次审需求发现的问题与要补的，§9 是仍然暂不定的。
+
+### 2. 一句话与验收
+
+**机器级装一次，之后每个 Claude Code 会话自动把两路数据落进本机 spool、有端点就 push；人不再跑任何命令。**
+
+验收，每条都要有带断言的测试（§10）：
+
+| # | 验收 | 怎么验 |
 |---|---|---|
-| **全量** | 像 Pilot 那样的会话全量：prompt、回复、thinking、工具调用参数与结果、token、会话 / 轮 / 调用 id；**要采全**，Pilot 漏的补上（§3） | 我们还没有这一路。Pilot 采到什么见 [Pilot 采集样例](third-party/loongsuite-pilot-collection-sample.md) |
-| **人机分歧** | 打断、拒绝工具调用这类关键数据，每条带 `human` 区分人的决定与机器 / 基础设施行为 | `tools/extract-diverge.jq` 已认打断、拒绝等 5 类，`vibetrail-sync` 手动投影进 `sessions/`（CAPABILITIES §2.2）；缺 hook 自动跑 |
+| A1 | **机器级装一次**，之后新开的会话自动采，每个 clone 不再有任何手动步骤 | 新机器跑一次 `vibetrail init`；之后在任何登记过的仓（或带项目级条目的仓）开会话都采；`vibetrail-doctor` 全绿 |
+| A2 | 全量一路**采全**：副本 ⊇ 源 | 会话结束后（或下一次 SessionStart 补做后），副本与源 transcript（主会话 + 子 agent + `.meta.json`）逐字节一致，截至源的最后一个完整行 |
+| A3 | 分歧一路自动 | 会话里的打断 / 拒绝，在下一次 hook（UserPromptSubmit / Stop / SessionEnd）触发后被提取进 spool；结果与 `extract-diverge.jq` 直接跑在同一份 transcript 上逐字一致 |
+| A4 | 只采登记过的项目（G8） | 用户级条目：未登记的目录里开会话，本机不落任何东西（spool、state 都没有）。项目级条目：仓里的条目本身就是登记 |
+| A5 | 不影响宿主 | 所有 hook `exit 0`、stdout 为空、显式 timeout；回放 scenario.json 时 transcript 的 `stop_hook_summary` 里 `hookErrors` 为空 |
+| A6 | 失效可见 | 删 settings 里的 hook 条目 / 删运行时 / 删登记，doctor 都报出来；没装运行时的机器碰到项目级条目静默不采，doctor 报「有条目无运行时」 |
+| A7 | 装卸对称 | uninstall 后用户级 settings 条目、`~/.vibetrail/bin` 与 state 还原；项目级条目在仓里、可能是别人提交的，只列出不动；`--purge` 才删 spool |
+| A8 | **两级可配，双挂不重** | 同一仓同时有用户级与项目级条目时，数据不重复（offset + 幂等键），只多一次空跑 |
+| A9 | **本机可看** | spool 里的文件人能直接打开读，且就是 push 会发的内容，不多不少；`vibetrail push --list` 能列出待发的每一份与大小 |
+| A10 | push 不重不漏 | 端点未配置：不发、不删、spool 完整。端点配置后：云端收到的字节与 spool 一致；断网期间的数据在网络恢复后由后续 hook 补传，重发不产生重复 |
 
-两路按 Claude Code 会话 id 关联。分歧这一路在本机从原始 transcript 提取，不从全量事件里扫：Pilot 的事件里打断记录
-265 条只进了 5 条（OPEN-ISSUES G7）。
+### 3. 两路各是什么
 
-### 3. 「采全」要补的（对照 Pilot 实跑，C02FM，2026-09-11）
+| 路 | 采什么 | 落哪 | 现状 |
+|---|---|---|---|
+| **全量** | ① 原始 transcript 的增量副本：主会话 `<sid>.jsonl` + `<sid>/subagents/*.jsonl` + `*.meta.json`；② hook 事件流，只存 transcript 里**没有**的字段；③ git 富化：每轮起止的 HEAD、分支、worktree 根、脏文件数；④ `InstructionsLoaded` 当场存下的 CLAUDE.md / rules 正文 | 本机 `~/.vibetrail/spool/<项目>/<sid>/`，文件就是将来 push 的内容；端点配置后由 hook 经 HTTP push 到云端。**不进 git** | 没有 |
+| **人机分歧** | `extract-diverge.jq` 的 5 类 kind + turn uuid 指针 + `end` 汇总（spec §3） | 同一个 spool，事件级文件；同一条 HTTP 通道（09-10 原话「分两路上传」）。仓内 `<repo>/.claude/trace/sessions/<sid>.jsonl` 的投影**停用**（09-14「不存git了」） | 判据已有（`extract-diverge.jq`）；`vibetrail-sync` 写仓内投影那条路停用，改写 spool，缺 hook 自动跑与 push |
+
+两路按 Claude Code 会话 id 关联——transcript 文件名、hook 的 `session_id`、trailer `Claude-Session`（若保留，§9）是同一个值。
+两路**解耦**：分歧一路不依赖全量一路开着。全量一路将来可能因隐私关掉（§6），分歧一路照常上传。
+原样副本上传之后，「在云上从全量数据里扫出分歧」重新可行（Pilot 的事件模型下不可行，是因为它漏人类侧）；本机提取仍是主路，
+云上重扫可作对账，见 §8 第 17 条。
+
+#### 3.1 「全」的定义：副本 ⊇ 源，不是 Pilot 的「全」
+
+Pilot 的「全」是把 transcript 规范化成事件之后的全。实测模型与工具一侧全、人类一侧漏：打断 265 条只进 5 条，每轮第一条人类输入
+1,599 条丢 154 条（[采集清单 §1.2b](third-party/loongsuite-pilot-collection.md)）。根因是它按 promptId 分轮、只读 `user` / `assistant`
+两种记录，而原始 transcript 里的记录类型远不止这两种。本机清单（2026-09-14，MacBook，40 个主会话 / 676 个子 agent 文件 / 700 MB，
+Claude Code 2.1.142–2.1.266，入口全是 claude-desktop）：
+
+| 顶层 `type` | 条数 | 里面是什么 |
+|---|---:|---|
+| `assistant` | 54,260 | 模型回复：text / thinking / tool_use，`usage`、`requestId`、`model` |
+| `user` | 28,258 | 人的输入、tool_result（`toolUseResult` 里有 Bash 的 `stdout` / `stderr` / `interrupted`，Edit 的 `structuredPatch` / `originalFile` / `oldString` / `newString`）、打断标记 |
+| `attachment` | 13,632 | 40 种子类型，见下 |
+| `last-prompt` / `ai-title` / `custom-title` | 7,864 / 7,169 / 4,361 | 会话元数据：最后一条 prompt 原文、标题 |
+| `queue-operation` | 6,444 | 人排队的消息：enqueue 3,237 / dequeue 2,314 / remove 893，remove 里 296 条带 `reason: absorbed_mid_turn`（人在模型干活时插话，被并入当前轮） |
+| `mode` | 5,748 | 模式切换 |
+| `system` | 2,995 | `stop_hook_summary` 2,084（每次 Stop 跑了哪些 hook、报没报错）、`api_error` 860、`compact_boundary` 48、`local_command` 2、`model_refusal_fallback` 1 |
+| `atis-latch` / `bridge-session` | 2,397 / 1,323 | 远程桥接；`bridge-session` 带 `ownerAccountUuid`、`ownerOrganizationUuid`——**身份类** |
+| `worktree-state` | 1,039 | desktop 给会话开的 worktree：`originalCwd`、`worktreePath`、`worktreeBranch`、`originalHeadCommit` |
+| `file-history-snapshot` / `file-history-delta` | 45 / 14 | 2.1.260 起的文件检查点（`CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING`）：每轮一份快照、每次 Edit / Write 前一份备份指针，正文在 `~/.claude/file-history/<sid>/<hash>@vN`，是整份文件（本机 952 KB） |
+| `frame-link` | 2 | — |
+
+`attachment` 的 40 种子类型里与本项目有关的：`prompt_snapshot` 38（system prompt 与全部工具定义，DESIGN §2.6）；
+`hook_blocking_error` 332 / `hook_success` 9 / `hook_cancelled` 1（hook 的结果，含命令与 stdout）；`edited_text_file` 327（Read 过的文件在磁盘上被改了，
+带文件名与开头片段——抽样 3 条都紧跟在 Bash 的 tool_result 之后、同一秒，是 agent 自己的命令改的，不是人）；`queued_command` 713
+（排队的人话原文，`origin.kind: human`）；`command_permissions` / `auto_mode` / `auto_mode_exit` 34 / 34 / 1（权限模式）；`instructions` 17 /
+`nested_memory` 7（加载的 CLAUDE.md）；`skill_listing` 102 / `mcp_instructions_delta` 105 / `environment` 82 / `session_context` 24
+（拼 system prompt 用）。其余是提醒类：`total_tokens_reminder` 8,333、`task_reminder` 2,397、`batching_reminder_sent` 352……
+
+所以「采全」只有一个可操作的定义：**原始文件逐字节复制**。§3.2 那张「要补的」清单里除 git 状态之外的每一项天然都在，完整性也只需
+一条断言（字节相等）。规范化成事件（像 Pilot 那样）是下游投影，不在采集这一步做——采集时做归一化，就是把 Pilot 的漏采路径重走一遍。
+
+#### 3.2 对照 Pilot 要补的（09-11 列的，按 3.1 的定义重看）
 
 出处：[Pilot 采集样例 §4](third-party/loongsuite-pilot-collection-sample.md)、[采集清单 §1.2b](third-party/loongsuite-pilot-collection.md)、G11 §3。
 
-- **打断记录**：265 条只进 5 条；样例里排在一轮最后一次模型调用之后的那条也没进。
-- **每轮第一条人类输入**：没等到真实回复的整轮会丢，1,599 条丢了 154 条。
-- **被拒与执行失败分不开**：Pilot 都记成 ToolError。
-- **结构化结果**：Edit 的 `structuredPatch`、改前的 `originalFile`，Bash 的 `stdout` / `stderr` / `interrupted` 都不采。
-- **指回原文的锚**：transcript 的 `uuid`、`promptId`、`requestId` 不采，事后跳不回 transcript 的那一行。
-- **system prompt 与工具定义**：Pilot 靠拦截器拿；2.1.258 起 transcript 自带 `prompt_snapshot`（[DESIGN §2.6](DESIGN.md)），
-  它不读。CLAUDE.md 另挂 `InstructionsLoaded` 当场存。
-- **git 状态**：只有仓根、分支、remote，没有 HEAD，也没有逐次调用时的工作树（G11 §3）。
+| 要补的 | 原始副本里有没有 | 还要做什么 |
+|---|---|---|
+| 打断记录（265 → 5） | 有：`user` 记录的 text 块 | 无 |
+| 每轮第一条人类输入（1,599 → 1,445） | 有 | 无 |
+| 被拒与执行失败分不开 | 有：拒绝正文在 `is_error` 块里，判据在 `extract-diverge.jq` | hook 侧另有类型化的 `PostToolUseFailure`（不含权限拒绝）与 `PermissionDenied`（只在 auto mode），见 §5.2 |
+| Edit 的 `structuredPatch` / `originalFile`，Bash 的 `stdout` / `stderr` / `interrupted` | 有：`toolUseResult` | 无 |
+| `uuid` / `promptId` / `requestId` | 有 | 无 |
+| system prompt 与工具定义 | ≥ 2.1.258 有（`prompt_snapshot`）；子 agent 没有；老版本没有 | 记版本；子 agent 与老版本接受缺失 |
+| CLAUDE.md 正文 | transcript 只有 `instructions` / `nested_memory` 附件，是否含全文未核 | `InstructionsLoaded` hook 当场存正文与 sha |
+| **git 状态**（HEAD、工作树） | **没有** | hook 侧富化：SessionStart / UserPromptSubmit / Stop 各记一次 HEAD、分支、worktree 根、`git status --porcelain` 的行数。逐次工具调用的工作树是 G11 4.2 的事，不在本条 |
 
-最省事的「全」是把原始 transcript（连 `<会话id>/subagents/`）增量存一份，上面各项天然都在；代价是体积（单个上百 MB）
-与隐私（含代码与 thinking 全文），与 G11 §10「对话证据怎么留」、G9 是同一个问题。
+### 4. 安装：一条命令做什么
 
-### 4. 只用 hook 怎么采
+照 teamai：**机器级装一次**（`vibetrail init`），之后不再有「每个 clone 跑一次」这一步（用户 09-14：「不要clone一次装一次……和teamai一样，装一次就行」）。
+hook 挂用户级还是项目级**两个都做、可配置**（同日原话「项目级和用户级都要，可配置的，参考teamai」）：
 
-- 挂 SessionStart / UserPromptSubmit / Stop / StopFailure / SubagentStop / SessionEnd；Stop 时增量读 transcript，记下读到哪。
-- 打断没有事件（G11 §11 第六轮错 6），在下一次 UserPromptSubmit / SessionStart 补读；agent 崩溃或被杀时 Stop / SessionEnd
-  都不来，所以每次 SessionStart 先补一遍「上次处理到哪」之后变过的 transcript。
-- hook 一律 `exit 0`、stdout 不输出；重活放后台子进程（SessionEnd 的 hook 全部加起来只有 1.5 秒）；几个会话同时写要加锁，
-  或写临时文件再原子改名。
-- 上传先落本地待发目录，每次 hook 顺手发一批，失败下次再发。
-- 只靠 hook 做不到的：hook 被删后自动装回（折中：git hook 或 SessionStart 顺手检查）；没有 hook 的 agent 只能搭车扫。
+| 层 | 做什么 | 幂等 / 升级 |
+|---|---|---|
+| 机器级（一次） | 运行时放 `~/.vibetrail/bin/`（hook 命令必须是绝对路径，触发时还不知道在哪个仓）；建 `~/.vibetrail/{spool,state,config}`；将来的云端鉴权 token 放 `~/.vibetrail/`（0600，teamai 的 `~/.teamai/token` 同款） | 幂等；不建守护进程、不改 shell rc、不注入进程（§5 边界） |
+| 用户级 hook（`--scope user`） | 往 `~/.claude/settings.json` 写 hook 条目，命令指向 `~/.vibetrail/bin/`；本机所有目录的会话都触发，采不采由 G8 的机器级项目清单决定 | 条目带 marker，升级按 marker 换掉自家旧条目（Pilot ⑥） |
+| 项目级 hook（`--scope project`，在仓里跑） | 往 `<repo>/.claude/settings.json` 写同样的条目，命令写 `$HOME/.vibetrail/bin/…`（不能写死某个人的绝对路径）；团队提交进仓则 clone 即得——这是 teamai self 模式的做法。条目本身就是登记，分发入口按 `--scope project` 参数免查清单 | 同上；仓里的条目由仓自己管 |
+| 登记（用户级条目下的开关，G8） | `vibetrail init` 在仓里跑时顺手登记本仓（键 = `git worktree list` 第一条的主 checkout，worktree 共享）；另有 `vibetrail projects add / remove / list` | 幂等 |
+| 自检 | `vibetrail-doctor` 扩到：两级条目在不在、指向的运行时在不在、版本一致否、是否双挂；本仓登记了没 / 带条目没；最近 N 个会话的 `stop_hook_summary` 里有几个跑过我们的命令（transcript 自带这条证据，不用另存状态）；spool 积压、offset 落后、端点配没配 | — |
+| 卸载 | `vibetrail uninstall`：用户级条目、`~/.vibetrail/bin` 与 state 还原；项目级条目只列出让人自己删（它在仓里）；`--purge` 才删 spool（Pilot ⑦） | — |
 
-### 5. 待定（先记录、暂不定）
+不再做的：仓内 vendor 运行时、`.gitattributes`、`.claude/trace/sessions/`——两路数据不进 git，这些为进 git 而设的东西 G7 不需要。
+git 的 `prepare-commit-msg`（commit ↔ session 的 trailer）去留**暂不定**，见 §9：留，就由 SessionStart 在登记过的仓里自动装（人不再手跑）；
+不留，就从全量副本里的 git 富化（每轮起止的 HEAD）推出 commit ↔ session。
 
-- 全量一路的格式：原样存 transcript，还是像 Pilot 那样规范化成事件。
-- 我们自己挂 hook，还是改造 Pilot（同 G11 §10）。
-- 传到哪、谁能看：与 G8（限定项目）、G9（本地展示）、K6（自由文本没脱敏）一起定。
-- hook 挂用户级还是入仓的项目级 `.claude/settings.json`（OPEN-ISSUES G7 ④：项目级是否要用户确认一次，待实测）。
-- Codex、Cursor 要不要一起采。
+**两级怎么参考 teamai**（[实跑样例 §2.6](third-party/teamai-cli-collection-sample.md)、[分析 §4.3](third-party/teamai-cli.md)）：
 
-### 6. 拆解
+- teamai 的 `--scope user` / `--scope project` 决定的是**配置与资源**放 HOME 还是项目分区、哪个团队仓收上报；hook 条目**两种 scope 都写 HOME 级**
+  `~/.claude/settings.json`（`types.ts:1497-1503`），所以它的 project scope 仍是全机触发。真正把 hook 条目提交进仓的只有 self 模式
+  （`teamai init .`）。我们的「项目级」对应的是 self 模式那一步，不是它的 `--scope project`。
+- 它的命令形如 `bash -lc "teamai hook-dispatch stop --tool claude 2>/dev/null" || true`：没装 teamai 的机器上条目静默失败。我们同款——
+  项目级条目「clone 即得」的前提是这台机器装过运行时，没装就静默不采，由 doctor 与一次性提示补位（§8 第 18 条）。
+- 官方文档（hooks.md「Workspace trust」，2026-09-14 取）：交互会话里所有 settings 文件的 hook——含 `~/.claude/settings.json`——都要等用户对该目录
+  接受过 workspace trust 才跑；`-p` / SDK 会话不弹。两级一样，不是 hook 专属的确认。实证：agentDock 的项目级 Stop hook 在 desktop 下真跑了
+  （本机 transcript 里 `stop_hook_summary` 含 `check-audit-stop.sh` 1,941 次）。
+- 默认哪一级**暂不定**（§9）；倾向用户级 + 清单，理由：采集不依赖每个仓提交 settings，G8 的门控本来就要机器级清单，desktop 与 CLI 都热加载
+  （hooks.md:738「file watcher」）。
+- 同一仓两级都挂时 Claude Code 会各跑一次；采集按 offset、push 按幂等键，重复触发只多一次空跑，不多数据（A8）。
 
-- [ ] 定 §5 的格式与去向。
-- [ ] 分歧一路：`extract-diverge.jq` 挂到 hook 上自动跑，带增量与补做。
-- [ ] 全量一路：按 §3 逐项补齐，先做 Claude Code。
-- [ ] 回归：两路各有带断言的测试，输入用 [experiments/collect-demo/scenario.json](experiments/collect-demo/scenario.json) 这类示例会话。
+### 5. 只用 hook 怎么采
+
+**边界**：harness hook + git 的 `prepare-commit-msg`（已有；commit ↔ session 是本项目主线，这一点与 teamai 不同）。不常驻守护进程、
+不改 shell rc、不注入进程、不改写用户命令——Pilot 走的那条路，[对比 §6.3](third-party/teamai-cli-vs-vibetrail.md) 已否。
+
+#### 5.1 事件与动作
+
+| 事件 | 动作 | 同步 / 异步 |
+|---|---|---|
+| `SessionStart` | 门控（用户级条目查清单，项目级条目免查，§4）→ 记 `source`、`model`、git 状态 →（若保留 git hook，§9）装回 git hook → **补做**：本仓（按 `git worktree list` 归属，同 `vibetrail-sync`）所有 offset 落后于文件大小的 transcript，各补一次副本、分歧提取与上传。agent 崩溃、被杀、`-p` 模式下 Stop / SessionEnd 都不来，全靠这一步 | 门控与记录同步；补做丢后台 |
+| `UserPromptSubmit` | 记 `prompt_id` 与 git 状态（轮开始）；顺手做一次增量副本 + 分歧提取（不上传）——打断只能在这里或下面两处补读 | 30 s 上限；stdout 会进模型上下文，**必须为空** |
+| `Stop` | 增量副本 + 分歧提取 + git 状态（轮结束）+ **push 一批**（本轮新增的，连同之前没传成的；端点未配置时这一步只记账不发） | `async: true`（hooks.md:3621）：不阻塞、不计 timeout |
+| `SubagentStart` / `SubagentStop` | 记 `agent_id`、`agent_type`、`agent_transcript_path`；Stop 时再扫一遍 `subagents/` 目录——后台子 agent 在父 Stop 之后才结束 | 异步 |
+| `PostToolUseFailure` / `PermissionDenied` / `StopFailure` / `Notification`（`permission_prompt`） | 只记事件头：`tool_use_id`、`error` / `reason` / `notification_type`、时间。类型化信号，见 §5.2 | 同步，毫秒级 |
+| `InstructionsLoaded` | 存 `file_path`、`load_reason`、正文与 sha | 官方说明它本身异步跑 |
+| `CwdChanged` | 记 `old_cwd` / `new_cwd`（G11 接手检测的同一挂载点） | 同步 |
+| `SessionEnd` | 只记 `reason`；预算 1.5 s（hooks.md:3315，`CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` 可抬），来不及的交给下一次 SessionStart 补做 | 同步 |
+
+不挂 `PreToolUse` / `PostToolUse`：每次工具调用多跑一个进程，而它们给的 `tool_input` / `tool_response` transcript 里全有。
+
+#### 5.2 分歧一路：为什么还是要读 transcript
+
+两类人的分歧都**没有 hook 事件**（官方文档，2026-09-14 核）：Stop 在用户打断时不触发（hooks-guide：「They don't fire on user interrupts」）；
+权限被人拒只有 PreToolUse、没有任何结束事件——`PostToolUseFailure` 明写不含权限拒绝，`PermissionDenied` 只在 auto mode 发（hooks.md:2068）。
+所以 `interrupt` / `permission_denied` 仍靠 `extract-diverge.jq` 读 transcript 的字符串判据，G6 的脆弱性不变。
+
+机器一侧倒有了类型化来源：`PermissionDenied`（≈ `classifier_blocked`）、`PostToolUseFailure`（工具失败，不是分歧）、`StopFailure`
+（API 错，带 `error` 类型）。hook 事件流记下它们的 `tool_use_id`，就能和 transcript 里的字符串判定对账——两边对不上就是判据漂了，
+这正是 G6 要的哨兵。
+
+**什么时候读**：每次 hook 触发读一次 transcript（UserPromptSubmit / Stop / SessionEnd，SessionStart 补做），有新的就提取、就传——
+用户 09-14 原话：「hook触发的时候采集一下，有就传」，没有实时的要求。打断没有专属事件，所以它在落进 transcript 之后的下一次 hook
+被读到；`transcript_path` 是异步写的、可能落后于内存里的对话（hooks.md:756），Stop 时读到的可能缺本轮最后几条，下一次 hook 补上。
+都不是缺口，是机制。
+
+#### 5.3 增量副本的规则
+
+- 每个 transcript 文件一个 byte offset，存 `~/.vibetrail/state/<sid>.json`；每次只复制到源文件**最后一个换行符**为止（源可能正在写半行）。
+- 源文件长度 < offset 时从 0 重读（重写守卫）。transcript 目前是 append-only，但 `file-history-snapshot` 带 `isSnapshotUpdate` 字段，
+  不能假设永远是。
+- 首次全读、无单次上限。Pilot 首次只读最后一轮、单次超过 50 MB 只读尾部，那份 111 MB 的会话前段整个丢掉，4 条拒绝没了
+  （[采集清单 §1.2b](third-party/loongsuite-pilot-collection.md)）。
+- 子 agent 文件按 `<sid>/subagents/` 目录扫，不只信 hook 递来的那一个路径——teamai 栽在这里，58% 的人拒在子 agent 文件里
+  （[对比 §3.2](third-party/teamai-cli-vs-vibetrail.md)）。
+- 产物写临时文件 + 原子 rename；每个会话一个目录，多 worktree 并发不共享文件，不加锁（Pilot ⑤）。
+- 失败日志只留元数据，不留 payload（[对比 §6.1b](third-party/teamai-cli-vs-vibetrail.md)）。
+- spool 里的文件**不压缩、人能直接读**：它就是用户现阶段要看的「输出内容」（09-14 原话），也就是 push 会发的东西；压缩只在传输层做
+  （`Content-Encoding: gzip`）。倾向的布局：`~/.vibetrail/spool/<项目键>/<sid>/` 下 `transcript/…`（逐字节副本，路径照源）、`events.jsonl`
+  （hook 事件流 + git 富化）、`diverge.jsonl`（分歧）、`manifest.json`（每个文件的 offset、sha、版本、push 水位）。
+
+#### 5.4 hook 纪律（G11 第六轮审计 + 本次核官方文档）
+
+`exit 0`；stdout 为空（SessionStart / UserPromptSubmit 的 stdout 会进模型上下文，hooks.md:810）；每条显式 `timeout`；命令用绝对路径、
+不依赖 PATH——desktop 启动的 hook 拿到什么 PATH 未测，jq 的路径要写死或随运行时带（Pilot ⑧）；`-p` 模式下 async hook 在会话结束时被杀
+（hooks.md:3652），靠下一次 SessionStart 补做兜底；所有 hook 并行跑（hooks-guide），与被观测仓自己的 Stop hook（agentDock 有三个）互不等待。
+
+### 6. 落盘、去向、隐私
+
+| | 全量 | 分歧 |
+|---|---|---|
+| 去向 | **云端**，hook 经 HTTP push（用户 09-14 原话）。现阶段云端还没有：本机 `~/.vibetrail/spool/<项目>/<sid>/`（0700）里的文件就是将来 push 的内容，先让人看（同日原话「暂时先缓存本地文件让我看输出内容，保留push动作」）；push 动作第一版就在，端点未配置时不发只记账。**不进 git** | 同左，同一条通道；仓内 `sessions/` 投影**停用**（「不存git了」） |
+| 与 D1 / D2 的关系 | **两路都不进 git，D1 / D2 对 G7 的数据不再适用**，记为 DESIGN D4。D1「随代码走、team 可见、换机器不丢」三条诉求改由云端承担，云端没配之前只有本机；D1 否掉的「上报外部服务」正是现在的去向，否决理由不作废，变成 push 前的要求：G8 门控、失败日志不留 payload；脱敏（K6）用户 09-14 定暂不考虑，先原样传。D1 / D2 仍管的只剩 `audits/` 与 commit trailer，它们是否也搬出仓暂不定（§9） | 同左；仓内 `sessions/` 投影停用，`vibetrail-sync` 退役，查询端改读 spool |
+| push 怎么传 | 端点在 `~/.vibetrail/config` 里配，没配就不发（spool 完整保留，`vibetrail push --list` 看待发清单）。配了：分块增量，按 byte offset 传新增部分，单会话 106 MB 不能一次 POST；传输层 gzip，spool 文件本身不压缩；幂等键 = 会话 id + 文件 + offset，重发不重复；服务端 ack 之后才推进 push 水位；失败留 spool，下次 hook 顺手重发；失败日志只留元数据（Pilot 的 `sls-failed-logs` 形态，不是 teamai 那种整份 context 落盘）。端点、鉴权、schema、谁能看**暂不定** | 事件级，每条带 sid + turn uuid；其余同左 |
+| 保留 | 端点未配置前 spool 不删，它就是全部。配置后：ack 即删，还是留 N 天供 G9 本地查看，暂不定；云端保留期暂不定。仍然要在会话自己的 Stop / SessionEnd 里落 spool，SessionStart 补做只是兜底——transcript 清理在启动时跑（本机 `~/.claude/.last-cleanup` 今天启动时刷新），CLI 会话默认 30 天，可能先于我们的 hook 把源删掉 | 同左 |
+| 体积 | 本机 40 个主会话 700 MB（主 376 + 子 308），最大单文件 106 MB，分布 <1 MB 11 / 1–10 MB 21 / 10–50 MB 7 / >50 MB 1。上传量同量级，分块与压缩是必需项不是优化 | KB 级（实测约 1,800 倍压缩） |
+| 隐私 | 含 stdout 里的密钥、代码、thinking、绝对路径、`bridge-session` 的账号与组织 uuid、hostname。**暂不脱敏**（用户 09-14：「暂时先不考虑脱敏」），先原样传。K6 留着，将来做时套在出本机那一层（三层准入：白名单 / 按 key 名拒 / 长度上限），本机缓冲永远原样，到时按 teamai 三分法把计数 / 文本 / 身份路径分开审。在那之前，云端「谁能看」（§9）是唯一的闸 | K6 的 `desc` / `cwd` 两处，同样暂缓 |
+
+### 7. 与其他条目的关系
+
+- **G2、G3 由此消失**：分歧谁写、何时写（Stop / UserPromptSubmit / SessionEnd 的 hook 写 spool，仓内 `sessions/` 停用）；「每人跑过 install」这件事不复存在
+  （机器级装一次；git hook 若保留则由 SessionStart 自动装）。
+- **G8**：用户级条目下，门控在分发入口按 `~/.vibetrail/projects` 判，未登记直接退出——teamai 是 fail-open 到处采，我们不是；项目级条目本身就是登记。
+  清单粒度与登记方式仍暂不定。
+- **G9**：本地展示读本机缓冲（上传前的原样）与已上传清单，先有东西才有得看；「不采什么」「什么出了本机」的声明按 §3.1 的清单逐类型写。
+- **K6**：暂不做（用户 09-14），不挡上传；G9 的「什么出了本机」声明因此更要如实。
+- **D1 / D2**：两路数据不进 git，仓内 `sessions/` 停用；D1「不上报外部服务」的否决被推翻。都记在 DESIGN D4。`audits/` 与 trailer 是否跟着搬，暂不定。
+- **G10**：钉子有了明确形状——全量 = 字节数与每类记录条数进出相等；分歧 = fixtures；hook = scenario.json 回放（Pilot / teamai 已经这样回放过一次）。
+- **G6**：hook 事件流的类型化信号与字符串判据对账（§5.2）；doctor 加一项「本机语料里出现了已知清单之外的 `type` / `attachment.type` / hook 事件名」，
+  把「每次升级查一遍类型化字段」从提醒变成机制。
+- **G11**：SessionStart / CwdChanged 是同一个挂载点；全量副本就是 G11 §10「定期把 transcript 存一份」那条路的答案；`worktree-state` 记录与
+  `~/.claude/sessions/<pid>.json`（当前活着的会话：pid、sessionId、cwd、version、entrypoint）可直接用于接手检测。
+
+### 8. 问题与要补充的（2026-09-14 审需求）
+
+1. **「全」没定义就没法验收。** 照 Pilot 的事件模型走，§3.2 的清单永远补不完——它漏的是结构性的（按 promptId 分轮）。定义成
+   「副本 ⊇ 源」之后，完整性一条断言就能验，Pilot 那三种漏法从机制上不存在。
+2. **去向推翻了 D1，要记成决策，不是留成矛盾。** 用户 09-14 先说「我从来没说要放git，我会用hook把他用http的方式传云端」，再说「不存git了」。D1 当初否掉
+   「上报 OTel / 外部服务」（理由：发到外部等于发布，stdout 可能含 API key、内部路径）；现在这正是两路的去向，而且仓内投影也停了。否决理由不作废，
+   转成 push 前的要求（G8、失败日志不留 payload；脱敏暂不做，见第 8 条）。README「留痕数据落在被观测的那个仓里」要改成「采集数据在本机 spool、push 云端；
+   仓内只剩审计记录与 commit trailer」。已记 DESIGN D4。
+3. **「和 teamai 一样」有两处可能不一样。** teamai 的分发层 fail-open、没 init 的目录一样采——我们要 G8 的门控（用户级条目下）。teamai 不碰 git hook——
+   我们的 commit ↔ session 是主线，靠 trailer 还是靠全量副本里的 git 富化推出来，§9 暂不定；留 trailer 也不再要人每 clone 装。边界：harness hook
+   （+ 可能的 git hook），不进 shell rc、不注入进程、不常驻。
+4. **hook 挂用户级还是项目级——已定：两级都做、可配置**（用户 09-14）。确认机制本次查清：交互会话下所有 settings 文件的 hook 都等目录级 trust 确认，
+   用户级也一样；项目级 hook 在 desktop 下实证真跑。剩「默认哪级」暂不定，倾向用户级 + 清单，理由在 §4。注意 teamai 的 `--scope project` 并不把
+   hook 写进仓，写进仓的是它的 self 模式；「参考 teamai」参考的是后者。
+5. ~~**分歧一路做不到实时，要把时效写进需求。**~~ **撤回**——用户 09-14：「什么时候说实时了，hook触发的时候采集一下，有就传」。
+   需求里从来没有实时这一条；机制照 §5.2，每次 hook 触发读一次、有新的就提取就传。打断没有专属事件、transcript 异步写可能缺尾，
+   只决定它在哪一次 hook 被读到，不是缺口。
+6. ~~**「一个命令」要装两层运行时。**~~ **撤回**——两路不进 git 之后，G7 的运行时只有机器级 `~/.vibetrail/bin/` 一份。仓内 vendor 只剩审计闸门
+   （CAPABILITIES §2.5 的 fail-closed）还在用，不属 G7；项目级条目写 `$HOME/.vibetrail/bin/…`，没装运行时的机器静默不采、doctor 报。
+7. **上游已经有几个类型化信号，比字符串判据可靠，先量再用。** 本机语料：`queue-operation remove reason=absorbed_mid_turn` 296 条
+   （人在模型干活时插话——没有任何字符串匹配）；`edited_text_file` 327 条（磁盘侧改动，实测是 agent 的 Bash 改的）；`hook_blocking_error`
+   332 条（我们自己的闸门拦停）；hook 事件 `PermissionDenied` / `StopFailure` / `Notification:permission_prompt`。都先按 spec §3.2 的
+   方式量精确率，再决定加不加 kind——`correction` 那类启发式仍挡在门外。
+8. **隐私暴露面比现在大一个量级，脱敏暂不做。** 现在仓内只有四处自由文本（K6）；全量副本含密钥（stdout）、代码、thinking、绝对路径、
+   账号 uuid，原样上云。用户 09-14：「暂时先不考虑脱敏」，K6 暂缓、不挡 G7。在那之前能做的只有：本机缓冲 0700、token 不进仓、
+   云端「谁能看」（§9）、G9 如实展示「什么出了本机」；`bridge-session` 一类身份记录先单列出来，将来做脱敏时第一批处理。
+9. **体积与清理竞态。** 本机 700 MB / 40 会话、单个 106 MB；副本翻倍。transcript 清理在启动时跑、可能先于 hook，所以副本要在会话
+   自己结束前落下，SessionStart 补做只是兜底。保留期与压缩要定。
+10. **版本漂移是常态，每条记录都要带版本。** 判据靠英文串；`prompt_snapshot` 只在 ≥ 2.1.258；hook 事件集随版本变（文档列 30 余种，
+    2.1.260 bundle 里 33 种）；同一台机器 CLI（`/opt/homebrew/bin/claude` 2.1.12）与 desktop 自带（2.1.266）并存。transcript 每条自带
+    `version`；hook 事件流要记 `hook_event_name` 与版本；doctor 报版本与未知事件。
+11. **完整性钉子（G10）要落成断言**：全量 = 字节数相等 + 每类记录条数进出相等；分歧 = fixtures 全绿；hook = scenario.json 回放。
+    Pilot 那条漏斗恒等式只写在文档里、grep 不到断言，别重蹈。
+12. **hook payload 里的 `tool_input` / `tool_response` 不要再存一份。** transcript 全有；Pilot 每份内容出现 3 次就是这样来的。
+    只存 transcript 没有的：事件名、时间、`tool_use_id`、错误类型、reason、`agent_id`。
+13. **Stop 用 `async: true`，SessionEnd 只做 1.5 s 内的事。** 重活（上百 MB 的增量复制、跑 jq）放 Stop 异步；SessionEnd 只记 reason；
+    `-p` 模式 async 会被杀，靠 SessionStart 补做。
+14. **子 agent 的收尾晚于父 Stop。** 后台子 agent 在父 Stop 之后才 SubagentStop（Pilot 用 `pending_subagent_turns` 门控）；副本按目录扫、
+    SubagentStop 也触发一次，就不用那套门控。
+15. **只做 Claude Code。** Codex / Cursor 一起采的代价见 [对比 §6.3](third-party/teamai-cli-vs-vibetrail.md)（Pilot `fix:feat = 181:82`，
+    三分之一代码在适配各家格式）；地基（hook 热加载、`CLAUDE_CODE_SESSION_ID` 等于文件名）也是 Claude Code 特有的实测。列为暂不定，
+    默认不做。
+16. **上传本身的要求要写进需求。** 分块增量、压缩、幂等（会话 id + 文件 + offset）、服务端 ack 后才推进 offset、鉴权 token 放本机不放仓、
+    失败日志只留元数据。Pilot 的 HTTP flusher 两处别学：每条事件是全字符串 map，且比本机 JSONL 多带 `agent.<ns>.*` 字段
+    （[Pilot 样例 §5](third-party/loongsuite-pilot-collection-sample.md)）；teamai 上报失败把整份 context 连 prompt 摘要写盘
+    （[对比 §6.1b](third-party/teamai-cli-vs-vibetrail.md)）。
+17. **云上从全量扫分歧重新可行，但本机提取仍是主路。** 09-10 否掉「云上扫」是因为 Pilot 的事件里没有打断记录；原样副本上传后云上什么都能扫。
+    本机提取保留的理由：两路解耦（全量一路关掉或脱敏后分歧一路照常）、无云也能用、已实现。云上重扫作对账：两边数字对不上就是判据漂了（G6）。
+18. **项目级条目「clone 即得」以机器装过运行时为前提。** 和 teamai 一样：条目 `|| true`，没装的机器静默不采。要有一次性提示（首次碰到条目而运行时缺失时
+    写一条到 `~/.vibetrail/`，doctor 与 `vibetrail status` 显示），否则「clone 即得」在新人机器上会静默失效而无人知道。
+19. **spool 就是输出内容，不是中间产物。** 用户现阶段要看的是它（「暂时先缓存本地文件让我看输出内容」），G9 的本地展示直接读它；所以文件要可读、不压缩、
+    按会话分目录、带 manifest；push 只做传输，不改内容。云端有了以后这一条也不变。
+20. **不存 git 之后，查询端要跟着搬。** `vibetrail show / log / session / diverge` 现在读仓内 `sessions/`；停用后改读 spool（本机）或云端。`vibetrail-sync`
+    退役，它的 jq 提取逻辑进 hook。D1 的「team 可见、换机器不丢」在端点配置之前是没有的——只有本机；这是用户明确接受的现阶段状态。
+21. **git hook 去留要定，两条路都成立。** 留：trailer 让 `git log` 直接可见会话 id，不依赖任何工具，由 SessionStart 在登记过的仓里自动装，人不再手跑；
+    代价是 SessionStart 往别人的 `.git/hooks` 写东西，与已有 hook 冲突时只能报不能装。不留：从全量副本的 git 富化（每轮起止 HEAD）与 Bash 的
+    `git commit` stdout 推出 commit ↔ session，零 git 侧安装，但推断要处理一轮多 commit、rebase 改 sha，且 D1 的主线论述要改。§9 暂不定。
+22. **双挂时的重复触发。** 同一仓两级条目并存，Claude Code 各跑一次；分发入口按 `--scope` 参数识别来源，采集按 offset、push 按幂等键，
+    结果不重复（A8）；但 doctor 要提示「双挂」，免得升级时一边换了一边没换。
+
+### 9. 待定（先记录、暂不定）
+
+- 全量一路的格式：原样存 transcript（§3.1 倾向），还是像 Pilot 那样规范化成事件。若原样存，是否连 `~/.claude/file-history/` 一起（Edit / Write
+  的改前整份文件 transcript 的 `originalFile` 已有，倾向不存）。
+- 默认 scope 是用户级还是项目级（两级都做已定；§4 倾向用户级 + 清单）。
+- git `prepare-commit-msg` 的去留（§8 第 21 条两条路）。
+- `audits/` 与仓内 vendor 是否也搬出仓：不属 G7 两路，D1 / D2 对它们暂仍有效。
+- 登记方式（G8）：init 时顺手登记 / `vibetrail projects add` / 项目级条目即登记，三种并存还是选一种。
+- 我们自己挂 hook，还是改造 Pilot（同 G11 §10）。用户 09-11：「肯定不止靠pilot，我知道他做不到，要改造」。
+- 云端是什么服务、端点与鉴权、push 的 schema（原样字节流，还是 Pilot 那样的事件）、谁能看：与 G8（限定项目）、G9（本地展示）一起定；端点没配之前
+  push 不发，所以这一项可以最晚定。脱敏（K6）暂不考虑，不在这次一起定。
+- spool 的保留：端点配置后 ack 即删还是留 N 天；云端保留期；传输层压缩格式。
+- README「边界」段与 FLOW / CAPABILITIES 的改口措辞（决策本身已记 DESIGN D4）。
+- §8 第 7 条那几个类型化信号要不要成为新的 kind。
+- Codex、Cursor 要不要一起采（默认不做）。
+
+### 10. 拆解
+
+- [ ] 定 §9 里的格式、默认 scope、git hook 去留三项（云端服务可以最晚定：端点没配之前 push 不发）。
+- [ ] 机器级安装：`vibetrail init [--scope user|project]`——`~/.vibetrail/bin` + settings 条目（带 marker，项目级写 `$HOME` 路径）+ 登记 + `config`；
+  `vibetrail uninstall`；doctor 扩展（§4）。
+- [ ] 分歧一路：`extract-diverge.jq` 挂到 UserPromptSubmit / Stop / SessionEnd / SessionStart，带 offset 增量与补做，写 spool；仓内 `sessions/` 停用，
+  `vibetrail-sync` 退役、查询端改读 spool。
+- [ ] 全量一路：增量副本（§5.3）+ hook 事件流（只存 transcript 没有的）+ git 富化 + `InstructionsLoaded`，写 spool；先做 Claude Code。
+- [ ] push：`vibetrail push [--list]`，端点从 `~/.vibetrail/config` 读、没配不发；配了走分块 + 传输层 gzip + 幂等 + ack 推进水位 + 失败重发；Stop 异步顺手调；
+  测试对手先用一个只记录请求的桩端点（Pilot / teamai 实跑样例就是这么截的）。
+- [ ] 完整性钉子：字节相等、每类记录条数进出相等、未知记录类型 / 事件名告警（G10、G6）。
+- [ ] 回归：两路各有带断言的测试，输入用 [experiments/collect-demo/scenario.json](experiments/collect-demo/scenario.json) 回放（补上 SessionStart 补做、
+  打断后无 Stop、后台子 agent 晚于父 Stop、双挂、端点未配置 / 配置后断网五个场景）。
+- [ ] 回写文档：README「边界」；FLOW / CAPABILITIES 的 ①②④ 段；OPEN-ISSUES 关 G2 / G3；DESIGN D4 已记。
 
 ## G11 多个会话改、一个会话提交：追回每一行出自哪个会话
 
