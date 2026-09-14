@@ -5,7 +5,8 @@
 # 它替代的是「0 字节 marker」：只记「审过了」，不记「审了什么、报了几个、几真几假」，
 # 于是命中率这类数字只能人肉从对话里数，而对话会被压缩掉。
 #
-# 锚用 patch-id 不用 sha —— sha 在 rebase 后就变（实测本仓 294 个旧 marker 已有 4 个失效）。
+# 锚是 commit message 里的 Vibetrail-Id trailer（spec §4）。不用 sha —— rebase 后就变（实测本仓 294 个旧 marker
+# 已有 4 个失效）；也不再用 patch-id —— 冲突 rebase 下必变（spec §4.0）。
 set -uo pipefail
 SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$(git rev-parse --show-toplevel)" || exit 1
@@ -29,7 +30,7 @@ anchor(){
 cmd_record(){
     local sha kind; sha=$(git rev-parse "${1:-HEAD}") || exit 1; kind=${2:-audit}
     local pid
-    pid=$(anchor "$sha") || { echo "✗ 锚算不出来（git / patch-id / awk 有问题），未写记录" >&2; exit 1; }
+    pid=$(anchor "$sha") || { echo "✗ 这个 commit 没有 Vibetrail-Id trailer（装 hook 之前提交的，或 message 被手改过），未写记录" >&2; exit 1; }
     if [ -z "$pid" ]; then
         echo "✓ 锚为空（无冲突 merge / 空 commit）—— 按 spec §4.0 无需审计，未写记录"
         return 0
@@ -74,7 +75,7 @@ cmd_record(){
 cmd_show(){
     local sha; sha=$(git rev-parse "${1:-HEAD}") || exit 1
     local pid; pid=$(anchor "$sha")
-    [ -z "$pid" ] && { echo "  锚为空 —— 无需审计"; return 0; }
+    [ -z "$pid" ] && { echo "  无 Vibetrail-Id trailer：装 hook 之前的 commit，或 message 被手改过 —— 审计闸门会拦（spec §4.1）"; return 0; }
     local f="$OUT/$pid.jsonl"
     [ -f "$f" ] || { echo "  无审计记录（锚 ${pid:0:12}…）"; return 0; }
     jq -rc '"── \(.kind)  \(.timestamp)  by \(.sessionId // "?" | .[0:8])…",
@@ -98,7 +99,7 @@ cmd_stats(){
 }
 
 # 专供闸门（Stop hook 等）调用：退出码即答案，锚的判据不需要在调用方复制一份。
-# 0 = 该 kind 的记录已存在，或锚为空（无需审计）；1 = 缺记录
+# 0 = 该 kind 的记录已存在；1 = 缺记录，或没有锚（fail-closed，spec §4.1）
 cmd_check(){
     local sha kind; sha=$(git rev-parse "${1:-HEAD}" 2>/dev/null) || return 1; kind=${2:-audit}
     local pid

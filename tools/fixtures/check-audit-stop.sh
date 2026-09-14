@@ -36,8 +36,8 @@ if [ -z "$risky_files" ]; then
     exit 0
 fi
 
-# 判据只有一处，在 vibetrail-audit 里：锚是 git patch-id（跨 rebase 稳定），
-# 不是 sha（本仓 294 个旧 marker 已有 4 个因 rebase 失效）。
+# 判据只有一处，在 vibetrail-audit 里：锚是 commit message 里的 Vibetrail-Id trailer（spec §4），
+# 不是 sha（本仓 294 个旧 marker 已有 4 个因 rebase 失效），也不再是 patch-id（冲突 rebase 下必变）。
 # 缺 vendored 运行时时**放行**——闸门 fail open 好过因工具缺失卡死所有人；
 # 该情形由 vibetrail-doctor 报出来。
 VA=.claude/vibetrail/vibetrail-audit

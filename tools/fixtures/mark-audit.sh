@@ -5,7 +5,8 @@
 # 报了几个、几真几假」——于是命中率这类数字只能人肉从对话里数，而对话会被压缩掉。
 # 现在写结构化记录，数字由 `mark-audit.sh stats` 算出来。
 #
-# 锚从 sha 换成 git patch-id：sha 在 rebase 后就变（本仓 294 个旧 marker 已有 4 个失效）。
+# 锚先从 sha 换成 git patch-id，后来又换成 Vibetrail-Id trailer（spec §4.0）：sha 在 rebase 后就变
+# （本仓 294 个旧 marker 已有 4 个失效），patch-id 在冲突 rebase 下必变。
 # 判据只有一处，在 .claude/vibetrail/vibetrail-audit 里，本脚本只是薄封装。
 #
 # 用法:

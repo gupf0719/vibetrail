@@ -33,13 +33,12 @@ SPEC=$(sed -n '/^## 4\. 审计记录/,/^### 4\.0/p' "$SELF/../spec/trace-v1.md" 
 EXPECT=$(eval "${SPEC//<sha>/HEAD}")
 ck "锚与 spec §4 一致" "$EXPECT" "$(basename "$(ls .claude/trace/audits/*.jsonl)" .jsonl)"
 
-# 有冲突解决的 merge：锚必须非空 —— 这是唯一能验出 --cc 的场景。
-# 普通 commit 上 --cc 与不加**结果逐字相同**，所以只用普通 commit 的断言是假绿
-# （实测：去掉 --cc 后原测试照样通过）。
+# 有冲突解决的 merge：锚（它自己的 Vibetrail-Id）必须非空，记录照写。
+# 换锚之前这里算的是 --cc 的 patch-id —— 那是旧机制，--cc 现在与锚无关。
 git checkout -q -b conf; printf 'C\n' > f; git add f; git commit -q -m c
 git checkout -q main; printf 'M\n' > f; git add f; git commit -q -m m
 git merge conf >/dev/null 2>&1; printf 'R\n' > f; git add f; git commit -q --no-edit
-CONF_ANCHOR=$(git diff-tree -p --cc --root HEAD | git patch-id --stable | awk 'NR==1{print $1}')
+CONF_ANCHOR=$(git log -1 --format='%(trailers:key=Vibetrail-Id,valueonly)' HEAD | tr -d '[:space:]')
 ck "有冲突 merge 锚非空" "yes" "$([ -n "$CONF_ANCHOR" ] && echo yes || echo no)"
 before2=$(ls .claude/trace/audits/*.jsonl 2>/dev/null | wc -l | tr -d ' ')
 printf '%s' "$F" | "$SELF/vibetrail-audit" record HEAD audit >/dev/null 2>&1
@@ -76,6 +75,15 @@ covered_before=$("$SELF/vibetrail-audit" stats 2>/dev/null | jq -r '."覆盖 com
 echo n2 > n2f; git add n2f; git commit -q -m "第二个 commit"
 printf '%s' "$F" | "$SELF/vibetrail-audit" record HEAD audit >/dev/null 2>&1
 ck "新 commit 让覆盖数 +1（N≥2 才测得出）" "$((covered_before+1))" "$("$SELF/vibetrail-audit" stats 2>/dev/null | jq -r '."覆盖 commit 数"')"
+
+# —— 查询端 vibetrail show 必须读到同一份记录 ——
+# 它曾按 patch-id 拼文件名去找，而记录按 Vibetrail-Id 命名，于是永远显示「无」、测试却全绿：
+# 此前没有任何用例调过 vibetrail show（2026-09-14 实跑发现，见 spec/trace-v1-sample.md §6）。
+# HOME 指向空目录：查询端会按 Claude-Session 去 ~/.claude/projects 找 transcript，别碰真实数据。
+ck "vibetrail show 读到审计记录" "1" "$(HOME="$T/nohome" "$SELF/vibetrail" show HEAD 2>/dev/null | grep -c 'audit  finding 2 条')"
+# HEAD~1 是上面「无锚 commit」：锚为空的含义已变成「没有 trailer」，不再是「无需审计」
+ck "无锚 commit：vibetrail show 说出缺 trailer" "1" "$(HOME="$T/nohome" "$SELF/vibetrail" show HEAD~1 2>/dev/null | grep -c '无 Vibetrail-Id trailer')"
+ck "无锚 commit：vibetrail-audit show 说出缺 trailer" "1" "$("$SELF/vibetrail-audit" show HEAD~1 2>/dev/null | grep -c '无 Vibetrail-Id trailer')"
 
 echo
 if [ $fail -eq 0 ]; then echo "  ✅ $pass/$((pass+fail)) 通过"; else echo "  ❌ $fail/$((pass+fail)) 失败"; exit 1; fi

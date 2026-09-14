@@ -14,7 +14,9 @@ die(){ echo "✗ $*" >&2; exit 1; }
 sess_of(){ git log -1 --format='%(trailers:key=Claude-Session,valueonly,separator=)' "$1" 2>/dev/null | tr -d '\n'; }
 # sid → transcript 路径（含子 agent 目录）；找不到返空
 tpath(){ find "$PROJ" -name "$1.jsonl" -maxdepth 3 2>/dev/null | head -1; }
-patchid(){ git diff-tree -p --cc --root "$1" 2>/dev/null | git patch-id --stable | awk 'NR==1{print $1}'; }
+# 审计锚 = commit message 里的 Vibetrail-Id trailer（spec §4），与 vibetrail-audit 的 anchor() 同一判据。
+# 曾按 patch-id 拼文件名去找，换锚时没跟上，于是永远显示「无」（test-audit.sh 钉着）
+vid_of(){ git log -1 --format='%(trailers:key=Vibetrail-Id,valueonly)' "$1" 2>/dev/null | head -1 | tr -d '[:space:]'; }
 
 cmd_show(){
     local ref=${1:-HEAD}
@@ -53,16 +55,16 @@ cmd_show(){
           | head -10
     fi
 
-    local pid; pid=$(patchid "$sha")
+    local vid; vid=$(vid_of "$sha")
+    local aud; aud="$(git rev-parse --show-toplevel)/.claude/trace/audits/$vid.jsonl"   # 在子目录里跑也找得到
     echo
     echo "── 审计记录 ──────────────────────────────────"
-    if [ -z "$pid" ]; then
-        echo "  锚为空（无冲突 merge / 空 commit）—— 按 spec §4.0 无需审计"
-    elif [ -f ".claude/trace/audits/$pid.jsonl" ]; then
-        jq -rc '"  \(.kind)  finding \(.findings|length) 条  by \(.sessionId[0:8])…"' \
-          ".claude/trace/audits/$pid.jsonl" 2>/dev/null
+    if [ -z "$vid" ]; then
+        echo "  无 Vibetrail-Id trailer：装 hook 之前的 commit，或 message 被手改过 —— 审计闸门会拦（spec §4.1）"
+    elif [ -f "$aud" ]; then
+        jq -rc '"  \(.kind)  finding \(.findings|length) 条  by \((.sessionId // "?")[0:8])…"' "$aud" 2>/dev/null
     else
-        echo "  无（锚 ${pid:0:12}…）"
+        echo "  无（锚 ${vid:0:12}…）"
     fi
 }
 
