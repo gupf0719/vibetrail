@@ -3,7 +3,7 @@
 #
 #   bash experiments/collect-demo/demo.sh [沙箱目录]
 #
-# 1. 在沙箱里建一个 git 仓当被观测项目，在仓里跑 vibetrail init（写沙箱的 settings.json、登记本仓）
+# 1. 在沙箱里建一个 git 仓当被观测项目，跑 vibetrail init（写沙箱的 settings.json；init 不登记任何仓），再 projects add 登记它
 # 2. 按 scenario.json 回放一段会话：往沙箱的 transcript 追加记录；轮到 hook 时，用沙箱 settings.json 里 init 真实写下的那条命令去跑，
 #    stdin 给 Claude Code 同样形状的 payload（prompt_id 取当轮的 promptId）。第 1 轮中途在仓里真的提交一次，演示 commit ↔ 轮次。
 #    每次 Stop 之后再写一条 stop_hook_summary：Claude Code 的「答完」标记，desktop 要等下一句人话才把它落盘（09-15 核过），所以 turn.end 不等它，Stop 时就发（DESIGN D7）。
@@ -29,8 +29,8 @@ rm -rf "$REPO"; mkdir -p "$REPO" "$(dirname "$VIBETRAIL_CLAUDE_SETTINGS")"
   && git remote add origin git@example.com:demo/demo-proj.git )
 printf '{\n  "permissions": {"allow": ["Bash(ls:*)"]}\n}\n' > "$VIBETRAIL_CLAUDE_SETTINGS"   # 用户原有的 settings，装卸都不能动它
 
-hr "1. 安装：在被观测仓里跑一次 vibetrail init"
-( cd "$REPO" && bash "$TOOLS/vibetrail" init )
+hr "1. 安装：跑一次 vibetrail init，再登记要采的仓（init 不会自己加）"
+( cd "$REPO" && bash "$TOOLS/vibetrail" init && bash "$TOOLS/vibetrail" projects add )
 echo; echo "沙箱 settings.json 里现在的 hook 事件（原有的 permissions 原样保留）："
 jq -c '{permissions, hook_events: (.hooks | keys)}' "$VIBETRAIL_CLAUDE_SETTINGS"
 echo "其中 Stop 那一条："; jq -c '.hooks.Stop' "$VIBETRAIL_CLAUDE_SETTINGS"

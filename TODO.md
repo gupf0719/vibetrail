@@ -18,7 +18,7 @@
 > 同日做完下面前四项，演示见 README「演示」一节与 `experiments/collect-demo/demo.sh`。
 
 - [x] 机器级安装（09-15）：`tools/vibetrail init [--scope project|user] [--no-register] [--events auto|core|all]`——`~/.vibetrail/bin`（MANIFEST）+ HOME settings 条目
-  （按命令里的 `vibetrail-hook` 认，改前备份）+ `config`（scope、jq 绝对路径、device_id、turn_idle_close、push 两个门槛）+ 登记本仓；`uninstall [--purge]`；`projects`；
+  （按命令里的 `vibetrail-hook` 认，改前备份）+ `config`（scope、jq 绝对路径、device_id、turn_idle_close、push 两个门槛）+ 登记本仓（09-16 起 init 不再登记，`projects pick / add` 自己加）；`uninstall [--purge]`；`projects`；
   `doctor`（运行时、jq、条目、事件兼容、scope 与登记、积压、落后、错误日志）。**只登记本机每个 Claude Code 都认识的事件**：有错的 settings 会被整个跳过（DESIGN §5）。
   被观测仓零写入（A8）：demo.sh 与 desktop 实跑都核过。doctor 还缺 `stop_hook_summary` 证据与未知类型告警（随完整性钉子）。
 - [x] hook 分发入口（09-15）：`vibetrail-hook` 接 12 个事件（09-15 加 PermissionRequest 成 13 个），发 session / turn.start / subagent 起止与 `ext.claude.*` 事件头，git 状态（`vt_git_snapshot`），
@@ -54,7 +54,8 @@
   演示报告第一块下面有每个会话的调用明细。
   重采后核出 5 处（重写副本、连续调用的开始时间、工具结果夹在调用中间、子 agent 读到半截、起读行越过未写出的调用），逐条对照 Pilot 与 teamai 后修掉（DESIGN D8 表）。
 - [x] settings 备份照 Pilot 改（09-15，用户问「backup的目的是啥」）：没变化不写、写前核对没被别人改过、装之前的原样只存一次永不覆盖。
-- [x] 项目级选项目（09-16，用户：「init后好像没选项目」）：init 在终端里列出用过 Claude Code 的仓让人选、总列出登记表，`projects pick`；
+- [x] 项目级选项目（09-16，用户：「init后好像没选项目」「一个项目都不会加，等用户自己add」）：init 不登记也不问，只列出登记表与用过 Claude Code 的仓；
+  `projects pick` 选（编号前加 - 去掉）、`projects remove --drop` 连待发数据挪出 spool（留一天，用户：「不要7天，一天吧」）；
   补采按各自的仓记（登记两个仓会记错，加多选时查出）；写 settings 两道保险——临时运行时写真实 settings 拒绝、写完自检不对就还原（DESIGN D11）。
 - [x] commit ↔ 轮次推导（09-15）：轮起 / 轮止快照（`state/<sid>/turns/`），本轮 commit = `rev-list 起..止` + 本轮 reflog 里新建的提交，归因看 transcript 里 agent 有没有跑
   `git commit`（DESIGN §3.5）；demo.sh 第 1 轮中途真的提交一次，turn.end 带上了。原写的「`vibetrail show` 按 commit 查改走它」不做了：按 commit 查是读取端的事（D5），

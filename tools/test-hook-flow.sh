@@ -255,6 +255,12 @@ vcli(){ ( cd "$REPO" && VIBETRAIL_HOME=$IS/.vibetrail VIBETRAIL_CLAUDE_SETTINGS=
 nhook(){ jq '[.. | objects | select(has("command")) | .command | select(test("vibetrail-hook"))] | length' "$IS/.claude/settings.json"; }
 vcli init --no-register; n1=$(nhook); vcli init --no-register
 check "两次 init：model 还在、条目没翻倍；第二次没变化，不写也不多备份；装之前的原样另存了一份" '[ "$(nhook)" = "$n1" ] && [ "$n1" -gt 0 ] && jq -e ".model == \"opus\"" "$IS/.claude/settings.json" >/dev/null && [ "$(ls "$IS/.vibetrail/backup"/settings.json.2* | wc -l | tr -d " ")" = 1 ] && jq -e ". == {model: \"opus\"}" "$IS/.vibetrail/backup/settings.json.before-vibetrail" >/dev/null 2>&1'
+IS2=$T/init-home2; mkdir -p "$IS2/.claude"
+check "在 git 仓里跑 init：不登记任何仓（免得在哪个目录跑一下就误加），并明说现在什么都不会采" \
+    'out=$( cd "$REPO" && VIBETRAIL_HOME=$IS2/.vibetrail VIBETRAIL_CLAUDE_SETTINGS=$IS2/.claude/settings.json bash "$SELF/vibetrail" init 2>&1 ); [ -z "$(ls "$IS2/.vibetrail/projects" 2>/dev/null)" ] && printf "%s" "$out" | grep -q "还没有登记任何仓"'
+mkdir -p "$IS2/.vibetrail/removed/old-x" "$IS2/.vibetrail/removed/new-y"; perl -e 'utime(time - 2*86400, time - 2*86400, $ARGV[0])' "$IS2/.vibetrail/removed/old-x"
+check "projects remove --drop 挪出去的数据留一天：两天前的清掉，刚挪进去的留着" \
+    'VIBETRAIL_HOME=$IS2/.vibetrail VIBETRAIL_CLAUDE_SETTINGS=$IS2/.claude/settings.json bash "$SELF/vibetrail" projects list >/dev/null 2>&1; [ ! -e "$IS2/.vibetrail/removed/old-x" ] && [ -d "$IS2/.vibetrail/removed/new-y" ]'
 mkdir -p "$T/g/home/.claude"; printf '{"model": "opus"}\n' > "$T/g/home/.claude/settings.json"; g0=$(cksum < "$T/g/home/.claude/settings.json")
 check "运行时在临时目录、settings 不在（模拟测试漏设 VIBETRAIL_CLAUDE_SETTINGS）：init 拒绝写，settings 一字不动" \
     '! ( cd "$REPO" && VIBETRAIL_HOME=$T/g/tmpvt VIBETRAIL_CLAUDE_SETTINGS=$T/g/home/.claude/settings.json VIBETRAIL_TMP_ROOTS=$T/g/tmpvt bash "$SELF/vibetrail" init --no-register --no-pick >/dev/null 2>&1 ) && [ "$(cksum < "$T/g/home/.claude/settings.json")" = "$g0" ]'
@@ -367,8 +373,14 @@ check "在第一个仓里开会话、补采到第二个仓的会话：记在第�
     '[ "$(cat "$VT_HOME/spool/$PK2/$SIDA"/*.jsonl 2>/dev/null | jq -s -c "[length > 0, (map(.project_id) | unique), (map(.workspace_id) | unique)]")" = "[true,[\"github.com/acme/second\"],[\"$REPO2\"]]" ] && [ ! -e "$VT_HOME/spool/$PKEY/$SIDA" ]'
 check "删掉的 desktop worktree 留下的会话照样补，归主仓" '[ -n "$(cat "$VT_HOME/spool/$PK2/$SIDB"/*.jsonl 2>/dev/null)" ]'
 check "init（不在终端里跑，不问）：最后列出登记表，两个仓都在" \
-    'out=$( cd "$REPO" && bash "$SELF/vibetrail" init --no-register 2>&1 ); printf "%s" "$out" | grep -q "只采下面这些登记过的仓" && printf "%s" "$out" | grep -q "$REPO2" && printf "%s" "$out" | grep -q "· $REPO\$"'
+    'out=$( cd "$REPO" && bash "$SELF/vibetrail" init --no-register 2>&1 ); printf "%s" "$out" | grep -q "只采下面这些登记过的仓" && printf "%s" "$out" | grep -q "$REPO2" && printf "%s" "$out" | grep -qF "· $REPO"'
 
+n2=$(printf '\n' | bash "$SELF/vibetrail" projects pick 2>/dev/null | grep -F "$REPO2" | sed -n 's/^ *\([0-9][0-9]*\)\..*/\1/p' | head -1)
+check "projects pick 编号前加 - 去掉：第二个仓不再登记，它已采的数据留在 spool" \
+    'printf -- "-%s\n" "$n2" | bash "$SELF/vibetrail" projects pick >/dev/null 2>&1; ! vt_registered "$REPO2" && [ -d "$VT_HOME/spool/$PK2" ]'
+vt_register "$REPO2"
+check "projects remove --drop：不再登记，它已采、还没发出去的数据挪出 spool（到 removed/，不删）" \
+    'bash "$SELF/vibetrail" projects remove "$REPO2" --drop >/dev/null 2>&1; ! vt_registered "$REPO2" && [ ! -e "$VT_HOME/spool/$PK2" ] && ls -d "$VT_HOME/removed/$PK2"-* >/dev/null 2>&1'
 check "测试没有动真实的 settings.json（${REAL_SETTINGS}）" '[ "$( { cat "$REAL_SETTINGS" 2>/dev/null || true; } | cksum)" = "$REAL_SUM" ]'
 echo
 [ "$skipped_schema" -gt 0 ] && echo "  ⚠ 本机 python3 没有 jsonschema，协议 schema 校验跳过 $skipped_schema 处（pip install jsonschema 后重跑）"

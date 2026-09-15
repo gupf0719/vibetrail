@@ -322,7 +322,7 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
 |---|---|---|
 | 机器级（一次） | 运行时放 `~/.vibetrail/bin/`（hook 命令必须是绝对路径，触发时还不知道在哪个仓）；往 `~/.claude/settings.json` 写 hook 条目；建 `~/.vibetrail/{spool,state,projects,config}`；将来的云端鉴权 token 放 `~/.vibetrail/`（0600，teamai 的 `~/.teamai/token` 同款） | 条目按命令里的 `vibetrail-hook` 认，升级时整条换掉（Pilot 按命令认条目的做法）；改 settings 照 Pilot 的 `writeTextFileAtomic`：与现有的按 JSON 语义相同就不写（重跑 init 不多一份备份、不改人手写的格式），读进来之后被别人改过就不写（备份前、rename 前各查一次），第一次改之前的原样另存 `settings.json.before-vibetrail`、永不覆盖（Pilot 用 `COPYFILE_EXCL` 只备份一次），每次改之前再存一份带时间的（留 10 份），临时文件 + rename（09-15 用户问「backup的目的是啥」后改：原先每次重跑都备份一份，原样那份十次后就被挤掉）；读不懂的 settings 不动；不建守护进程、不改 shell rc、不注入进程 |
 | scope（可配） | `project`（**默认**，用户 09-15 定，参考 teamai）：只采登记过的项目，分发入口查 `~/.vibetrail/projects/`，未登记直接退出（G8）。`user`：本机所有目录都采，不看登记表——用户显式选才开。配置在 `~/.vibetrail/config` | 改配置即生效，hook 每次触发读一次 |
-| 登记（scope=project 的开关） | `vibetrail init` 在仓里跑时顺手登记本仓（键 = `git worktree list` 第一条的主 checkout，worktree 共享）；另有 `vibetrail projects add / remove / list`（U2）。登记表在 HOME，仓里不留痕 | 幂等 |
+| 登记（scope=project 的开关） | `vibetrail init` 不登记任何仓（用户 09-16：免得在哪个目录跑一下就误加），由人 `vibetrail projects pick`（从用过 Claude Code 的仓里选，编号前加 - 去掉）/ `add` / `remove [--drop]` / `list`；键 = `git worktree list` 第一条的主 checkout，worktree 共享（D11）。登记表在 HOME，仓里不留痕 | 幂等 |
 | 自检 | `vibetrail doctor`：运行时按 MANIFEST 校验、jq 在不在、条目在不在且指向的运行时存在、**本机每个 Claude Code 都认识登记的事件**（下一段）；scope 与本仓登记了没；spool 积压、transcript 落后（10 分钟没动还没采完）、重写次数、错误日志、端点配没配（09-15 已做）。还没做：最近 N 个会话的 `stop_hook_summary` 里有几个跑过我们的命令、本机语料里有没有已知清单之外的 `type` / `attachment.type` / hook 事件名（G6，随完整性钉子做） | — |
 | 卸载 | `vibetrail uninstall`：去掉 settings 里自家的条目（别的原样留着），删 `~/.vibetrail/bin`、state、logs；spool、config、登记表、settings 备份留着，`--purge` 才整个删。被观测仓里没有东西要还原 | — |
 
@@ -407,15 +407,20 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
 
 ## 7. 决策记录
 
-### D11 — 项目级：init 让人选项目、总列出登记表；补采按仓记；写 settings 加两道保险（2026-09-16，现行）
+### D11 — 项目级：init 不登记、由人 projects pick / add，移出可连待发数据一起挪走；补采按仓记；写 settings 加两道保险（2026-09-16，现行）
 
 用户原话：「支持项目级，默认也是项目级，但是init后好像没选项目」「改claude这些配置文件一定要小心，别改坏了或者影响用户使用」。
 
 - **选项目**：原先 `init` 只在「当前目录所在的仓」里顺手登记，不在 git 仓里跑就只打一句提示、什么都不登记，也不列出登记了哪些——默认只采登记过的仓，
-  选哪些却是隐形的。teamai 同样按当前目录定项目，但会把「Scope: project（路径）」打出来，在 home 目录下退回用户级；Pilot 不分项目。
-  现在：在终端里跑 `init` 会列出用过 Claude Code 的仓（从 `~/.claude/projects` 每个目录最近那份 transcript 的 `cwd` 推出主仓，worktree 并成一项，
-  desktop 的 worktree 删了按 `<仓>/.claude/worktrees/<名字>` 找回主仓；标出已登记与最近活跃）让人输编号选；不在终端里跑（脚本、`--no-pick`）不问。
-  最后总是列出登记表，一个都没有就明说「现在什么都不会采」。随时可以 `vibetrail projects pick` 再选。
+  选哪些却是隐形的。teamai 同样按当前目录定项目（它的项目级是把 hook 装进 `<项目>/.claude`），会把「Scope: project（路径）」打出来，在 home 目录下退回用户级；Pilot 不分项目。
+  用户接着定：「init之后默认是项目级，并且一个项目都不会加，等用户自己add……免得他在某个目录使用命令误操作加了」。现在 `init` 不登记也不问，
+  只列出登记表（一个都没有就明说「现在什么都不会采」）和用过 Claude Code、还没登记的仓；由人 `vibetrail projects pick` 选——列出用过 Claude Code 的仓
+  （从 `~/.claude/projects` 每个目录最近那份 transcript 的 `cwd` 推出主仓，worktree 并成一项，desktop 的 worktree 删了按 `<仓>/.claude/worktrees/<名字>` 找回主仓，
+  标出已登记、会话数与最近活跃），输编号登记、编号前加 `-` 去掉；或在仓里 `projects add`。
+- **移出项目**：用户问「已经采集的要移出去不采呢，teamai应该也做了吧」——teamai 在那个项目里 `uninstall` 去掉装进去的 hook，它实时上报、本机没有待发数据。
+  我们先落本机 spool 再推，所以去掉一个仓（`pick` 里 `-编号` 或 `projects remove`）之后，它已采、还没发出去的数据默认还在 spool、将来照样发；
+  `projects remove --drop` 把它们挪出 spool 到 `~/.vibetrail/removed/`，不再发，一天后由 hook / CLI 顺手删掉（用户：「不要7天，一天吧」；挪进去时重置目录时间，
+  否则 `mv` 保留原目录的旧时间、一挪进去就过期）。登记表与 `projects list` 标出每个仓 spool 里待发几块。
 - **补采按仓记**（加多选时查出的缺陷）：SessionStart / sync 的补采扫所有登记过的仓，却一直用本次 hook 所在仓的 project / workspace / spool 目录——
   登记两个仓，别的仓的会话就记到这个仓名下。现在每个仓按它自己的算。已经删掉的 desktop worktree 留下的会话目录也扫，归主仓。
 - **写 settings 的两道保险**：09-15 23:55 我新写的 test-hook-flow 第 16 段跑 `init` 时漏设 `VIBETRAIL_CLAUDE_SETTINGS`，把用户真实 settings 里
@@ -625,7 +630,7 @@ D2 的「正文与指针分开」在 D5 后反转：分歧事件自带能判责�
 
 | # | 验收 | 怎么验 |
 |---|---|---|
-| A1 | **机器级装一次**，之后新开的会话自动采，每个 clone 不再有任何手动步骤 | 新机器跑一次 `vibetrail init`；之后在任何登记过的仓开会话都采（scope=user 时本机所有目录）；doctor 全绿 |
+| A1 | **机器级装一次**，之后新开的会话自动采，每个 clone 不再有任何手动步骤 | 新机器跑一次 `vibetrail init`、`projects pick` 选要采的仓（每个仓一次，worktree 共享）；之后在任何登记过的仓开会话都采（scope=user 时本机所有目录）；doctor 全绿 |
 | A2 | **分歧不漏、轮次成对**：每类记录进出条数相等 | 同一份 transcript 上，diverge-v1 的每条命中都有对应事件（`permission.decision` / `turn.end` interrupted / `subagent.end` cancelled）；每个 UserPromptSubmit 有 `turn.start`，每个 Stop 或打断有 `turn.end`；子 agent 文件按目录扫全，条数进出相等 |
 | A3 | 分歧一路自动 | 打断 / 拒绝在下一次 hook 触发后被提取进 spool；结果与 `extract-diverge.jq` 直接跑在同一份 transcript 上逐字一致 |
 | A4 | 只采登记过的项目（G8） | scope=project：未登记的目录里开会话，本机不落任何东西。scope=user：本机所有目录都采 |

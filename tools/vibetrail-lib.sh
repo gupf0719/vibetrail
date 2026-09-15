@@ -196,6 +196,12 @@ vt_hook_turns(){ # vt_hook_turns <sid> → 一行 JSON：{<turn_id>: {start, sto
     else echo '{}'; fi
 }
 
+vt_prune_removed(){ # projects remove --drop 挪出 spool 的数据留一天，之后删掉（用户 09-16：「不要7天，一天吧」）。hook 与 CLI 每次都顺手做
+    [ -d "$VT_HOME/removed" ] || return 0
+    find "$VT_HOME/removed" -mindepth 1 -maxdepth 1 -mtime +0 -exec rm -rf {} + 2>/dev/null
+    return 0
+}
+
 vt_hook_perms(){ # vt_hook_perms <sid> → 一行 JSON 数组：PermissionRequest 记的权限框证据 [{at, tool_name, agent_id, prompt_id, permission_mode}]（K7）
     local dir="$VT_HOME/state/$1/perms"
     if ls "$dir"/*.json >/dev/null 2>&1; then "${JQ:-jq}" -s -c 'map(objects)' "$dir"/*.json 2>/dev/null || echo '[]'

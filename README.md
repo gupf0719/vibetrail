@@ -39,10 +39,14 @@ vibetrail init（每台机器一次）
 bash experiments/collect-demo/demo.sh
 ```
 
-在自己机器上装（在要采的仓里跑，顺手登记这个仓；默认 scope=project，只采登记过的仓）：
+在自己机器上装（在哪个目录跑都行，不会登记任何仓；默认 scope=project，只采登记过的仓），再选要采的仓：
 
 ```bash
 bash tools/vibetrail init
+```
+
+```bash
+~/.vibetrail/bin/vibetrail projects pick
 ```
 
 之后在这个仓里正常用 Claude Code（CLI 或 desktop 都行，settings 热加载，已开着的会话从下一次 hook 起生效）。看采了什么：

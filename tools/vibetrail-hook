@@ -56,6 +56,7 @@ set_project(){ # set_project <主 checkout 或目录> → workspace / project（
 }
 
 gate(){
+    vt_prune_removed
     scope=$(vt_conf scope project)
     main=$(vt_main_checkout "${cwd:-.}") || main=""
     if [ "$scope" = "project" ]; then

@@ -58,7 +58,7 @@ B3 删掉 `user_edited_after_agent` 进了 [spec/diverge-v1.md §2.1](spec/diver
 | **M2** | 未量 | 🟢 | **召回率绝对基线未测**——现有基线是无锚子串候选集；`permission_denied` 的「人工核对候选集」口径没记 |
 | **M3** | 未量 | 🟢 | **`.meta.json` 字段集随版本变**——2.1.85 两项 / 2.1.202 三项 / 2.1.260 四项。全量副本逐字节复制它，消费方按缺失容错 |
 | ~~**U1**~~ | 待定决策 | ✅ | ~~默认 scope~~ —— **已定**（2026-09-15，用户）：scope 可配置（`project` 只采登记的 / `user` 全机采），默认 `project`，参考 teamai；与 G8 一致，误采代价高于漏采（DESIGN §5） |
-| **U2** | 待定决策 | 🟢 | **登记方式**：`vibetrail init` 在仓里跑时顺手登记 / `vibetrail projects add`，两种并存还是选一种 |
+| ~~**U2**~~ | 待定决策 | ✅ | ~~登记方式：`vibetrail init` 在仓里跑时顺手登记 / `vibetrail projects add`~~ —— **用户 09-16 定**：「一个项目都不会加，等用户自己add，免得他在某个目录使用命令误操作加了」。init 不登记也不问；`projects pick`（从用过 Claude Code 的仓里选，编号前加 - 去掉）/ `add` / `remove [--drop]`（DESIGN D11） |
 | ~~**U3**~~ | 待定决策 | ✅ | ~~全量一路的格式~~ —— **由 D5 关闭**（2026-09-15）：不传 transcript 原文件，不存 file-history；分歧映射成协议事件并带最小正文，其余只有轮次元数据（DESIGN §2、§4.1） |
 | **U4** | 待定决策 | 🟡 | **端点、token、谁能看**。云端服务与 schema 已定（D5，2026-09-15）：paas-coding-hook 事件协议 1.0 的 collector，映射见 DESIGN §4.1。仍未定：端点地址；`Onepaas-Api-Access-Token` 怎么发与续期（hook 无人值守，要长期 token，放 `~/.vibetrail/` 0600）；谁能看（协议默认全公司可见，与 K6 暂不脱敏冲突，已提第二轮 [意见](third-party/paas-coding-hook-protocol-feedback.md)）。端点没配之前 push 不发，可以最晚定 |
 | **U5** | 待定决策 | 🟢 | **端点未配置阶段 spool 的上限与超限策略**。本机全量 700 MB 量级；倾向只警告不丢——采全（A2）优先于少存。配置后 ack 即删已定（D4） |

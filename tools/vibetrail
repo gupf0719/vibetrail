@@ -1,10 +1,10 @@
 #!/bin/bash
 # vibetrail：机器级安装、登记与本地查看（DESIGN §5；G8 / G9）。
 #
-#   vibetrail init [--scope project|user] [--no-register] [--no-pick] [--events auto|core|all]
+#   vibetrail init [--scope project|user] [--events auto|core|all]
 #       机器级装一次：运行时拷到 ~/.vibetrail/bin/，~/.claude/settings.json 里写 hook 条目（命令里带 vibetrail-hook，升级按它换掉旧条目），
-#       写 ~/.vibetrail/config（scope、jq 绝对路径、device_id…）。在 git 仓里跑且 scope=project 时顺手登记本仓（worktree 共享）；
-#       在终端里跑还会列出用过 Claude Code 的仓让人选（--no-pick 不问），最后列出登记表——scope=project 只采登记过的仓。
+#       写 ~/.vibetrail/config（scope、jq 绝对路径、device_id…）。不登记任何仓（用户 09-16：免得在哪个目录跑一下就误加了）：
+#       scope=project 只采登记过的仓，用 projects pick / add 自己加；最后列出登记表和用过 Claude Code 的仓。
 #       被观测仓里什么都不写（A8）。可以反复跑：升级运行时、刷新条目，已有的配置与登记不动。
 #       --events：auto（默认）只登记本机每个 Claude Code 都认识的 hook 事件——settings 里有它不认识的事件名，
 #                 它会把整份 settings 判为出错并整个跳过（2.1.266 二进制里的提示原文：Files with errors are skipped entirely）；
@@ -12,7 +12,8 @@
 #   vibetrail uninstall [--purge]
 #       去掉 settings 里的 vibetrail 条目，删 ~/.vibetrail/bin、state、logs；spool（还没发出去的数据）、config、登记表留着，
 #       --purge 才连 ~/.vibetrail 整个删掉（A7）
-#   vibetrail projects [list | add [目录] | remove [目录] | pick]     scope=project 时的登记表（U2）；pick 从用过 Claude Code 的仓里选
+#   vibetrail projects [list | add [目录] | remove [目录] [--drop] | pick]     scope=project 时的登记表（U2）；pick 从用过 Claude Code 的仓里选、
+#       编号前加 - 去掉；remove --drop 连它已采、还没发出去的数据一起挪出 spool（到 ~/.vibetrail/removed/，不再发，一天后自动删）
 #   vibetrail list                                            本机 spool 里有哪些块：项目、会话、条数、大小（就是将来 push 的内容）
 #   vibetrail show [--session SID] [--type 前缀] [--last N] [--json]
 #       把采到的事件按会话、按时间列成人能读的一行一条；--json 原样输出协议事件
@@ -190,12 +191,11 @@ settings_write(){ # settings_write <读进来时的内容> < 新内容。照 Pil
 }
 
 cmd_init(){
-    local scope="" register=1 pick=1 mode=auto a
+    local scope="" mode=auto a
     while [ $# -gt 0 ]; do
         case "$1" in
             --scope) scope=${2:-}; shift 2;;
-            --no-register) register=0; shift;;
-            --no-pick) pick=0; shift;;
+            --no-register|--no-pick) shift;;   # 老参数：init 已经不登记、不问，留着不报错
             --events) mode=${2:-}; shift 2;;
             *) die "init 不认识的参数：$1";;
         esac
@@ -270,14 +270,12 @@ cmd_init(){
         [ -n "$(vt_conf permission_request_since "")" ] || conf_set permission_request_since "$(date +%s)"
     else conf_set permission_request_since ""; fi
 
-    # 4. 登记本仓；在终端里跑还让人从用过 Claude Code 的仓里选（用户 09-15：「默认也是项目级，但是init后好像没选项目」）；最后列出登记表
+    # 4. 不登记任何仓，只列出登记表与用过 Claude Code 的仓，由人自己 projects pick / add（用户 09-16：「一个项目都不会加，等用户自己add，
+    #    免得他在某个目录使用命令误操作加了」）。以前在 git 仓里跑会顺手登记本仓
     if [ "$(vt_conf scope project)" = project ]; then
-        if [ $register = 1 ]; then
-            local m; m=$(vt_main_checkout "$PWD" 2>/dev/null) && { vt_register "$PWD" && say "✓ 已登记本仓 ${m}（它的所有 worktree 都采）"; } \
-                || say "  当前目录不在 git 仓里，没有顺手登记"
-        fi
-        if [ $pick = 1 ] && [ -t 0 ] && [ -t 1 ]; then say ""; pick_projects; fi
         say ""; show_registered
+        local c; c=$(candidate_projects | while IFS="$(printf '\t')" read -r mt n p; do vt_registered "$p" || printf '  · %s   （%s 个会话，最近 %s）\n' "$p" "$n" "$(fmt_epoch "$mt")"; done)
+        [ -z "$c" ] || { say "用过 Claude Code、还没登记的仓（要采就 vibetrail projects pick 选，或在那个仓里 projects add）："; say "$c"; }
     else
         say "  scope=user：本机所有目录的会话都采，不看登记表"
     fi
@@ -324,6 +322,10 @@ candidate_projects(){ # → 每行「最近活跃 epoch<TAB>会话数<TAB>主 ch
          | sort -t "$(printf '\t')" -k1,1nr
 }
 
+pending_chunks(){ # pending_chunks <主 checkout> → 这个仓在 spool 里待发的块数
+    find "$VT_HOME/spool/$(vt_project_key "$1")" -type f -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' '
+}
+
 fmt_epoch(){ date -r "$1" '+%m-%d %H:%M' 2>/dev/null || date -d "@$1" '+%m-%d %H:%M' 2>/dev/null || echo "?"; }
 
 pick_projects(){ # 列出用过 Claude Code 的仓（✓ = 已登记），读一行编号登记：空格分隔、a 全部、直接回车不改。stdin 不是终端时也照读一行（脚本、测试用）
@@ -337,18 +339,26 @@ pick_projects(){ # 列出用过 Claude Code 的仓（✓ = 已登记），读一
     done <<EOF_CANDS
 $cands
 EOF_CANDS
-    printf '要采哪些？输编号（空格分隔），a 全部，直接回车不改：'
+    printf '输编号登记，编号前加 - 去掉（空格分隔，如 2 -1），a 全部登记，直接回车不改：'
     IFS= read -r ans || ans=""
     [ -n "$ans" ] || { say ""; return 0; }
     [ "$ans" = a ] || [ "$ans" = A ] && ans=$(seq 1 "$i" | tr '\n' ' ')
+    local removed=0 neg
     for k in $ans; do
+        neg=0; case "$k" in -*) neg=1; k=${k#-};; esac
         case "$k" in ''|*[!0-9]*) say "  ⚠ 不认识的编号：$k"; continue;; esac
         p=$(printf '%s\n' "$cands" | sed -n "${k}p" | cut -f3)
         [ -n "$p" ] || { say "  ⚠ 没有第 $k 个"; continue; }
-        vt_registered "$p" && continue
-        vt_register "$p" && added=$((added + 1))
+        if [ $neg = 1 ]; then
+            vt_registered "$p" || continue
+            vt_unregister "$p" && removed=$((removed + 1))
+            [ "$(pending_chunks "$p")" -gt 0 ] && say "  $p 已采、还没发出去的 $(pending_chunks "$p") 块还在 spool；不想发：vibetrail projects remove $p --drop"
+        else
+            vt_registered "$p" && continue
+            vt_register "$p" && added=$((added + 1))
+        fi
     done
-    say "  新登记 $added 个"
+    say "  新登记 $added 个，去掉 $removed 个"
 }
 
 show_registered(){ # scope=project 时列出登记表；一个都没有就明说现在什么都不采
@@ -356,10 +366,10 @@ show_registered(){ # scope=project 时列出登记表；一个都没有就明说
     say "scope=project：只采下面这些登记过的仓（连同它们的所有 worktree）："
     for d in "$VT_HOME/projects"/*; do
         [ -f "$d" ] || continue
-        p=$(head -1 "$d"); n=$((n + 1)); say "  · $p$([ -d "$p" ] || echo '   ⚠ 目录不在了')"
+        p=$(head -1 "$d"); n=$((n + 1)); say "  · $p$([ -d "$p" ] || echo '   ⚠ 目录不在了')$(k=$(pending_chunks "$p"); [ "$k" -gt 0 ] && echo "   （spool 待发 ${k} 块）")"
     done
     [ $n -gt 0 ] || say "  ⚠ 还没有登记任何仓，现在什么都不会采。选：$VT_HOME/bin/vibetrail projects pick；或在要采的仓里跑 $VT_HOME/bin/vibetrail projects add"
-    say "  （改：vibetrail projects pick / add / remove；全都采：vibetrail init --scope user）"
+    say "  （改：vibetrail projects pick / add / remove [--drop]；全都采：vibetrail init --scope user）"
 }
 
 cmd_projects(){
@@ -369,10 +379,23 @@ cmd_projects(){
             ls "$VT_HOME/projects" 2>/dev/null | grep -q . || { say "（没有登记的项目；scope=$(vt_conf scope project)）"; return 0; }
             for d in "$VT_HOME/projects"/*; do
                 [ -f "$d" ] || continue
-                local p; p=$(head -1 "$d"); printf '%s%s\n' "$p" "$([ -d "$p" ] || echo '   ⚠ 目录不在了')"
+                local p; p=$(head -1 "$d"); printf '%s%s%s\n' "$p" "$([ -d "$p" ] || echo '   ⚠ 目录不在了')" "$(k=$(pending_chunks "$p"); [ "$k" -gt 0 ] && echo "   （spool 待发 ${k} 块）")"
             done ;;
         add) d=${2:-$PWD}; vt_register "$d" && say "✓ 已登记 $(vt_main_checkout "$d")";;
-        remove|rm) d=${2:-$PWD}; vt_unregister "$d" && say "✓ 已注销 $(vt_main_checkout "$d")（spool 里已采的不动）" || die "不在 git 仓里：$d";;
+        remove|rm)   # 去掉：以后不再采；--drop 连它已采、还没发出去的数据一起挪出 spool（放到 removed/，不删、也不再发）
+            local drop=0 a m k to; d=""; shift
+            for a in "$@"; do case "$a" in --drop) drop=1;; *) d=$a;; esac; done
+            d=${d:-$PWD}
+            m=$(vt_main_checkout "$d") || die "不在 git 仓里：$d"
+            vt_unregister "$d"; say "✓ 已去掉 ${m}：以后不再采（它的所有 worktree 都算）"
+            k=$(pending_chunks "$m")
+            if [ "$k" -gt 0 ] && [ $drop = 1 ]; then
+                to="$VT_HOME/removed/$(vt_project_key "$m")-$(date -u +%Y%m%dT%H%M%SZ)"
+                mkdir -p "$VT_HOME/removed" && mv "$VT_HOME/spool/$(vt_project_key "$m")" "$to" && touch "$to" \
+                    && say "  它已采、还没发出去的 ${k} 块挪到了 ${to}，不会再发，一天后自动删掉（挪错了在这一天里挪回 spool/ 即可）"
+            elif [ "$k" -gt 0 ]; then
+                say "  它已采、还没发出去的 ${k} 块还在 spool，将来 push 时照样发；不想发：vibetrail projects remove $m --drop"
+            fi ;;
         pick) pick_projects;;
         *) die "projects 只认 list / add / remove / pick";;
     esac
@@ -508,7 +531,7 @@ cmd_doctor(){
     if [ "$scope" = user ]; then ok "scope=user：本机所有目录都采"
     else
         local np; np=$(ls "$VT_HOME/projects" 2>/dev/null | wc -l | tr -d ' ')
-        [ "$np" -gt 0 ] && ok "scope=project，登记了 $np 个项目" || note "scope=project 但一个项目都没登记——什么都不会采（vibetrail projects add）"
+        [ "$np" -gt 0 ] && ok "scope=project，登记了 $np 个项目" || note "scope=project 但一个项目都没登记——什么都不会采（vibetrail projects pick 选，或 projects add）"
         if [ -n "$here" ]; then vt_registered "$here" && ok "本仓已登记：$here" || note "本仓没登记：${here}（vibetrail projects add）"; fi
     fi
     # 采集证据
@@ -550,6 +573,7 @@ cmd_doctor(){
     elif [ $warn -ne 0 ]; then say "⚠ 能用，有告警"; else say "✓ 采集工作正常"; fi
 }
 
+vt_prune_removed   # projects remove --drop 挪出去的数据留一天
 case "${1:-}" in
     init) shift; cmd_init "$@";;
     uninstall) shift; cmd_uninstall "$@";;
