@@ -48,7 +48,7 @@ Claude Code 已经把每轮对话、thinking 全文、每次 Edit 的 diff、每
 | 路 | 采什么 | 正文 | 形态 |
 |---|---|---|---|
 | **人机分歧** | [spec/diverge-v1.md](spec/diverge-v1.md) 的 5 类 kind，映射成协议事件（§4.1） | **带**能判责的最小上下文：被拒调用的工具输入（命令 / 编辑内容）与拒绝原文；被打断的那条模型回复与打断后人的下一句 | 事件，每条 KB 级 |
-| **轮次元数据** | session / turn / subagent 的起止事件；每轮起止的 HEAD、分支、脏否与 `rev-list` 出的 commit（§3.5）；轮次状态、model、token 用量；`InstructionsLoaded` / `CwdChanged` / `StopFailure` 等 hook 事件头（事件名、时间、`tool_use_id`、错误类型、reason、`agent_id`） | **不带**：非分歧轮次的消息、工具输入输出、thinking、system prompt、CLAUDE.md 正文都不传 | 事件，每轮几条、百字节级 |
+| **轮次元数据** | session / turn / subagent 的起止事件；每轮起止的 HEAD、分支、脏否与 `rev-list` 出的 commit（§3.5）；轮次状态、model、token 用量；**调用 trace**（09-15 加，D8）：每次模型调用一条（model、这次的 token、stop_reason、调了哪些工具、请求起止），每次工具调用一条（工具名、成功 / 出错 / 取消、耗时）；`InstructionsLoaded` / `CwdChanged` / `StopFailure` 等 hook 事件头（事件名、时间、`tool_use_id`、错误类型、reason、`agent_id`） | **不带**：非分歧轮次的消息、工具输入输出、thinking、system prompt、CLAUDE.md 正文都不传 | 事件，每轮几条到几十条、每条百字节级 |
 
 **不传 transcript 原文件**（§7 D5）。两路按会话 id 关联——transcript 文件名与 hook 的 `session_id` 是同一个值——走同一条通道。分歧一路的提取仍是
 diverge-v1 那份 jq，转成事件是它之后的一步。「后面有必要再补充」的口子留着：协议的 message.* / tool.* 与 ext.* 事件都在，要补正文时只是多映射几类记录，
@@ -406,6 +406,27 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
   [Pilot 实跑](third-party/loongsuite-pilot-collection-sample.md)、[Pilot 原始输出](third-party/loongsuite-pilot-collection-output.md)。
 
 ## 7. 决策记录
+
+### D8 — 采调用 trace：照 Pilot 的粒度，一次调用一条，不带正文（2026-09-15，现行）
+
+用户原话：「trace是不是没采，genai那些」「除了协议，你还可以参考下pilot，它全采了，我没看teamai有没有采」「旧的展示数据可以先删掉」。
+
+对照（本机两个仓的源码）：Pilot 每轮按调用拆（`assets/hooks/claude-code-hook-processor.mjs`）——每次模型调用一对 `llm.request` / `llm.response`
+（`gen_ai.request.model`、`gen_ai.response.id`、`finish_reasons`，入 / 出 / 缓存读 / 缓存写 token，外加输入输出全文），每次工具调用一对 `tool.call` / `tool.result`
+（工具名、call id，外加参数与结果全文）；请求开始时间取同一轮里上一条工具结果的时间，没有就取人话的时间（`claude-code/transcript-parser.mjs`）。
+teamai 没有调用这一级（`src/dashboard-collector.ts`）：每次 PostToolUse 记一条工具名（没有耗时、状态），token 是 Stop 时扫整份 transcript 加总的会话累计。
+
+定了什么：映射层（`tools/map-events.jq` 的 trace 部分，rule_version `call-v1`；`trace-v1` 已是审计记录格式的名字）从 transcript 出，不另挂 hook——
+- 每次模型调用（同一 `message.id` 的几条记录）一条 `message.assistant`，`content_state` = `omitted`，`extensions.vibetrail.call` 带 `response_id`、`request_id`、
+  `stop_reason`、这次的 token、`started_at`（上一条 user 记录——工具结果或人话——的时间，与 Pilot 同法）、调了哪些工具、有没有 thinking。
+  这次调用结束时发：读到下一条 user 记录或另一个 `message.id`，或关轮时读到文件末尾（Stop 时与 `turn.end` 同一块）。
+- 每个工具结果一条 `tool.end`（工具名、`call_id`、success / error / cancelled、`duration_ms` = 结果时间 − 调用时间）；执行前被拒的没执行，不出 `tool.end`，拒绝本身已有 `permission.decision`。
+- 子 agent 文件同样出，实例 = agentId。
+
+**不带正文**（D5 不变），一次调用一条而不是 Pilot 的两条：每条百字节级。本机当时最重的会话（`ffe1c0f1`，09-15）257 次模型调用、254 次工具调用，
+事件从 25 条变成 530 多条。本机 10 份真 transcript、89 个切点，trace 打开后增量解析与整份解析逐条一致。途中查出一处：压缩上下文时 Claude Code 会把早先一条并行工具的结果
+按原 uuid、换上新 promptId 再写一遍（本机只此一例），增量解析读不到它的调用，会以 `unknown` 工具名重发一条 `tool.end`（event_id 相同，spool 按 id 会拦下，但映射层不该发）。
+现在读不到对应调用的工具结果不发 `tool.end`：结果与调用同在一轮，增量解析从当前轮开头读起，正常的都读得到（`test-hook-flow.sh` 第 11 段）。
 
 ### D7 — turn.end 在模型答完的那一刻写：Stop 时当场关轮，被别的 Stop hook 拦下时补发更新的一条（2026-09-15，现行）
 

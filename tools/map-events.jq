@@ -42,6 +42,12 @@
 #      status：summary 或 hook 记到的 Stop 是 completed；summary 里 preventedContinuation 是 hook_stopped；只有 StopFailure 是 error；
 #      什么证据都没有是 unknown。vcs / commits 来自 $hook_turns（Stop 时 hook 按轮起 HEAD 算好的，DESIGN §3.5）；
 #      用量是本轮 assistant 记录按 message.id 去重求和（与打断同一定义）。子 agent 文件不切轮：子 agent 的起止由 SubagentStart / SubagentStop hook 发。
+#
+# trace（rule_version call-v1；09-15 用户要，照 Pilot 的粒度、不带正文，DESIGN D8）：每次模型调用一条 message.assistant（content_state = omitted，extensions.vibetrail.call
+#      带 response_id、request_id、stop_reason、这次调用的 token、请求开始时间、调了哪些工具、有没有 thinking），在这次调用结束时发——下一条 user 记录
+#      或另一个 message.id 出现，或者带 $close_last 读到文件末尾；每个工具结果一条 tool.end（工具名、call_id、success / error / cancelled、耗时）。
+#      执行前就被拒的调用只有 permission.decision，不伪造 tool.end（协议）；按停止打断正在跑的工具写成与拒绝一样的记录，也归到这里（K7）。
+#      Pilot 每次调用各有请求 / 响应两条、工具各有调用 / 结果两条，且带全文；我们一次调用一条、只有元数据。
 
 include "diverge-rules";
 
@@ -112,6 +118,8 @@ def init: {
   denials: [],            # 当前轮里 permission_denied 记录的 uuid，给 for-tool-use 配对
   pending: null,          # {after: [uuid…], kind, since}：等「人的下一句」；since＝第一个触发所在轮的开头行
   pturn: null,            # 按 promptId 切的当前轮（轮次元数据一路）：{id, line, last_ts, usage, model, interrupted, denied, git_commit, closed}
+  call: null,             # trace：正在累计的这次模型调用（同一 message.id 的几条记录）
+  last_user_ts: null,     # trace：最近一条 user 记录的时间＝下一次模型调用的请求开始（照 Pilot 的 fillRequestStartTimes，也只取更晚的）
   last_ts: null, version: null, entrypoint: null, branch: null,
   ledger: {in: {}, in_total: {}, out: {}, events: {}, absorbed_for_tool_use: 0, unpaired_for_tool_use: 0,
            lookup: {index: 0, regex: 0, missing: 0}, dedup: 0, records: 0, skipped_no_uuid: 0, skipped_non_object: 0,
@@ -405,6 +413,67 @@ def turnAccumulate($r; $s):
        then .pturn.git_commit = true else . end)
   end;
 
+# ---------- trace：每次模型调用、每次工具调用各一条，不带正文 ----------
+def epochms: if type != "string" then null else
+  (capture("^(?<b>[^.Z]+)(?<f>\\.[0-9]+)?Z$")? // null) as $m
+  | if $m == null then null else ((($m.b + "Z") | fromdateiso8601) * 1000 + (("0" + ($m.f // ".0")) | tonumber * 1000 | floor)) end end;
+def usageOne($u): if ($u | type) != "object" then null else
+  ({input_tokens: (($u.input_tokens // 0) + ($u.cache_creation_input_tokens // 0)), cached_input_tokens: ($u.cache_read_input_tokens // 0),
+    output_tokens: ($u.output_tokens // 0)}
+   + (($u.output_tokens_details | if type == "object" then (.thinking_tokens // 0) else 0 end) as $t | if $t > 0 then {reasoning_tokens: $t} else {} end))
+  | .total_tokens = (.input_tokens + .cached_input_tokens + .output_tokens) end;
+def stopReasonOf($r): ($r.message | if type == "object" then .stop_reason else null end);
+def thinkingIn($r): ($r | msg.content | if type == "array" then any(.[]?; type == "object" and .type == "thinking") else false end);
+
+def flushCall($eof):
+  if .call == null then . else
+    .call as $c
+    | (base({agent: $c.agent}; "message.assistant"; $c.last_uuid; $c.last_ts; $c.turn)
+       | .content_state = "omitted"
+       | .payload = ({author_type: "agent"} + opt("model"; $c.model))
+       | .provenance = {kind: "transcript", rule_version: "call-v1", source_event_id: $c.last_uuid}
+       | .extensions += {"vibetrail.call": ({kind: "llm", stop_reason: $c.stop_reason, tool_calls: $c.tools, thinking: $c.thinking}
+                          + opt("response_id"; $c.mid) + opt("request_id"; $c.rid) + opt("started_at"; $c.started_at) + opt("usage"; usageOne($c.usage)))}
+       | ._key = ($c.key + "|llm.call")) as $e
+    | (if $eof then emitAlways($e) else emit($e) end)
+    | .call = null end;
+
+def toolEnds($r; $s):
+  reduce ($r | msg.content | if type == "array" then .[] else empty end | objects | select(.type == "tool_result")) as $b (.;
+    ($b.tool_use_id // null) as $cid
+    # 这次没读到调用的结果不发：结果与调用同在一轮，增量解析从当前轮开头读起，正常的都读得到；读不到的是重写的旧记录
+    # （压缩时 Claude Code 把早先一条并行工具的结果按原 uuid、换上新 promptId 再写一遍，09-15 本机），它的 tool.end 早发过了
+    | if $cid == null or .tools[$cid] == null then . else
+        .tools[$cid] as $tu
+        | ($b.content | errText) as $txt
+        | (if $b.is_error != true then {code: "success", category: "success"}
+           elif ($txt | test("^\\[Tool call (did not complete|skipped)")) then {code: "cancelled", category: "cancellation"}
+           elif ($txt | (isHumanDenial or isClassifier or isInfra)) or ($txt | startswith("The user doesn't want to")) then null   # 执行前被拒：只有 permission.decision
+           else {code: "error", category: "error"} end) as $st
+        | (($s.ts | epochms) as $b1 | ($tu.ts | epochms) as $a1 | if $b1 != null and $a1 != null and $b1 >= $a1 then $b1 - $a1 else null end) as $d
+        | ({id: (.turn // $s.uuid), inferred: (.turn == null)}) as $t
+        | if $st == null then . else
+            emit( base($s; "tool.end"; $s.uuid; $s.ts; $t)
+                  | .content_state = "omitted"
+                  | .payload = ({tool_name: $tu.name, call_id: $cid, status: $st} + opt("duration_ms"; $d))
+                  | .provenance = {kind: "transcript", rule_version: "call-v1", source_event_id: $s.uuid}
+                  | ._key = ($cid + "|tool.end") ) end end);
+
+def traceStep($r; $s):
+  (if $s.type == "user" then flushCall(false) | toolEnds($r; $s) | .last_user_ts = ([.last_user_ts, $s.ts] | max) else . end)   # 只往后走：重写的旧记录带着旧时间
+  | (if $s.type == "assistant" and ($s.synthetic | not) then
+       ($s.mid // $s.rid // $s.uuid) as $k
+       | (if .call != null and .call.key != $k then flushCall(false) else . end)
+       | if .call == null
+         then .call = {key: $k, mid: $s.mid, rid: $s.rid, model: $s.model, usage: $s.usage, stop_reason: stopReasonOf($r),
+                       tools: [$s.tools[] | .name], thinking: thinkingIn($r), last_ts: $s.ts, last_uuid: $s.uuid,
+                       started_at: .last_user_ts, agent: $s.agent, turn: {id: (.turn // $s.uuid), inferred: (.turn == null)}}
+         else .call.last_ts = ($s.ts // .call.last_ts) | .call.last_uuid = $s.uuid
+              | .call.stop_reason = (stopReasonOf($r) // .call.stop_reason)
+              | .call.tools += [$s.tools[] | .name] | .call.thinking = (.call.thinking or thinkingIn($r))
+              | (if $s.usage != null and (($s.usage.output_tokens // 0) >= (.call.usage.output_tokens // -1)) then .call.usage = $s.usage else . end) end
+     else . end);
+
 def step($r):
   .out = [] | .ln += 1 | .ln as $ln
   | if ($r | type) != "object" then .ledger.skipped_non_object += 1
@@ -429,6 +498,7 @@ def step($r):
               | .turn_model = ($s.model // .turn_model) else . end)
       | turnAccumulate($r; $s)
       | turnStopMarker($r; $s)
+      | (if $turns then traceStep($r; $s) else . end)
       | (if $ln > $from_line and $keyrec then .ledger.sources += [[$s.uuid, $ln]] else . end)
       | (if ($r.toolUseResult | type) == "string" and ($r.toolUseResult | startswith("User rejected tool use"))
          then .ledger.sentinel.marker += 1
@@ -447,6 +517,8 @@ def checkpoint: turnStart as $ts
 # 文件末尾：$close_last 非空（会话结束 / 恢复 / 空闲）就把最后一轮也关掉
 def atEof:
   .out = []
+  # trace：最后一次模型调用在关轮时一起写出（没有下一条 user 记录来结束它）；子 agent 文件读到末尾就写（它跑完文件就不再长）
+  | (if $turns and .call != null and ($close_last != "" or .call.agent != null) then flushCall(true) else . end)
   | if $close_last == "" or .pturn == null then .
     elif $close_last == "stop" then   # Stop hook：这次 Stop 的那一轮、有过模型回复、没看到拦停反馈，就当场关
       (if .pturn.id == $stop_turn and .pturn.answered and (.pturn.block_pending | not) and (.pturn.stop_blocked | not)

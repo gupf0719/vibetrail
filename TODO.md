@@ -50,6 +50,8 @@
   装到真实环境后发现它晚一轮才落盘，再改成 Stop 时当场关（DESIGN D7）。演示用的 markdown 报告 `experiments/collect-demo/report.sh`（三块：轮次元数据 / 人机分歧 / commit ↔ 会话，上线用不到）。
   hook 的 prompt_id 与记录的 promptId 是同一个值（探针实测）。本机 10 份真 transcript 30 个切点增量等价逐条一致；demo.sh 加了一轮「第一次 Stop 被拦、补完再 Stop」。
   09-15 请用户按停止实测：没有任何 hook、没有 `idle_prompt`；按停止打断正在跑的工具被记成拒绝（OPEN-ISSUES K7，区分方案待定）。
+- [x] 调用 trace（09-15，用户：「trace是不是没采，genai那些」「参考下pilot，它全采了」）：每次模型调用、每次工具调用各一条，照 Pilot 的粒度、不带正文（DESIGN D8）；
+  演示报告第一块下面有每个会话的调用明细。
 - [x] commit ↔ 轮次推导（09-15）：轮起 / 轮止快照（`state/<sid>/turns/`），本轮 commit = `rev-list 起..止` + 本轮 reflog 里新建的提交，归因看 transcript 里 agent 有没有跑
   `git commit`（DESIGN §3.5）；demo.sh 第 1 轮中途真的提交一次，turn.end 带上了。原写的「`vibetrail show` 按 commit 查改走它」不做了：按 commit 查是读取端的事（D5），
   现在的 `vibetrail show` 是本地预览。Bash stdout 里短 sha 的旁证还没做。

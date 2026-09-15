@@ -2,7 +2,7 @@
 # 回归：hook 分发入口 + 分歧一路挂 hook（TODO G7 第 2 步）。用 experiments/collect-demo/scenario.json 在临时目录里真实回放：
 # 临时 git 仓当被观测项目，临时目录当 ~/.vibetrail 与 ~/.claude/projects，逐步追加 transcript、逐个触发 hook。
 # 断言：A4 未登记零写入；登记后 spool == 对最终 transcript 的一次全量映射；stdout 永远为空、exit 0；重复触发不重复写；
-# 锁被占时跳过、之后补上；半行等写完再读；文件被重写后不重复；打断后没有 Stop 也不漏；子 agent；回放副本；SessionStart 补做别的会话；scope=user。
+# 锁被占时跳过、之后补上；半行等写完再读；文件被重写后不重复；打断后没有 Stop 也不漏；子 agent；回放副本；SessionStart 补做别的会话；scope=user；压缩时重写的旧工具结果不重发 tool.end。
 # 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
 # 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
 export LC_ALL=C
@@ -132,7 +132,8 @@ printf '%s\n' '{"agentType":"general-purpose","description":"查","spawnDepth":1
   rec s1d s1a P1 user '[{"type":"tool_result","tool_use_id":"st1","content":"Permission to use Bash with command ls has been denied.","is_error":true}]' '{"agentId":"s1","isSidechain":true}'
 } > "$TDIR/$SID/subagents/agent-s1.jsonl"
 hook SubagentStop "$(payload SubagentStop '{"agent_id":"s1"}')"
-check "子 agent 的拒绝进 spool，实例 s1、父实例 main、parent_call_id 取 meta" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "length == 2 and all(.[]; .agent_instance_id == \"s1\" and .parent_agent_instance_id == \"main\" and .parent_call_id == \"toolu_x\")" >/dev/null'
+check "子 agent 的拒绝进 spool，实例 s1、父实例 main、parent_call_id 取 meta" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"diverge-v1\")) | length == 2 and all(.[]; .agent_instance_id == \"s1\" and .parent_agent_instance_id == \"main\" and .parent_call_id == \"toolu_x\")" >/dev/null'
+check "子 agent 的那次模型调用有 trace：实例 s1、不带正文；被拒的调用不伪造 tool.end" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"call-v1\")) | length == 1 and .[0].type == \"message.assistant\" and .[0].agent_instance_id == \"s1\" and .[0].content_state == \"omitted\" and (.[0].payload | has(\"text\") | not) and .[0].extensions[\"vibetrail.call\"].tool_calls == [\"Bash\"]" >/dev/null'
 
 echo "════ 8. 文件被重写（变短）：从 0 重读，不重复 ════"
 head -n 5 "$TR" > "$TR.tmp" && mv "$TR.tmp" "$TR"
@@ -170,6 +171,24 @@ check "scope=project 下注销后回放：不写" '[ ! -e "$VT_HOME/spool" ]'
 printf 'scope=user\n' > "$VT_HOME/config"
 replay
 check "scope=user：照样写" '[ "$(spool_events | wc -l | tr -d " ")" = 3 ]'
+
+echo "════ 11. 压缩时重写的旧工具结果（原 uuid、新 promptId）：增量解析不再发一次 tool.end ════"
+R=$T/rewrite.jsonl
+{ rec r1 "" P1 user '"跑一下"' | jq -c '.parentUuid = null'
+  rec r2 r1 P1 assistant '[]' '{"message":{"id":"rm1","model":"claude-opus-5","role":"assistant","content":[{"type":"tool_use","id":"rt1","name":"Bash","input":{"command":"ls"}}]}}'
+  rec r3 r2 P1 user '[{"type":"tool_result","tool_use_id":"rt1","content":"calc.py"}]'
+  rec r4 r3 P1 assistant '[]' '{"message":{"id":"rm2","model":"claude-opus-5","role":"assistant","content":[{"type":"text","text":"好了。"}],"stop_reason":"end_turn"}}'
+  rec r5 r4 P2 user '"再看看"'
+  rec r6 r5 P2 assistant '[]' '{"message":{"id":"rm3","model":"claude-opus-5","role":"assistant","content":[{"type":"text","text":"看过了。"}],"stop_reason":"end_turn"}}'
+  rec r3 r2 P2 user '[{"type":"tool_result","tool_use_id":"rt1","content":"calc.py"}]'
+} > "$R"
+map_r(){ bash "$SELF/vibetrail-map" "$@" --sid "$SID" --project-id p --workspace-id w 2>/dev/null; }
+head -n 6 "$R" > "$T/rewrite-a.jsonl"
+map_r "$T/rewrite-a.jsonl" --ledger "$T/rw-a.l" --sources-out "$T/rw-a.src" > "$T/rw-a.ev"
+map_r "$R" --start-line "$(jq -r .checkpoint_line "$T/rw-a.l")" --start-byte "$(jq -r .checkpoint_byte "$T/rw-a.l")" --from-line 6 \
+    --seen-uuids "$T/rw-a.src" --ledger /dev/null > "$T/rw-b.ev"
+check "整份解析：rt1 只有一条 tool.end，工具名是 Bash" 'map_r "$R" --ledger /dev/null | jq -s -e "map(select(.type == \"tool.end\")) | length == 1 and .[0].payload.tool_name == \"Bash\"" >/dev/null'
+check "分两次解析：后一次不再发 rt1 的 tool.end，两次合起来没有重复的 event_id" '! grep -q "\"tool.end\"" "$T/rw-b.ev" && [ "$(cat "$T/rw-a.ev" "$T/rw-b.ev" | jq -r .event_id | sort | uniq -d | wc -l | tr -d " ")" = 0 ]'
 
 echo
 [ "$skipped_schema" -gt 0 ] && echo "  ⚠ 本机 python3 没有 jsonschema，协议 schema 校验跳过 $skipped_schema 处（pip install jsonschema 后重跑）"

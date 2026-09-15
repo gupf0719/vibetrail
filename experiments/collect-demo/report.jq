@@ -1,5 +1,5 @@
 # vibetrail 演示与测试用（上线用不到，用户 09-15）：把本机 spool 里的协议事件整理成一份 markdown 报告，三类分开展示：
-#   一、每一轮的元数据（turn.start / turn.end，外加会话、子 agent、事件头）
+#   一、每一轮的全量数据：轮次元数据（turn.start / turn.end，外加会话、子 agent、事件头）+ 调用 trace（每次模型调用、每次工具调用各一条，不带正文）
 #   二、人机分歧（permission.decision、打断的 turn.end / subagent.end，连同派生的被拒调用、被打断的回复、之后人说的话）
 #   三、commit ↔ 会话（turn.end 的 commits：每轮起止 HEAD 与本轮 reflog 推出，DESIGN §3.5）
 # 用法（由同目录的 report.sh 调）：jq -s -r --argjson subjects <{sha: 提交说明}> --arg generated <生成时间> --arg source <spool 目录>
@@ -27,6 +27,9 @@ def call_s: (.payload.tool_name // "?") + " " + ((.payload.input | if type == "o
 # 同一轮有多条 turn.end（被别的 Stop hook 拦下后又 Stop 一次）取 vibetrail.stops 最大的那条（DESIGN D7）
 def latest_end: max_by(.extensions["vibetrail.stops"] // 0);
 def is_trigger: .type == "permission.decision" or ((.type == "turn.end" or .type == "subagent.end") and .provenance.rule_version == "diverge-v1");
+def is_llm: .type == "message.assistant" and .provenance.rule_version == "call-v1";
+def is_tool: .type == "tool.end" and .provenance.rule_version == "call-v1";
+def durms: if type != "number" then "–" elif . < 1000 then "\(floor)ms" elif . < 60000 then "\((. / 100 | floor) / 10)s" else "\(. / 60000 | floor)m\((. % 60000) / 1000 | floor)s" end;
 # 「依据 · 何时关」一列：两者相同就只写一次；分歧一路发的打断 turn.end 没有这两个字段
 def end_col: if . == null then "–" else
   (.extensions["vibetrail.end_evidence"]) as $ev | (.extensions["vibetrail.closed_by"]) as $cb
@@ -55,9 +58,10 @@ map(select(type == "object")) as $ev
   ($sessions[] | . as $s
     | "| `\($s.sid | short)` | \($s.project | cell) | \($s.first | lt("%m-%d %H:%M")) | \([$s.events[] | select(.type == "turn.start" or .type == "turn.end") | .turn_id] | unique | length) | \([$tgroups[] | select(.t.session_id == $s.sid)] | length)\(if ([$tgroups[] | select(.t.session_id != $s.sid and (.also | index($s.sid)))] | length) > 0 then "（另有 " + ([$tgroups[] | select(.t.session_id != $s.sid and (.also | index($s.sid)))] | length | tostring) + " 条复制来的）" else "" end) | \([$commit_turns[] | select(.session_id == $s.sid) | .commits[]] | length) |"),
   "",
-  "## 一、每一轮的元数据",
+  "## 一、每一轮的全量数据（轮次 + 调用 trace，不带正文）",
   "",
-  "来源：`turn.start`（说一句话时 hook 当场记，transcript 补位）与 `turn.end`（模型答完时关轮），不含对话正文。HEAD 后面带 `*` 表示工作区当时有未提交的改动。",
+  "来源：`turn.start`（说一句话时 hook 当场记，transcript 补位）与 `turn.end`（模型答完时关轮）；调用 trace 照 Pilot 的粒度，每次模型调用一条 `message.assistant`、每次工具调用一条 `tool.end`，",
+  "只有模型、token、耗时、状态这些元数据，不含对话与工具的正文（DESIGN D5）。HEAD 后面带 `*` 表示工作区当时有未提交的改动。",
   "",
   ($sessions[] | . as $s
     | ($s.events | map(select(.type == "turn.start")) | group_by(.turn_id) | map(sort_by(if .provenance.kind == "hook" then 0 else 1 end) | .[0])) as $starts
@@ -69,12 +73,23 @@ map(select(type == "object")) as $ev
     | "### 会话 `\($s.sid | short)` · \($s.project | cell) · Claude Code \($agent.version // "?")\(if $agent.surface then "（" + $agent.surface + "）" else "" end)",
       "",
       (if ($dups[$s.sid].n // 0) > 0 then "> 其中 \($dups[$s.sid].n) 轮与更早的会话 \([$dups[$s.sid].from[] | "`" + short + "`"] | join("、")) 相同：desktop 续接会话时复制过来的历史（OPEN-ISSUES K8）。", "" else empty end),
-      "| # | 轮 | 开始 | 结束 | 用时 | 状态 | 依据 · 何时关 | 模型 | tokens 入 / 缓存 / 出 | HEAD 起 → 止 | 分歧 | commit |",
-      "|---|---|---|---|---|---|---|---|---|---|---|---|",
+      "| # | 轮 | 开始 | 结束 | 用时 | 状态 | 依据 · 何时关 | 模型 | tokens 入 / 缓存 / 出 | 调用 模型 / 工具 | HEAD 起 → 止 | 分歧 | commit |",
+      "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
       ($turns | to_entries[] | .key as $i | .value as $t
         | ($t.e.payload.usage // {}) as $u
-        | "| \($i + 1) | `\($t.id | short)` | \($t.s.occurred_at | lt("%H:%M:%S")) | \($t.e.occurred_at | lt("%H:%M:%S")) | \(dur($t.s.occurred_at; $t.e.occurred_at)) | \(if $t.e then ($t.e.payload.status.code | status_label) else "进行中" end) | \($t.e | end_col) | \($t.e.payload.model // $t.s.payload.model // "–") | \($u.input_tokens | k) / \($u.cached_input_tokens | k) / \($u.output_tokens | k) | \($t.s.payload.vcs | vcs_s) → \($t.e.payload.vcs | vcs_s) | \([$triggers[] | select(.session_id == $s.sid and .turn_id == $t.id)] | length) | \(($t.e.commits // []) | length) |"),
+        | "| \($i + 1) | `\($t.id | short)` | \($t.s.occurred_at | lt("%H:%M:%S")) | \($t.e.occurred_at | lt("%H:%M:%S")) | \(dur($t.s.occurred_at; $t.e.occurred_at)) | \(if $t.e then ($t.e.payload.status.code | status_label) else "进行中" end) | \($t.e | end_col) | \($t.e.payload.model // $t.s.payload.model // "–") | \($u.input_tokens | k) / \($u.cached_input_tokens | k) / \($u.output_tokens | k) | \([$s.events[] | select(is_llm and .turn_id == $t.id)] | length) / \([$s.events[] | select(is_tool and .turn_id == $t.id)] | length) | \($t.s.payload.vcs | vcs_s) → \($t.e.payload.vcs | vcs_s) | \([$triggers[] | select(.session_id == $s.sid and .turn_id == $t.id)] | length) | \(($t.e.commits // []) | length) |"),
       "",
+      ( [$s.events[] | select(is_llm or is_tool)] | sort_by(.occurred_at, (if is_llm then 0 else 1 end)) as $calls
+        | if ($calls | length) == 0 then empty else
+            "<details><summary>调用明细（trace）：模型调用 \([$calls[] | select(is_llm)] | length) 次、工具调用 \([$calls[] | select(is_tool)] | length) 次</summary>",
+            "",
+            "| 时间 | 轮 | 实例 | 类型 | 名称 | 耗时 | tokens 入 / 缓存 / 出 | 结果 |",
+            "|---|---|---|---|---|---|---|---|",
+            ($calls[] | . as $c
+              | if is_llm then (.extensions["vibetrail.call"] // {}) as $x
+                  | "| \(.occurred_at | lt("%H:%M:%S")) | `\(.turn_id | short)` | \(.agent_instance_id | if . == "main" then "main" else short end) | 模型 | \(.payload.model // "–") | \(if $x.started_at then (((.occurred_at | epoch) - ($x.started_at | epoch)) * 1000 | durms) else "–" end) | \($x.usage.input_tokens | k) / \($x.usage.cached_input_tokens | k) / \($x.usage.output_tokens | k) | \($x.stop_reason // "–")\(if ($x.tool_calls // []) | length > 0 then " → " + ($x.tool_calls | join("、")) else "" end)\(if $x.thinking then "（有 thinking）" else "" end) |"
+                else "| \(.occurred_at | lt("%H:%M:%S")) | `\(.turn_id | short)` | \(.agent_instance_id | if . == "main" then "main" else short end) | 工具 | \(.payload.tool_name | cell) | \(.payload.duration_ms | durms) | – | \(.payload.status.code | {success: "成功", error: "出错", cancelled: "取消"}[.] // .) |" end),
+            "", "</details>", "" end),
       ( [$s.events[] | select(.type == "session.start" or .type == "session.end" or .type == "subagent.start" or .type == "subagent.end" or (.type | startswith("ext.")))
          | select((.type == "subagent.end" and .provenance.rule_version == "diverge-v1") | not)] as $others
         | if ($others | length) == 0 then empty else

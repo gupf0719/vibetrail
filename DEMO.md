@@ -61,7 +61,7 @@ bash tools/vibetrail init
 |---|---|
 | 会话开始 | `session.start`（来源、model、HEAD） |
 | 说一句话 | `turn.start`（HEAD、分支、有没有改动） |
-| 模型答完 | `turn.end`（状态、token 用量、本轮的 commit），同一块里还有这一轮的分歧事件：`permission.decision`（拒绝）、`tool.request`（被拒的命令）、`message.user`（之后人说的话） |
+| 模型答完 | `turn.end`（状态、token 用量、本轮的 commit）。同一块里还有这一轮的调用 trace：每次模型调用一条 `message.assistant`（不带正文：model、token、stop_reason、调了哪些工具）、每次工具调用一条 `tool.end`（工具名、成功 / 出错 / 取消、耗时）；以及分歧事件：`permission.decision`（拒绝）、`tool.request`（被拒的命令）、`message.user`（之后人说的话） |
 | 子 agent 起止 | `subagent.start` / `subagent.end` |
 | 工具失败、权限弹框、CLAUDE.md 加载 | `ext.claude.*`，只有事件头 |
 | 会话结束 | `session.end` |
@@ -72,7 +72,7 @@ bash tools/vibetrail init
 bash experiments/collect-demo/report.sh
 ```
 
-把采到的事件分三块整理成 `~/.vibetrail/report.md`：每一轮的元数据（起止、用时、状态、token、HEAD 起止）、人机分歧（谁、对哪次调用、原文、之后人说了什么）、
+把采到的事件分三块整理成 `~/.vibetrail/report.md`：每一轮的全量数据（起止、用时、状态、token、模型 / 工具调用次数、HEAD 起止，每个会话下面折叠着逐次调用的 trace）、人机分歧（谁、对哪次调用、原文、之后人说了什么）、
 commit ↔ 会话（每个提交归到哪个会话哪一轮，提交说明现从本机 git 查）。`-o -` 打到终端，`--session <前缀>` 只看一个会话。这个脚本不装进产品，上线用不到。
 
 ## 6. 自检与卸载
