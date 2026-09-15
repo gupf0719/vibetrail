@@ -15,6 +15,7 @@
 #   vibetrail list                                            本机 spool 里有哪些块：项目、会话、条数、大小（就是将来 push 的内容）
 #   vibetrail show [--session SID] [--type 前缀] [--last N] [--json]
 #       把采到的事件按会话、按时间列成人能读的一行一条；--json 原样输出协议事件
+#   vibetrail sync                                            立刻把登记过的仓里没采完的 transcript 补一遍（平时开会话时的 SessionStart 会做）
 #   vibetrail doctor                                          自检：运行时、jq、settings 条目、scope 与登记、采集证据、落后、错误日志
 #   vibetrail version
 #
@@ -34,7 +35,7 @@ SETTINGS=$(vt_settings_path)
 
 say(){ printf '%s\n' "$*"; }
 die(){ printf '✗ %s\n' "$*" >&2; exit 1; }
-usage(){ sed -n '2,24p' "$SELF/vibetrail" | sed 's/^# \{0,1\}//'; }
+usage(){ sed -n '2,25p' "$SELF/vibetrail" | sed 's/^# \{0,1\}//'; }
 
 find_jq(){ # jq 的绝对路径：config 里记的优先，其次 PATH；hook 不靠 PATH（desktop 启动的 hook 拿到什么 PATH 未测，§3.4）
     local j; j=$(vt_conf jq "")
@@ -312,6 +313,18 @@ cmd_show(){
     say "（按会话、按时间排；原始事件：vibetrail show --json，文件：vibetrail list）"
 }
 
+cmd_sync(){ # 与 SessionStart 的补做相同：本仓与所有登记过的仓，落后的 transcript 各补一次；空闲超过 turn_idle_close 的会话把最后一轮也关掉
+    JQ=$(find_jq) || die "没找到 jq"; export JQ
+    local repo; repo=$(vt_main_checkout "$PWD" 2>/dev/null) || repo=$(head -1 "$VT_HOME/projects"/* 2>/dev/null | head -1)
+    [ -n "$repo" ] || die "当前目录不在 git 仓里，也没有登记过的仓"
+    local before after
+    before=$(chunks | wc -l | tr -d ' ')
+    "$JQ" -n -c --arg c "$repo" '{session_id: "vibetrail-sync", cwd: $c, hook_event_name: "CatchUp"}' \
+        | VIBETRAIL_FOREGROUND=1 bash "$SELF/vibetrail-hook" CatchUp
+    after=$(chunks | wc -l | tr -d ' ')
+    say "✓ 补采完：spool 从 $before 块到 $after 块（vibetrail show / list 看结果）"
+}
+
 cmd_doctor(){
     local fatal=0 warn=0 a
     ok(){ printf '  ✓ %s\n' "$*"; }
@@ -410,6 +423,7 @@ case "${1:-}" in
     list) shift; cmd_list "$@";;
     show) shift; cmd_show "$@";;
     doctor) shift; cmd_doctor "$@";;
+    sync) shift; cmd_sync "$@";;
     version|--version|-v) say "vibetrail $VT_RUNTIME_VERSION"; [ -f "$SELF/VERSION" ] && cat "$SELF/VERSION";;
     ''|-h|--help|help) usage;;
     *) usage; exit 1;;

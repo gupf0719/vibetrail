@@ -51,6 +51,7 @@ bash tools/vibetrail init
 ```
 
 `list` 列出每个文件的位置、条数、大小；`show --json` 输出原始协议事件，也可以 `--session <会话 id 前缀>`、`--type turn` 过滤。
+想马上看到本仓以前的会话（装之前开的那些），跑 `~/.vibetrail/bin/vibetrail sync` 补采一遍；平时下次开会话时会自动补。
 
 **数据文件在** `~/.vibetrail/spool/<项目目录名>-<hash>/<会话 id>/`，每个文件是一次 hook 产出的一块，文件名 `<UTC 时间>-<pid>-<来源>.jsonl`，
 来源是 `hook-<事件名>`（hook 当场给的）、`main`（解析主会话 transcript 得出的）或 `agent-<id>`（子 agent 的 transcript）。每行一条 paas-coding-hook 协议 1.0 事件，直接 `cat` 就能看。

@@ -300,6 +300,8 @@ run(){ # 门控通过之后按事件干活
             esac ;;
         PermissionDenied|CwdChanged)
             emit_hook "$event" null '{}' ;;
+        CatchUp)   # 不是 Claude Code 的事件：vibetrail sync 要求把登记过的仓里落后的 transcript 补一遍（与 SessionStart 的补做相同），不发任何事件
+            catch_up ;;
         *) ;;
     esac
 }
