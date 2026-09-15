@@ -60,6 +60,7 @@ check "spool 里的事件与全量映射逐条一致（3 条：被拒命令、�
 check "每条过协议 schema" 'cat "$SPOOL"/*.jsonl | python3 "$SELF/schema-check.py" >/dev/null'
 check "state 记下 checkpoint 与消费到的字节" 'jq -e ".consumed_bytes == $(wc -c < "$TR" | tr -d " ") and .checkpoint_line >= 1" "$VT_HOME/state/$SID/main.json" >/dev/null'
 check "没有错误日志" '[ ! -s "$VT_HOME/logs/errors.log" ]'
+check "正常追加不算重写：state 里 rewrites 为 0、带文件指纹" 'jq -e ".rewrites == 0 and (.fprint | test(\"^[0-9]+:[0-9a-f]{40}:[0-9a-f]{40}$\"))" "$VT_HOME/state/$SID/main.json" >/dev/null'
 check "被观测仓里零写入（A8）" '[ -z "$(git -C "$REPO" status --porcelain)" ]'
 
 echo "════ 3. 重复触发不重复写 ════"
@@ -117,6 +118,20 @@ head -n 5 "$TR" > "$TR.tmp" && mv "$TR.tmp" "$TR"
 hook Stop "$(payload Stop)"
 check "state 重置到新文件" '[ "$(jq -r .consumed_bytes "$VT_HOME/state/$SID/main.json")" = "$(wc -c < "$TR" | tr -d " ")" ]'
 check "spool 里没有重复的 event_id" '[ "$(cat "$SPOOL"/*.jsonl | jq -r .event_id | sort | uniq -d | wc -l | tr -d " ")" = 0 ]'
+
+echo "════ 8b. offset 信任检查（照 agentsview）：换 inode、原地改开头都算重写；什么都没变不算 ════"
+rw(){ jq -r .rewrites "$VT_HOME/state/$SID/main.json"; }
+nev(){ cat "$SPOOL"/*.jsonl | wc -l | tr -d ' '; }
+r0=$(rw); e0=$(nev)
+hook Stop "$(payload Stop)"
+check "什么都没变：不算重写" '[ "$(rw)" = "$r0" ]'
+cp "$TR" "$TR.new" && mv "$TR.new" "$TR"
+hook Stop "$(payload Stop)"
+check "内容不变、换了 inode：算重写，从 0 重读，spool 不多一条" '[ "$(rw)" = "$((r0 + 1))" ] && [ "$(nev)" = "$e0" ]'
+{ rec zz "" q0 user '"在开头插进来的一行"' | jq -c '.parentUuid = null'; cat "$TR"; } > "$TR.new"
+cat "$TR.new" > "$TR"; rm -f "$TR.new"
+hook Stop "$(payload Stop)"
+check "inode 不变、开头被改、文件变长：靠开头的哈希认出重写，spool 里没有重复的 event_id" '[ "$(rw)" = "$((r0 + 2))" ] && [ "$(cat "$SPOOL"/*.jsonl | jq -r .event_id | sort | uniq -d | wc -l | tr -d " ")" = 0 ]'
 
 echo "════ 9. SessionStart 补做同仓里别的会话 ════"
 SID2=22222222-3333-4444-8555-666666666666

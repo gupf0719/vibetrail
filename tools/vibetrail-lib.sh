@@ -67,3 +67,17 @@ vt_unlock(){ rmdir "$1/.lock" 2>/dev/null || true; }
 vt_slug(){ # vt_slug <路径> → ~/.claude/projects 下的目录名（非字母数字都换成 -）
     printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'
 }
+
+vt_sha_stdin(){ if command -v sha1sum >/dev/null 2>&1; then sha1sum | cut -c1-40; else shasum -a 1 | cut -c1-40; fi; }
+
+vt_fprint(){ # vt_fprint <文件> <已消费字节> → "inode:开头 4 KB 的 sha1:消费位置前 4 KB 的 sha1"
+    # offset 信任检查（照 agentsview 的思路，09-15 调研）：只有同一个文件、开头与 checkpoint 前一段都没变，上次的 offset 才可信。
+    # agentsview 哈希整个前缀；我们只哈希两小段，保住「从本轮开头读」的代价（每次多读 8 KB），代价是查不出只改了中间的原地重写
+    local f=$1 n=$2 ino head tail s
+    ino=$(stat -f %i "$f" 2>/dev/null || stat -c %i "$f" 2>/dev/null) || return 1
+    s=$(( n > 4096 ? 4096 : n ))
+    head=$(head -c "$s" "$f" | vt_sha_stdin)
+    s=$(( n > 4096 ? n - 4096 : 0 ))
+    tail=$(tail -c +$((s + 1)) "$f" | head -c $((n - s)) | vt_sha_stdin)
+    printf '%s:%s:%s' "$ino" "$head" "$tail"
+}

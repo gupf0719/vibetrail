@@ -30,11 +30,12 @@
   Stop 先等 transcript 写稳；文件变短时清 state 从 0 重读；子 agent 按 `<sid>/subagents/` 目录扫；spool 改成块文件（DESIGN §3.3）。
   回归 `tools/test-hook-flow.sh` 21 项：scenario 回放 + 未登记零写入、重复触发、锁、半行、回放副本、子 agent、重写、补做别的会话、scope=user；
   两个变异（去掉会话锁、ids 去重换回 `NR == FNR`）都被抓到。
-- [ ] 借鉴开源调研（09-15，[third-party/open-source-survey.md](third-party/open-source-survey.md)，不照抄）：
+- [x] 借鉴开源调研（09-15，[third-party/open-source-survey.md](third-party/open-source-survey.md)，不照抄）：
   - [x] 人话排除清单补「This session is being continued」「Stop hook feedback:」两类前缀，IDE 标签只剥不整条排除（照 agentsview）；本机语料上的条数没量成（命令被拦），下个会话补
   - [x] 同一 message.id 的用量留 output 大的那份（照 ccusage）；本机同一 id 用量全部一致，纯防御
   - [x] 对照时查出的真问题：被打断的回复只取了最近一条记录，按 message.id 拼回整条，快照留完整的、真多段接起来（两家都会丢段，DESIGN §4.2）；回复 22 → 97 条
-  - [ ] state 多记 inode 与文件开头、checkpoint 前各一小段的哈希，对不上从 0 重读（照 agentsview 的思路、不哈希整个前缀）
+  - [x] offset 信任检查：state 记「inode : 开头 4 KB : 消费位置前 4 KB」指纹，对不上从 0 重读、`rewrites` 计次（照 agentsview 的思路、不哈希整个前缀）；
+    `test-hook-flow.sh` 25 项，含换 inode、原地改开头、什么都没变三个场景，去掉哈希的变异被抓到
   - push 的退避与永久失败记账随 push 一项做（D6 已写进 DESIGN §4）。
 - [ ] 轮次元数据一路：每轮 `turn.start` / `turn.end`（status、usage、vcs）、`InstructionsLoaded` 只记路径与 sha；不传 transcript 原文件、不传非分歧正文（D5）；先做 Claude Code。
 - [ ] commit ↔ session 推导：每轮起止 HEAD + `rev-list`（DESIGN §3.5）；`vibetrail show` 按 commit 查改走它。

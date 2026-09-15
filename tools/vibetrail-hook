@@ -41,15 +41,20 @@ pkey=$(vt_project_key "$workspace")
 # ---- 一份 transcript 文件：从 checkpoint 起映射 → 去重 → 写一块 spool → 推进 state ----
 process_file(){ # process_file <sid> <state 目录> <文件> <名>
     local sid=$1 sd=$2 f=$3 name=$4 st="$2/$4.json" seen="$2/$4.seen"
-    local size lines=0 consumed=0 ckl=1 ckb=0 tmp rc
+    local size lines=0 consumed=0 ckl=1 ckb=0 fp_old="" rewrites=0 ino tmp rc fp
     size=$(wc -c < "$f" 2>/dev/null | tr -d ' ') || return 0
+    ino=$(stat -f %i "$f" 2>/dev/null || stat -c %i "$f" 2>/dev/null)
     if [ -f "$st" ]; then
-        IFS=$'\t' read -r lines consumed ckl ckb < <("$JQ" -r '[.lines, .consumed_bytes, .checkpoint_line, .checkpoint_byte] | @tsv' "$st" 2>/dev/null)
-        lines=${lines:-0}; consumed=${consumed:-0}; ckl=${ckl:-1}; ckb=${ckb:-0}
+        IFS=$'\x1f' read -r lines consumed ckl ckb fp_old rewrites < <("$JQ" -r \
+            '[.lines, .consumed_bytes, .checkpoint_line, .checkpoint_byte, (.fprint // ""), (.rewrites // 0)] | map(tostring) | join("")' "$st" 2>/dev/null)
+        lines=${lines:-0}; consumed=${consumed:-0}; ckl=${ckl:-1}; ckb=${ckb:-0}; rewrites=${rewrites:-0}
     fi
-    [ "$size" -eq "$consumed" ] && return 0                       # 没有新字节
-    if [ "$size" -lt "$consumed" ]; then                           # 文件变短：被重写过，从 0 重读（ids 留着，重复事件照样拦下）
-        rm -f "$st" "$seen"; lines=0; consumed=0; ckl=1; ckb=0
+    # offset 信任检查（照 agentsview，09-15）：换了 inode、变短、开头或 checkpoint 前 4 KB 的哈希变了，都算被重写过——从 0 重读，
+    # ids 留着，重读出的同一批事件在写 spool 前按 event_id 拦下。没有新字节时只比 inode（一次 stat），不算哈希：
+    # 一个会话几十个子 agent 文件，每个都算两段哈希会让每次 Stop 多一两秒；大小完全不变的原地改写只能靠 inode 发现
+    if [ "$size" -eq "$consumed" ] && { [ -z "$fp_old" ] || [ "${fp_old%%:*}" = "$ino" ]; }; then return 0; fi
+    if [ "$consumed" -gt 0 ] && { [ "$size" -lt "$consumed" ] || { [ -n "$fp_old" ] && [ "$(vt_fprint "$f" "$consumed")" != "$fp_old" ]; }; }; then
+        rm -f "$st" "$seen"; lines=0; consumed=0; ckl=1; ckb=0; rewrites=$((rewrites + 1))
     fi
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/vibetrail-hook.XXXXXX") || return 0
     bash "$SELF/vibetrail-map" "$f" --sid "$sid" --project-id "$project" --workspace-id "$workspace" \
@@ -71,7 +76,9 @@ process_file(){ # process_file <sid> <state 目录> <文件> <名>
         sed -n 's/.*"event_id":"\([0-9a-f-]*\)".*/\1/p' "$tmp/new" >> "$sd/ids"
     fi
     [ -f "$tmp/src" ] && cat "$tmp/src" >> "$seen"
-    "$JQ" -c '{lines, consumed_bytes, file_bytes, checkpoint_line, checkpoint_byte, parent_instance, updated_at: (now | todate)}' \
+    fp=$(vt_fprint "$f" "$("$JQ" -r '.consumed_bytes' "$tmp/ledger")") || fp=""
+    "$JQ" -c --arg fp "$fp" --argjson rw "$rewrites" \
+        '{lines, consumed_bytes, file_bytes, checkpoint_line, checkpoint_byte, parent_instance, fprint: $fp, rewrites: $rw, updated_at: (now | todate)}' \
         "$tmp/ledger" > "$st.tmp" && mv "$st.tmp" "$st"
     rm -rf "$tmp"
 }

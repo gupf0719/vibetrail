@@ -26,7 +26,7 @@
 
 | 问题 | 最好的做法（出处） | 比我们好吗 | 我们怎么办 |
 |---|---|---|---|
-| 增量读取 | agentsview：信任 offset 前先查三件事——同一个文件、没变短、offset 之前那段的哈希没变，任一不满足就整份重读；新读到的记录接不上上次最后一个 uuid 时也整份重读 [源码 `assessCapture`、`claudeParseSessionFrom`] | **是**：我们只查「变短」，同样大小的原地重写查不出来 | 借：state 多记 inode 与 checkpoint 之前一小段（如 4 KB）的哈希，对不上从 0 重读；只哈希一小段是我们的改法，agentsview 哈希整个前缀 |
+| 增量读取 | agentsview：信任 offset 前先查三件事——同一个文件、没变短、offset 之前那段的哈希没变，任一不满足就整份重读；新读到的记录接不上上次最后一个 uuid 时也整份重读 [源码 `assessCapture`、`claudeParseSessionFrom`] | **是**：我们只查「变短」，同样大小的原地重写查不出来 | **已借**（09-15）：state 记 inode、开头 4 KB 与消费位置前 4 KB 的哈希，对不上从 0 重读；只哈希两小段是我们的改法，agentsview 哈希整个前缀。「接不上上次最后一个 uuid 就整份重读」没借：我们从本轮开头读，回放副本另有按 uuid + 行号的规则（DESIGN §4.2） |
 | 会话锁 | agentsview 非阻塞 `flock`；Langfuse `LOCK_NB` 等 2 s [源码] | 持平 | 我们用 mkdir 锁，bash 里等价；vibe-log 先查后写的锁有竞态，别学 |
 | 回放副本 | claude-code-log 按 uuid 留第一份，时间戳相同的兄弟记录当回放 [源码 `build_message_index`]；agentsview 按 uuid 重叠裁掉后台 fork 的回放 [源码] | 否，没人处理「promptId 被改写」 | 维持按 uuid + 行号跳过。两个 Claude Code issue 说 `saved_hook_context` 会共用 uuid、`file-history-snapshot` 的 messageId 会撞 uuid [issue]——我们只对触发记录与人话记录去重，正好避开 |
 | 打断与拒绝 | 各家都是字符串前缀加 `is_error` [源码]；没人拿 `toolUseResult` 对账 | 否 | 维持判据 + 字段哨兵。更硬的信号在 Claude Code 自己：`PermissionDenied` hook（auto mode 拒绝，带 `tool_use_id` 与 reason）、`PostToolUseFailure` 的 `is_interrupt`、OTel 的 `tool_decision` 事件（`decision_source` 分 user_reject / user_abort / config / hook）[文档]，列进 U8 / G6 做对账候选。新版 transcript 的 `toolDenialKind` 在内部会话重置时也会出现 [issue]，只能当提示 |

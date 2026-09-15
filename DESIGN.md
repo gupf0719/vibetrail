@@ -143,7 +143,10 @@ hook payload 里的 `tool_input` / `tool_response` 也不另存一份——trans
 - **从本轮开头读，不从文件头读**（U11，09-15 定）。映射要回看的东西都在同一轮里，所以只重读本轮：106 MB 的会话一次从 10.5 s
   降到 0.19 s；676 轮里九成不超过 0.4 MB。借的是 Pilot「只读新字节」的思路，但它不保留上下文、全靠 Stop 恰好切在轮边界，
   我们退到本轮开头，边界落在轮中间也不丢上下文。首次整读仍是 O(文件)，106 MB 约 12 s，只发生一次、在后台。
-- 源文件长度 < offset 时从 0 重读（重写守卫），清掉这份文件的 state 与 `.seen`，`ids` 留着——重读出的同一批事件在写 spool 前按 event_id 拦下。
+- **offset 信任检查**（重写守卫，照 agentsview 的思路，[调研](third-party/open-source-survey.md)）：state 里记文件指纹「inode : 开头 4 KB 的 sha1 :
+  已消费位置前 4 KB 的 sha1」。换了 inode、文件变短、两段哈希任一变了，都算被重写过：从 0 重读，清掉这份文件的 state 与 `.seen`，`ids` 留着——
+  重读出的同一批事件在写 spool 前按 event_id 拦下；state 的 `rewrites` 计次数，给 doctor 看。agentsview 哈希整个前缀，我们只哈希两小段，
+  保住「从本轮开头读」的代价；没有新字节时只比 inode、不算哈希（一个会话几十个子 agent 文件）。代价写明：只改了中间、大小又不变的原地改写查不出来。
   transcript 目前是 append-only，但 `file-history-snapshot` 带 `isSnapshotUpdate` 字段，不能假设永远是。
 - 首次全读、无单次上限。Pilot 首次只读最后一轮、单次超过 50 MB 只读尾部，那份 111 MB 的会话前段整个丢掉，4 条拒绝没了；
   teamai 超过 50 MB 整份不扫。两种上限都会丢分歧，不学。
