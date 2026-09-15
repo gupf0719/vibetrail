@@ -11,7 +11,8 @@
 
 ### 拆解
 
-- [ ] 定 U1 默认 scope（U4 只剩端点与 token，可以最晚定：端点没配之前 push 不发）。服务端 schema 已进仓：`third-party/collection-batch-1.0.schema.json`。
+- [x] 定 U1 默认 scope：可配，默认 `project`（用户 09-15）。U4 只剩端点与 token，可以最晚定：端点没配之前 push 不发。服务端 schema 已进仓：`third-party/collection-batch-1.0.schema.json`。
+  默认值：`client.name` 照填 `paas-coding-hook`，`policy_version` 填 `none-0`（DESIGN §4.1）。
 - [ ] 机器级安装：`vibetrail init [--scope user|project]`——`~/.vibetrail/bin` + HOME settings 条目（带 marker）+ `config`（含 jq 绝对路径）+ 登记；
   `vibetrail uninstall`；doctor 改成 DESIGN §5 的自检项。被观测仓里零写入（A8）。
 - [ ] hook 分发入口 `vibetrail-hook <事件>`：读 stdin、按 scope 门控、发 session / turn / subagent 起止事件与 `ext.claude.*` 事件头、git 状态，写 `events.jsonl`（DESIGN §3.1、§4.1）；纪律照 §3.4。

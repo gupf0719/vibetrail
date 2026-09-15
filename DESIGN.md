@@ -22,7 +22,7 @@
 - 09-14：「项目级和用户级都要，可配置的，参考teamai，不存git了，不要clone一次装一次，未来会push云端，暂时先缓存本地文件让我看输出内容，保留push动作。然后和teamai一样，装一次就行」
 - 09-14：「我们应该也不把hook写进仓，之前的做法不需要」「现在我们的目标就是通过hook把数据传上去，尽量本地不要存太多东西」「如果不是常驻进程，用不到go吧」
 - 09-14：「它没说transcript正文要进表吧？你在哪看到的」
-- 09-15：「不用传全量的transcript文本，有必要吗」「正文的话，人机分歧先看看能不能带正文吧，其他的先不考虑，不然数据量有点大。如果后面有必要再补充」「数据30天没问题，超过一个月复盘意义不大」「读取不是我们读，我们只负责采，读取分析由其他服务完成」「turn.end 推荐 code，其实是自定义的，不是枚举的，interrupted我们可以直接加」
+- 09-15：「不用传全量的transcript文本，有必要吗」「正文的话，人机分歧先看看能不能带正文吧，其他的先不考虑，不然数据量有点大。如果后面有必要再补充」「数据30天没问题，超过一个月复盘意义不大」「读取不是我们读，我们只负责采，读取分析由其他服务完成」「turn.end 推荐 code，其实是自定义的，不是枚举的，interrupted我们可以直接加」「U1 默认 scope 取 project。意思是项目级别还是用户级别，这个是可配置项把，默认项目级别。参考teamai」
 
 ## 1. 要解决的问题
 
@@ -206,7 +206,7 @@ flowchart LR
 Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-batch-1.0.schema.json)）：枚举类字段全是小写 `code` 型；`permission.decision` 必填
 `permission_id` / `tool_name` / `decision` / `decided_by`；`provenance.kind=transcript` 必带 `rule_version`；`files[].evidence=tool_argument` 只能是
 `target` / `read`，说「改了」要 `tool_result` 或 `before_after`；路径必须在工作区根内、不能 `..`（跨仓改动 K2 没有表达法）；`commits` 只能挂 `turn.end`、
-非空、完整 sha；`ext.*` 必带 `provenance.source_event`；thinking 不能当 assistant 文本。`client.name` 是 const `paas-coding-hook`（已提意见）。
+非空、完整 sha；`ext.*` 必带 `provenance.source_event`；thinking 不能当 assistant 文本。`client.name` 是 const `paas-coding-hook`，先照填（已提意见），vibetrail 自己的版本放 `extensions.vibetrail.version`；`policy_version` 填 `none-0` 表示暂不脱敏（两个默认值用户 09-15 认可）。
 `workspace_id` 取主 checkout（`git worktree list` 第一条），与 G8 的分区键一致，worktree 路径放 extensions。
 
 ## 5. 安装与范围
@@ -217,7 +217,7 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
 | 层 | 做什么 | 幂等 / 升级 |
 |---|---|---|
 | 机器级（一次） | 运行时放 `~/.vibetrail/bin/`（hook 命令必须是绝对路径，触发时还不知道在哪个仓）；往 `~/.claude/settings.json` 写 hook 条目；建 `~/.vibetrail/{spool,state,projects,config}`；将来的云端鉴权 token 放 `~/.vibetrail/`（0600，teamai 的 `~/.teamai/token` 同款） | 条目带 marker，升级按 marker 换掉自家旧条目（Pilot 的做法）；不建守护进程、不改 shell rc、不注入进程 |
-| scope（可配） | `project`（倾向默认，U1）：只采登记过的项目，分发入口查 `~/.vibetrail/projects/`，未登记直接退出（G8）。`user`：本机所有目录都采，不看登记表——用户显式选才开。配置在 `~/.vibetrail/config` | 改配置即生效，hook 每次触发读一次 |
+| scope（可配） | `project`（**默认**，用户 09-15 定，参考 teamai）：只采登记过的项目，分发入口查 `~/.vibetrail/projects/`，未登记直接退出（G8）。`user`：本机所有目录都采，不看登记表——用户显式选才开。配置在 `~/.vibetrail/config` | 改配置即生效，hook 每次触发读一次 |
 | 登记（scope=project 的开关） | `vibetrail init` 在仓里跑时顺手登记本仓（键 = `git worktree list` 第一条的主 checkout，worktree 共享）；另有 `vibetrail projects add / remove / list`（U2）。登记表在 HOME，仓里不留痕 | 幂等 |
 | 自检 | `vibetrail-doctor`：条目在不在、指向的运行时与 jq 在不在、版本一致否；scope 与本仓登记了没；最近 N 个会话的 `stop_hook_summary` 里有几个跑过我们的命令（transcript 自带这条证据，不用另存状态）；spool 积压、offset 落后、端点配没配；本机语料里有没有已知清单之外的 `type` / `attachment.type` / hook 事件名（G6） | — |
 | 卸载 | `vibetrail uninstall`：settings 条目、`~/.vibetrail/bin` 与 state 还原；`--purge` 才删 spool。被观测仓里没有东西要还原 | — |
@@ -311,7 +311,7 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
   转成 push 的前置条件：只采登记过的项目（G8）、失败日志不留 payload。脱敏（K6）暂缓，先原样传。
 - **本机不是存档。** push 在产出数据的同一个 hook 里发，ack 即删，本机常驻只有 offset 与没 ack 的块。现阶段没有云端：spool 里的文件就是将来
   push 的内容，先让人看；push 动作第一版就在，端点没配置时不发只记账。G9 的本地查看在端点配置后改看清单与元数据。
-- **安装照 teamai：机器级装一次**，不再每个 clone 装。hook 条目只写 HOME 的 `~/.claude/settings.json`；「项目级 / 用户级」是 scope 配置，默认暂不定（U1）。
+- **安装照 teamai：机器级装一次**，不再每个 clone 装。hook 条目只写 HOME 的 `~/.claude/settings.json`；「项目级 / 用户级」是 scope 配置，默认 `project`（U1，09-15 定）。
 - **被观测仓里零写入。** `prepare-commit-msg` 的 `Claude-Session` trailer 退役——不再往任何仓的 `.git/hooks` 写东西，仓内 vendor、`.gitattributes`
   也不再需要。commit ↔ session 改从每轮起止的 HEAD 推（§3.5）；trailer 机制的实测结论留在 git 历史与 `tools/test-hook.sh`。
 - **实现栈 bash + jq + curl**，不做 Go（§5.3）。
@@ -370,6 +370,6 @@ D2 的「正文与指针分开」在 D5 后反转：分歧事件自带能判责�
 
 ## 10. 未定项
 
-只记在 [OPEN-ISSUES.md](OPEN-ISSUES.md)：U1 默认 scope · U2 登记方式 · U4 端点 / token / 谁能看 · U5 spool 上限 ·
+只记在 [OPEN-ISSUES.md](OPEN-ISSUES.md)：U2 登记方式 · U4 端点 / token / 谁能看 · U5 spool 上限 ·
 U6 审计线去向 · U7 自建还是改造 Pilot · U8 类型化信号成不成 kind · U9 Codex / Cursor；另有 K6 脱敏（暂缓）、G5（升为前置）、
-G8 / G9 / G6 / G10 / G11。U3 / U10 / K1 已由 D5 关闭。
+G8 / G9 / G6 / G10 / G11。U1 已定（scope 可配，默认 `project`）；U3 / U10 / K1 已由 D5 关闭。

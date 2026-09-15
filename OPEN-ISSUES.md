@@ -52,7 +52,7 @@ B3 删掉 `user_edited_after_agent` 进了 [spec/diverge-v1.md §2.1](spec/diver
 | **M1** | ~~未量~~ | ✅ | ~~`is_error` 数组形态在语料里有多少~~ —— **已量（09-09）：1145 个 `is_error` 块全部字符串形态，数组形态 0 个**。铁律五的修复是纯防御，未恢复任何漏计 |
 | **M2** | 未量 | 🟢 | **召回率绝对基线未测**——现有基线是无锚子串候选集；`permission_denied` 的「人工核对候选集」口径没记 |
 | **M3** | 未量 | 🟢 | **`.meta.json` 字段集随版本变**——2.1.85 两项 / 2.1.202 三项 / 2.1.260 四项。全量副本逐字节复制它，消费方按缺失容错 |
-| **U1** | 待定决策 | 🟡 | **默认 scope**：`project`（只采登记的）还是 `user`（全机采）。倾向 project——与 G8 一致，误采代价高于漏采（DESIGN §5） |
+| ~~**U1**~~ | 待定决策 | ✅ | ~~默认 scope~~ —— **已定**（2026-09-15，用户）：scope 可配置（`project` 只采登记的 / `user` 全机采），默认 `project`，参考 teamai；与 G8 一致，误采代价高于漏采（DESIGN §5） |
 | **U2** | 待定决策 | 🟢 | **登记方式**：`vibetrail init` 在仓里跑时顺手登记 / `vibetrail projects add`，两种并存还是选一种 |
 | ~~**U3**~~ | 待定决策 | ✅ | ~~全量一路的格式~~ —— **由 D5 关闭**（2026-09-15）：不传 transcript 原文件，不存 file-history；分歧映射成协议事件并带最小正文，其余只有轮次元数据（DESIGN §2、§4.1） |
 | **U4** | 待定决策 | 🟡 | **端点、token、谁能看**。云端服务与 schema 已定（D5，2026-09-15）：paas-coding-hook 事件协议 1.0 的 collector，映射见 DESIGN §4.1。仍未定：端点地址；`Onepaas-Api-Access-Token` 怎么发与续期（hook 无人值守，要长期 token，放 `~/.vibetrail/` 0600）；谁能看（协议默认全公司可见，与 K6 暂不脱敏冲突，已提第二轮 [意见](third-party/paas-coding-hook-protocol-feedback.md)）。端点没配之前 push 不发，可以最晚定 |
@@ -69,7 +69,8 @@ M1 数组形态 · G4 留痕自检 · G3 的实现部分 · **G1 查询端** · 
 K4 分歧记录含分支名（并入 K6）·
 **L2 审计留痕**（`vibetrail-audit`，断链二解决）·
 **G2 写入者 / G3 / D1 / D2**（2026-09-14 随 D4 关闭：hook 写 spool、机器级装一次、trailer 退役、不留 SpecStory 副本）·
-**U3 / U10 / K1**（2026-09-15 随 D5 关闭：不传 transcript 原文件、30 天够用、父子打断是两个事实不去重）。
+**U3 / U10 / K1**（2026-09-15 随 D5 关闭：不传 transcript 原文件、30 天够用、父子打断是两个事实不去重）·
+**U1**（2026-09-15 用户定：scope 可配，默认 `project`）。
 
 
 ## D. 三轮审计的方法教训
