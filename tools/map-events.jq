@@ -378,9 +378,11 @@ def stopFeedback($r; $s):
      and (($r.attachment.hookEvent // "") | test("^(Stop|SubagentStop)$")))
   or ($r.type == "user" and ($s.text | test("^(Stop|SubagentStop) hook feedback:")));
 
-# 模型答完的标记：Claude Code 跑完这次 Stop 的 hook 写的 stop_hook_summary。前面没有拦停痕迹就当场关轮
+# 模型答完的标记：Claude Code 跑完这次 Stop 的 hook 写的 stop_hook_summary。前面没有拦停痕迹就当场关轮。
+# 只关已经有过模型回复的轮：desktop 等下一句人话进来才把上一轮的 summary 落盘，它会落在下一轮开头的本地命令记录（/model 之类，与下一句人话共用一个 promptId）
+# 之后——09-15 本机就这样把下一轮在开头错关了，整轮的用量都丢了
 def turnStopMarker($r; $s):
-  if .pturn != null and (.pturn.closed | not) and mainRec($r) and $r.type == "system" and $r.subtype == "stop_hook_summary"
+  if .pturn != null and (.pturn.closed | not) and .pturn.answered and mainRec($r) and $r.type == "system" and $r.subtype == "stop_hook_summary"
   then if (.pturn.stop_blocked // false) then .pturn.stop_blocked = false | .pturn.block_pending = true   # 这次 Stop 被拦下，模型要接着干
        else .pturn.summary = {uuid: $s.uuid, ts: $s.ts, prevented: ($r.preventedContinuation == true), reason: ($r.stopReason // "")}
             | closeTurn("summary"; $s; false) end
