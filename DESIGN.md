@@ -407,6 +407,22 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
 
 ## 7. 决策记录
 
+### D11 — 项目级：init 让人选项目、总列出登记表；补采按仓记；写 settings 加两道保险（2026-09-16，现行）
+
+用户原话：「支持项目级，默认也是项目级，但是init后好像没选项目」「改claude这些配置文件一定要小心，别改坏了或者影响用户使用」。
+
+- **选项目**：原先 `init` 只在「当前目录所在的仓」里顺手登记，不在 git 仓里跑就只打一句提示、什么都不登记，也不列出登记了哪些——默认只采登记过的仓，
+  选哪些却是隐形的。teamai 同样按当前目录定项目，但会把「Scope: project（路径）」打出来，在 home 目录下退回用户级；Pilot 不分项目。
+  现在：在终端里跑 `init` 会列出用过 Claude Code 的仓（从 `~/.claude/projects` 每个目录最近那份 transcript 的 `cwd` 推出主仓，worktree 并成一项，
+  desktop 的 worktree 删了按 `<仓>/.claude/worktrees/<名字>` 找回主仓；标出已登记与最近活跃）让人输编号选；不在终端里跑（脚本、`--no-pick`）不问。
+  最后总是列出登记表，一个都没有就明说「现在什么都不会采」。随时可以 `vibetrail projects pick` 再选。
+- **补采按仓记**（加多选时查出的缺陷）：SessionStart / sync 的补采扫所有登记过的仓，却一直用本次 hook 所在仓的 project / workspace / spool 目录——
+  登记两个仓，别的仓的会话就记到这个仓名下。现在每个仓按它自己的算。已经删掉的 desktop worktree 留下的会话目录也扫，归主仓。
+- **写 settings 的两道保险**：09-15 23:55 我新写的 test-hook-flow 第 16 段跑 `init` 时漏设 `VIBETRAIL_CLAUDE_SETTINGS`，把用户真实 settings 里
+  14 条 hook 命令写成了测试临时目录（随后被删），本机采集断了约 15 分钟，重跑真实 init 恢复，恢复时存下的那份坏备份挪进了废纸篓。
+  现在 `init` 在「运行时在临时目录、settings 却不在」时拒绝写；写完自检（JSON 对象、每条 hook 命令指向的脚本都在），不对就用这次的备份还原。
+  test-hook-flow 全局导出 `VIBETRAIL_CLAUDE_SETTINGS`，末尾核对真实 settings 的校验和没变。回归：第 13、16 段。
+
 ### D10 — 新发现的几处两家都没解决，自己修：内部 agent、API 重试、origin.kind、轮里插话、调用 id（2026-09-15，现行）
 
 用户原话：「新发现的问题看看两家有没有解决，没有我们再自己修」；看报告时问「trace的话没有span id和trace id这些是么，pilot有这些吗」。

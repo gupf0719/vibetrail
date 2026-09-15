@@ -2,7 +2,7 @@
 # 回归：hook 分发入口 + 分歧一路挂 hook（TODO G7 第 2 步）。用 experiments/collect-demo/scenario.json 在临时目录里真实回放：
 # 临时 git 仓当被观测项目，临时目录当 ~/.vibetrail 与 ~/.claude/projects，逐步追加 transcript、逐个触发 hook。
 # 断言：A4 未登记零写入；登记后 spool == 对最终 transcript 的一次全量映射；stdout 永远为空、exit 0；重复触发不重复写；
-# 锁被占时跳过、之后补上；半行等写完再读；文件被重写后不重复；打断后没有 Stop 也不漏；子 agent（还在跑的不写半截调用）；回放副本；SessionStart 补做别的会话；scope=user；压缩时重写的旧工具结果不重发 tool.end；连续调用的请求开始；init 重跑不动 settings；K7 分拒绝与按停止；内部 agent、API 重试、origin.kind、轮里插话。
+# 锁被占时跳过、之后补上；半行等写完再读；文件被重写后不重复；打断后没有 Stop 也不漏；子 agent（还在跑的不写半截调用）；回放副本；SessionStart 补做别的会话；scope=user；压缩时重写的旧工具结果不重发 tool.end；连续调用的请求开始；init 重跑不动 settings；K7 分拒绝与按停止；内部 agent、API 重试、origin.kind、轮里插话；项目级多仓各记各的、projects pick。
 # 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
 # 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
 export LC_ALL=C
@@ -21,7 +21,10 @@ check(){ if eval "$2"; then ok; else ko "$1"; fi; }
 REPO=$T/demo-proj; mkdir -p "$REPO"; REPO=$(cd "$REPO" && pwd -P)
 ( cd "$REPO" && git init -q -b main && git config user.email t@t && git config user.name t \
   && printf 'def add(a, b):\n    return a + b\n' > calc.py && git add -A && git commit -q -m init )
-export VIBETRAIL_HOME=$T/vt VIBETRAIL_CLAUDE_PROJECTS=$T/claude/projects VIBETRAIL_STABLE_WAIT=0 VIBETRAIL_FOREGROUND=1
+# settings 也必须指到临时目录：09-15 第 16 段跑 init 时漏了它，把真实的 ~/.claude/settings.json 里的 hook 命令写成了临时目录（事后已恢复）
+REAL_SETTINGS=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json
+REAL_SUM=$( { cat "$REAL_SETTINGS" 2>/dev/null || true; } | cksum)
+export VIBETRAIL_HOME=$T/vt VIBETRAIL_CLAUDE_PROJECTS=$T/claude/projects VIBETRAIL_CLAUDE_SETTINGS=$T/claude/settings.json VIBETRAIL_STABLE_WAIT=0 VIBETRAIL_FOREGROUND=1
 . "$SELF/vibetrail-lib.sh"; VT_HOME=$VIBETRAIL_HOME
 SID=11111111-2222-4333-8444-555555555555
 TDIR=$VIBETRAIL_CLAUDE_PROJECTS/$(vt_slug "$REPO"); TR=$TDIR/$SID.jsonl
@@ -252,6 +255,9 @@ vcli(){ ( cd "$REPO" && VIBETRAIL_HOME=$IS/.vibetrail VIBETRAIL_CLAUDE_SETTINGS=
 nhook(){ jq '[.. | objects | select(has("command")) | .command | select(test("vibetrail-hook"))] | length' "$IS/.claude/settings.json"; }
 vcli init --no-register; n1=$(nhook); vcli init --no-register
 check "两次 init：model 还在、条目没翻倍；第二次没变化，不写也不多备份；装之前的原样另存了一份" '[ "$(nhook)" = "$n1" ] && [ "$n1" -gt 0 ] && jq -e ".model == \"opus\"" "$IS/.claude/settings.json" >/dev/null && [ "$(ls "$IS/.vibetrail/backup"/settings.json.2* | wc -l | tr -d " ")" = 1 ] && jq -e ". == {model: \"opus\"}" "$IS/.vibetrail/backup/settings.json.before-vibetrail" >/dev/null 2>&1'
+mkdir -p "$T/g/home/.claude"; printf '{"model": "opus"}\n' > "$T/g/home/.claude/settings.json"; g0=$(cksum < "$T/g/home/.claude/settings.json")
+check "运行时在临时目录、settings 不在（模拟测试漏设 VIBETRAIL_CLAUDE_SETTINGS）：init 拒绝写，settings 一字不动" \
+    '! ( cd "$REPO" && VIBETRAIL_HOME=$T/g/tmpvt VIBETRAIL_CLAUDE_SETTINGS=$T/g/home/.claude/settings.json VIBETRAIL_TMP_ROOTS=$T/g/tmpvt bash "$SELF/vibetrail" init --no-register --no-pick >/dev/null 2>&1 ) && [ "$(cksum < "$T/g/home/.claude/settings.json")" = "$g0" ]'
 vcli uninstall
 check "uninstall 之后回到原样，原样那份备份没被覆盖" 'jq -e ". == {model: \"opus\"}" "$IS/.claude/settings.json" >/dev/null && jq -e ". == {model: \"opus\"}" "$IS/.vibetrail/backup/settings.json.before-vibetrail" >/dev/null 2>&1'
 
@@ -335,6 +341,35 @@ R6=$T/k15-par.jsonl
 check "按停止打断时只发真正被打断的那次调用：同一条回复里已经跑完的 Read 不算" \
     '[ "$(map_r "$R6" --ledger /dev/null | jq -s -c "[.[] | select(.type == \"tool.request\") | .payload.call_id]")" = "[\"nt2\"]" ]'
 
+echo "════ 16. 项目级：两个登记的仓各记各的（补采按那个仓算）；删掉的 desktop worktree 留下的会话照样补；projects pick 选仓；init 列登记表 ════"
+REPO2=$T/second-proj; mkdir -p "$REPO2"; REPO2=$(cd "$REPO2" && pwd -P)
+( cd "$REPO2" && git init -q -b main && git config user.email t@t && git config user.name t && git remote add origin git@github.com:acme/second.git \
+  && printf 'x\n' > a.txt && git add -A && git commit -q -m init )
+grep -v '^scope=' "$VT_HOME/config" > "$VT_HOME/config.tmp"; printf 'scope=project\n' >> "$VT_HOME/config.tmp"; mv "$VT_HOME/config.tmp" "$VT_HOME/config"
+vt_register "$REPO"; vt_unregister "$REPO2" 2>/dev/null
+TD2=$VIBETRAIL_CLAUDE_PROJECTS/$(vt_slug "$REPO2"); TDG=$VIBETRAIL_CLAUDE_PROJECTS/$(vt_slug "$REPO2")--claude-worktrees-gone; mkdir -p "$TD2" "$TDG"
+SIDA=33333333-0000-4000-8000-00000000000a; SIDB=33333333-0000-4000-8000-00000000000b
+{ rec a1 "" qa user '"第二个仓里问一句"' | jq -c --arg s "$SIDA" --arg c "$REPO2" '.sessionId = $s | .cwd = $c | .parentUuid = null'
+  rec a2 a1 qa assistant '[]' '{"message":{"id":"am1","model":"claude-opus-5","role":"assistant","content":[{"type":"text","text":"我先看看。"}]}}' | jq -c --arg s "$SIDA" --arg c "$REPO2" '.sessionId = $s | .cwd = $c'
+  rec a3 a2 qa user '[{"type":"text","text":"[Request interrupted by user]"}]' | jq -c --arg s "$SIDA" --arg c "$REPO2" '.sessionId = $s | .cwd = $c'
+} > "$TD2/$SIDA.jsonl"
+{ rec g1 "" qg user '"worktree 里问一句"' | jq -c --arg s "$SIDB" --arg c "$REPO2/.claude/worktrees/gone" '.sessionId = $s | .cwd = $c | .parentUuid = null'
+  rec g2 g1 qg assistant '[]' '{"message":{"id":"gm1","model":"claude-opus-5","role":"assistant","content":[{"type":"text","text":"好。"}]}}' | jq -c --arg s "$SIDB" --arg c "$REPO2/.claude/worktrees/gone" '.sessionId = $s | .cwd = $c'
+  rec g3 g2 qg user '[{"type":"text","text":"[Request interrupted by user]"}]' | jq -c --arg s "$SIDB" --arg c "$REPO2/.claude/worktrees/gone" '.sessionId = $s | .cwd = $c'
+} > "$TDG/$SIDB.jsonl"
+PK2=$(vt_project_key "$REPO2")
+hook SessionStart "$(payload SessionStart '{"source":"startup"}')"
+check "第二个仓没登记：补采不碰它" '[ ! -e "$VT_HOME/spool/$PK2" ]'
+check "projects pick：候选里有第二个仓（删掉的 worktree 并到主仓），选 a 全部登记" \
+    'out=$(printf "a\n" | bash "$SELF/vibetrail" projects pick 2>&1); printf "%s" "$out" | grep -q "$REPO2" && [ "$(printf "%s" "$out" | grep -c "$REPO2")" = 1 ] && vt_registered "$REPO2"'
+hook SessionStart "$(payload SessionStart '{"source":"startup"}')"
+check "在第一个仓里开会话、补采到第二个仓的会话：记在第二个仓的 spool 目录，project_id / workspace_id 是第二个仓的" \
+    '[ "$(cat "$VT_HOME/spool/$PK2/$SIDA"/*.jsonl 2>/dev/null | jq -s -c "[length > 0, (map(.project_id) | unique), (map(.workspace_id) | unique)]")" = "[true,[\"github.com/acme/second\"],[\"$REPO2\"]]" ] && [ ! -e "$VT_HOME/spool/$PKEY/$SIDA" ]'
+check "删掉的 desktop worktree 留下的会话照样补，归主仓" '[ -n "$(cat "$VT_HOME/spool/$PK2/$SIDB"/*.jsonl 2>/dev/null)" ]'
+check "init（不在终端里跑，不问）：最后列出登记表，两个仓都在" \
+    'out=$( cd "$REPO" && bash "$SELF/vibetrail" init --no-register 2>&1 ); printf "%s" "$out" | grep -q "只采下面这些登记过的仓" && printf "%s" "$out" | grep -q "$REPO2" && printf "%s" "$out" | grep -q "· $REPO\$"'
+
+check "测试没有动真实的 settings.json（${REAL_SETTINGS}）" '[ "$( { cat "$REAL_SETTINGS" 2>/dev/null || true; } | cksum)" = "$REAL_SUM" ]'
 echo
 [ "$skipped_schema" -gt 0 ] && echo "  ⚠ 本机 python3 没有 jsonschema，协议 schema 校验跳过 $skipped_schema 处（pip install jsonschema 后重跑）"
 if [ $fail -eq 0 ]; then echo "  ✅ $pass/$pass 通过"; else echo "  ❌ $fail 失败 / $pass 通过"; exit 1; fi

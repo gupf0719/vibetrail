@@ -28,7 +28,13 @@ bash tools/vibetrail init
 | `~/.vibetrail/config` | scope（默认 project，只采登记过的仓）、jq 路径等 |
 | `~/.vibetrail/projects/` | 登记的仓 |
 
-被观测的仓里什么都不写。要多采一个仓：在那个仓里跑 `~/.vibetrail/bin/vibetrail projects add`。
+默认只采登记过的仓。在终端里跑 `init` 会列出你用过 Claude Code 的仓让你输编号选，最后列出登记了哪些；以后随时可以再选：
+
+```bash
+~/.vibetrail/bin/vibetrail projects pick
+```
+
+也可以在要采的仓里跑 `~/.vibetrail/bin/vibetrail projects add`；`projects list` 看、`projects remove` 去掉。全都采：`init --scope user`。被观测的仓里什么都不写。
 
 ## 3. 采集
 

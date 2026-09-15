@@ -48,16 +48,20 @@ case "$sid" in ''|*/*|.*) exit 0;; esac   # 会话 id 要能当目录名
 now_iso(){ "$JQ" -n -r 'now | (floor | todate | sub("Z$"; "")) + "." + ((. * 1000 | floor) % 1000 | tostring | ("00" + .)[-3:]) + "Z"'; }
 
 # ---- 门控（scope，DESIGN §5；G8）----
+set_project(){ # set_project <主 checkout 或目录> → workspace / project（origin 地址，没有就用路径）/ pkey（spool 目录名）。门控与补采共用：补采别的仓时按那个仓算
+    workspace=$1
+    project=$(git -C "$workspace" remote get-url origin 2>/dev/null | sed -E 's#^[a-z+]+://([^@/]*@)?##; s#^[^@/]*@##; s#:#/#; s#\.git$##')
+    project=${project:-$workspace}
+    pkey=$(vt_project_key "$workspace")
+}
+
 gate(){
     scope=$(vt_conf scope project)
     main=$(vt_main_checkout "${cwd:-.}") || main=""
     if [ "$scope" = "project" ]; then
         [ -n "$main" ] && vt_registered "$main" || return 1
     fi
-    workspace=${main:-$(vt_realpath "${cwd:-.}")}
-    project=$(git -C "$workspace" remote get-url origin 2>/dev/null | sed -E 's#^[a-z+]+://([^@/]*@)?##; s#^[^@/]*@##; s#:#/#; s#\.git$##')
-    project=${project:-$workspace}
-    pkey=$(vt_project_key "$workspace")
+    set_project "${main:-$(vt_realpath "${cwd:-.}")}"
     SD="$VT_HOME/state/$sid"
     AGENT_VERSION=$(vt_agent_version "$tpath")
     SURFACE=${CLAUDE_CODE_ENTRYPOINT:-}
@@ -240,13 +244,24 @@ wait_stable(){ # 照 Pilot：文件大小连续两次不变才读，最多 1.5 s
     done
 }
 
+catch_up_dirs(){ # → 每行「主 checkout<TAB>Claude 项目目录」：本仓与所有登记过的仓——现有的每个 worktree，加上已经删掉的 desktop worktree
+    # （<仓>/.claude/worktrees/<名字>，目录名是「仓的目录名--claude-worktrees-名字」）留下的会话目录，这些会话照样归主仓
+    { printf '%s\n' "$workspace"; cat "$VT_HOME/projects"/* 2>/dev/null; } | awk 'NF && !seen[$0]++' | while IFS= read -r repo; do
+        [ -d "$repo" ] && git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || continue
+        { git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | while IFS= read -r wt; do printf '%s\n' "$CLAUDE_PROJECTS/$(vt_slug "$wt")"; done
+          for d in "$CLAUDE_PROJECTS/$(vt_slug "$repo")--claude-worktrees-"*; do [ -d "$d" ] && printf '%s\n' "$d"; done
+        } | awk '!seen[$0]++' | while IFS= read -r d; do [ -d "$d" ] && printf '%s\t%s\n' "$repo" "$d"; done
+    done
+}
+
 catch_up(){ # 本仓与所有登记过的仓，每个 worktree 对应的 Claude 项目目录里，落后的 transcript 各补一次
-    # 扫所有登记过的仓而不只本仓：人不再回那个仓时，它最后一轮没关的也能在下一次开任意会话时关掉（用户 09-15：隔很久才问会缺最后一轮）
-    local wt dir t s close idle now mt repo
+    # 扫所有登记过的仓而不只本仓：人不再回那个仓时，它最后一轮没关的也能在下一次开任意会话时关掉（用户 09-15：隔很久才问会缺最后一轮）。
+    # 别的仓的会话按那个仓的 project / workspace / spool 目录记（以前沿用了本次 hook 所在仓的，登记两个仓就会记错，09-15 加多选时发现）
+    local dir t s close idle now mt repo w0=$workspace p0=$project k0=$pkey
     idle=$(vt_conf turn_idle_close 3600); now=$(date +%s)
-    while IFS= read -r wt; do
-        dir="$CLAUDE_PROJECTS/$(vt_slug "$wt")"
-        [ -d "$dir" ] || continue
+    while IFS="$(printf '\t')" read -r repo dir; do
+        [ -n "$dir" ] || continue
+        set_project "$repo"
         for t in "$dir"/*.jsonl; do
             [ -f "$t" ] || continue
             s=$(basename "$t" .jsonl); close=""
@@ -258,9 +273,8 @@ catch_up(){ # 本仓与所有登记过的仓，每个 worktree 对应的 Claude 
             fi
             process_session "$s" "$t" "$close"
         done
-    done < <({ printf '%s\n' "$workspace"; cat "$VT_HOME/projects"/* 2>/dev/null; } | awk 'NF && !seen[$0]++' | while IFS= read -r repo; do
-                 [ -d "$repo" ] && git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p'
-             done | awk '!seen[$0]++')
+    done < <(catch_up_dirs)
+    workspace=$w0; project=$p0; pkey=$k0
     [ -n "$main" ] || { [ -f "$tpath" ] && process_session "$sid" "$tpath" "$([ "$source" = resume ] && echo resume)"; }   # scope=user 且不在 git 仓
     find "$VT_HOME/state" \( -path '*/turns/*.json' -o -path '*/perms/*.json' \) -mtime +14 -delete 2>/dev/null   # 轮次、权限框证据留两周够用
 }
