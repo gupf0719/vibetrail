@@ -35,8 +35,12 @@
   「Stop hook feedback:」、IDE 标签三类前缀（照 agentsview，先在本机语料上核有多少、会不会误伤）。push 的退避与永久失败记账随 push 一项做。
 - [ ] 轮次元数据一路：每轮 `turn.start` / `turn.end`（status、usage、vcs）、`InstructionsLoaded` 只记路径与 sha；不传 transcript 原文件、不传非分歧正文（D5）；先做 Claude Code。
 - [ ] commit ↔ session 推导：每轮起止 HEAD + `rev-list`（DESIGN §3.5）；`vibetrail show` 按 commit 查改走它。
-- [ ] push：`vibetrail push [--list | --show]`，端点与 token 从 `~/.vibetrail/config` 读、没配不发；配了按协议打批（≤ 100 条 / 16 MiB）、每条先过 schema、`event_id` 幂等、accepted + duplicate 推进水位并删本机块、失败重发；
-  Stop 异步顺手调；测试对手先用一个只记录请求并按 schema 校验的桩端点（Pilot / teamai 实跑样例就是这么截的）。
+- [ ] push：`vibetrail push [--list | --show]`，端点与 token 从 `~/.vibetrail/config` 读、没配不发；配了按协议打批（≤ 100 条 / 16 MiB）、每条先过 schema、`event_id` 幂等、accepted + duplicate 推进水位并删本机块、失败重发。
+  **门槛与兜底（D6，用户 09-15 定，DESIGN §4）**：Stop 落 spool 后查全机最早待发是否超 1 小时、全机待发是否满 100 条（`push_max_age` / `push_max_events` 可配），任一满足且不在退避期才推，
+  扫全部 spool 混批、循环发到发完、一次最多 10 批；SessionEnd 起脱离进程的后台 push、SessionStart 补做后 push，都不看门槛只看退避；机器级 mkdir 锁 `state/push/.lock`、陈旧阈值 600 s；
+  失败分暂时（退避 1 分钟起指数到 1 小时封顶，记在 `state/push/`）与永久（4xx 整块挪 `spool/.rejected/`、计数进 doctor）。
+  要测：门槛不满不发、满任一就发且发全机、兜底不看门槛、退避期兜底也不发、4xx 隔离不重试、两个 hook 同时推不重不丢、SessionEnd 的后台进程在 `-p` 与 desktop 关会话时活不活（没实测，DESIGN §3.1）。
+  测试对手先用一个只记录请求并按 schema 校验的桩端点（Pilot / teamai 实跑样例就是这么截的）。
 - [ ] 完整性钉子：每类记录条数进出相等、映射后事件全部过 schema（这两条测试期已在 `test-map.sh` 钉住；运行时要进账本与 doctor）、超 1 MiB 被拒计数、未知记录类型 / 事件名告警（A11；G10、G6）。
 - [ ] 回归：两路各有带断言的测试，输入用 [experiments/collect-demo/scenario.json](experiments/collect-demo/scenario.json) 回放，补上 SessionStart 补做、
   打断后无 Stop、后台子 agent 晚于父 Stop、一轮多 commit、端点未配置 / 配置后断网五个场景。分歧一路已有 `test-hook-flow.sh`，其中补做与打断后无 Stop 已覆盖。
