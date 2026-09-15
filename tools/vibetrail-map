@@ -23,6 +23,9 @@
 #
 # 只读 transcript，不复制、不在它旁边写东西；产物只有 stdout 与账本。只解析到源文件最后一个换行符（源可能正在写半行）。
 # event_id = UUIDv5(vibetrail 命名空间, "<sid>|<记录 uuid>|<事件类型>|<限定符>")，同一输入重跑得到同一个 id（幂等重发靠它）。
+# 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
+# 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
+export LC_ALL=C
 set -uo pipefail
 SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 : "${JQ:=jq}"; export JQ
@@ -104,18 +107,18 @@ fi
 if [ -z "$start_byte" ]; then
     if [ "$start_line" -eq 1 ]; then start_byte=0; else start_byte=$(head -n $((start_line - 1)) "$f" | wc -c | tr -d ' '); fi
 fi
-[ "$start_byte" -le "$consumed" ] || die "起读偏移 $start_byte 超过文件可读长度 $consumed（文件被重写过？从 0 重读）"
+[ "$start_byte" -le "$consumed" ] || die "起读偏移 $start_byte 超过文件可读长度 ${consumed}（文件被重写过？从 0 重读）"
 
 tmp=$(mktemp "${TMPDIR:-/tmp}/vibetrail-map.XXXXXX") || die "mktemp 失败"
 trap 'rm -rf "$tmp" "$tmp.err" "$tmp.seen" "$tmp.turns"' EXIT
 if [ -n "$seen_file" ] && [ -f "$seen_file" ]; then
     $JQ -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | [.[0], (.[1] | tonumber)])' "$seen_file" > "$tmp.seen" \
-        || die "读不了 $seen_file（每行应是 uuid<TAB>行号）"
+        || die "读不了 ${seen_file}（每行应是 uuid<TAB>行号）"
 else
     echo '[]' > "$tmp.seen"
 fi
 if [ -n "$hook_turns" ] && [ -s "$hook_turns" ]; then
-    $JQ -c 'if type == "object" then . else {} end' "$hook_turns" > "$tmp.turns" 2>/dev/null || die "读不了 $hook_turns（要是 JSON 对象）"
+    $JQ -c 'if type == "object" then . else {} end' "$hook_turns" > "$tmp.turns" 2>/dev/null || die "读不了 ${hook_turns}（要是 JSON 对象）"
 else
     echo '{}' > "$tmp.turns"
 fi
@@ -129,7 +132,7 @@ tail -c +$((start_byte + 1)) "$f" | head -c $((consumed - start_byte)) | $JQ -n 
     -f "$SELF/map-events.jq" > "$tmp" 2>"$tmp.err"
 rc=$?
 if [ $rc -ne 0 ] || [ -s "$tmp.err" ]; then
-    die "jq 失败（rc=$rc）: $(head -c 300 "$tmp.err")"
+    die "jq 失败（rc=${rc}）: $(head -c 300 "$tmp.err")"
 fi
 
 # ---- event_id：UUIDv5(uuid5(NS_URL, "vibetrail"), "<sid>|<_key>")，实现在 vibetrail-lib.sh 的 vt_fill_ids（hook 直接发的事件共用） ----

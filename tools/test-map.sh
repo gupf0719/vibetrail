@@ -7,6 +7,9 @@
 #   4. 增量等价：对每个切点 L，「前 L 行全量扫」∪「全文从 L 起扫」== 「全文全量扫」——派生事件跟触发记录走、去重不看门控，
 #      这两条不成立时这里会红；再加一路「从前段账本给的 checkpoint_line（本轮开头）读起」，钉住 U11 的按轮增量
 # 用法：test-map.sh [--update]   --update 重新生成 golden（先看 diff 再提交）
+# 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
+# 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
+export LC_ALL=C
 set -uo pipefail
 cd "$(dirname "$0")"; SELF=$PWD; FX=$SELF/fixtures-map
 FILES=("$FX"/*.jsonl "$FX"/fx-*/subagents/agent-*.jsonl)
@@ -20,7 +23,7 @@ schema_check(){ if [ "$HAVE_SCHEMA" = 1 ]; then python3 "$SELF/schema-check.py";
 ok(){ pass=$((pass+1)); }
 ko(){ fail=$((fail+1)); printf '  ✗ %s\n' "$*"; }
 # 断言：jq 表达式对 events 文件（-s 整体）求值必须是 true
-check(){ local r; r=$(jq -s "$2" "$3" 2>&1); if [ "$r" = "true" ]; then ok; else ko "$1 （得到 $r）"; fi; }
+check(){ local r; r=$(jq -s "$2" "$3" 2>&1); if [ "$r" = "true" ]; then ok; else ko "$1 （得到 ${r}）"; fi; }
 run(){ # run <名> <transcript> [额外参数…] → $T/<名>.events / .ledger；stderr 必须为空
     local n=$1 f=$2; shift 2
     bash "$SELF/vibetrail-map" "$f" --no-turns --ledger "$T/$n.ledger" "$@" > "$T/$n.events" 2> "$T/$n.err" \
@@ -152,15 +155,15 @@ for f in "${FILES[@]}" "$T/scenario.jsonl"; do
     for L in $(seq 1 $((N-1))); do
         head -n "$L" "$f" > "$T/cut.jsonl"
         rm -f "$T/cut.src"
-        bash "$SELF/vibetrail-map" "$T/cut.jsonl" "${common[@]}" --ledger "$T/cut.ledger" --sources-out "$T/cut.src" > "$T/a.events" 2> "$T/a.err" || { echo "    $n 切点 $L：前段失败 $(head -c 120 "$T/a.err")"; }
-        bash "$SELF/vibetrail-map" "$f" "${common[@]}" --from-line "$L" --ledger "$T/b.ledger" > "$T/b.events" 2> "$T/b.err" || { echo "    $n 切点 $L：后段失败 $(head -c 120 "$T/b.err")"; }
+        bash "$SELF/vibetrail-map" "$T/cut.jsonl" "${common[@]}" --ledger "$T/cut.ledger" --sources-out "$T/cut.src" > "$T/a.events" 2> "$T/a.err" || { echo "    $n 切点 ${L}：前段失败 $(head -c 120 "$T/a.err")"; }
+        bash "$SELF/vibetrail-map" "$f" "${common[@]}" --from-line "$L" --ledger "$T/b.ledger" > "$T/b.events" 2> "$T/b.err" || { echo "    $n 切点 ${L}：后段失败 $(head -c 120 "$T/b.err")"; }
         cat "$T/a.events" "$T/b.events" | jq -S -c . | sort > "$T/ab.norm"
-        if ! cmp -s "$T/ab.norm" "$T/full.sorted"; then bad=$((bad+1)); [ $bad -le 2 ] && { echo "    $n 切点 $L："; diff "$T/full.sorted" "$T/ab.norm" | head -4 | cut -c1-160 | sed 's/^/      /'; }; fi
+        if ! cmp -s "$T/ab.norm" "$T/full.sorted"; then bad=$((bad+1)); [ $bad -le 2 ] && { echo "    $n 切点 ${L}："; diff "$T/full.sorted" "$T/ab.norm" | head -4 | cut -c1-160 | sed 's/^/      /'; }; fi
         # U11：后段改从前段账本的 checkpoint_line 读起
         C=$(jq -r .checkpoint_line "$T/cut.ledger"); CB=$(jq -r .checkpoint_byte "$T/cut.ledger")
-        bash "$SELF/vibetrail-map" "$f" "${common[@]}" --start-line "$C" --start-byte "$CB" --from-line "$L" --seen-uuids "$T/cut.src" --ledger "$T/c.ledger" > "$T/c.events" 2> "$T/c.err" || { echo "    $n 切点 $L：checkpoint 段失败 $(head -c 120 "$T/c.err")"; }
+        bash "$SELF/vibetrail-map" "$f" "${common[@]}" --start-line "$C" --start-byte "$CB" --from-line "$L" --seen-uuids "$T/cut.src" --ledger "$T/c.ledger" > "$T/c.events" 2> "$T/c.err" || { echo "    $n 切点 ${L}：checkpoint 段失败 $(head -c 120 "$T/c.err")"; }
         cat "$T/a.events" "$T/c.events" | jq -S -c . | sort > "$T/ac.norm"
-        if ! cmp -s "$T/ac.norm" "$T/full.sorted"; then badc=$((badc+1)); [ $badc -le 2 ] && { echo "    $n 切点 $L（从第 $C 行读）："; diff "$T/full.sorted" "$T/ac.norm" | head -4 | cut -c1-160 | sed 's/^/      /'; }; fi
+        if ! cmp -s "$T/ac.norm" "$T/full.sorted"; then badc=$((badc+1)); [ $badc -le 2 ] && { echo "    $n 切点 ${L}（从第 $C 行读）："; diff "$T/full.sorted" "$T/ac.norm" | head -4 | cut -c1-160 | sed 's/^/      /'; }; fi
     done
     if [ $bad -eq 0 ]; then ok; else ko "$n: $bad 个切点不等价（共 $((N-1)) 个）"; fi
     if [ $badc -eq 0 ]; then ok; else ko "$n: 从 checkpoint 读起时 $badc 个切点不等价（共 $((N-1)) 个）"; fi

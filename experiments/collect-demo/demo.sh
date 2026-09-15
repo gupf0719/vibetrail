@@ -10,6 +10,9 @@
 #    会话结束前再加一轮：第一次 Stop 被别的 Stop hook 拦下（先写拦停反馈、再写 summary），模型补完再 Stop——这一轮只出一条 turn.end，带两次提交
 # 3. vibetrail list / show / doctor，最后列出 spool 目录与被观测仓的 git status（零写入）
 # 跑完沙箱留着，想翻原始文件就进去看；不想留就 rm -rf 它。
+# 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
+# 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
+export LC_ALL=C
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); TOOLS=$(cd "$HERE/../../tools" && pwd); SC=$HERE/scenario.json
 D=${1:-$(mktemp -d "${TMPDIR:-/tmp}/vibetrail-demo.XXXXXX")}; mkdir -p "$D"; D=$(cd "$D" && pwd -P)

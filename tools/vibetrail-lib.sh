@@ -1,7 +1,7 @@
 #!/bin/bash
 # vibetrail 运行时共用函数：vibetrail-hook 与将来的 vibetrail init / push / doctor 都 source 它。只定义函数，不执行。
 #
-# 本机目录（DESIGN §3.3、§5），根目录 $VT_HOME（默认 ~/.vibetrail，测试时指到临时目录）：
+# 本机目录（DESIGN §3.3、§5），根目录 ${VT_HOME}（默认 ~/.vibetrail，测试时指到临时目录）：
 #   config                     key=value：scope=project|user（默认 project）、jq=<jq 绝对路径>、endpoint=…、token=…
 #   projects/<key>             登记表（scope=project 的开关）：文件名是主 checkout 路径的 sha1 前 16 位，内容是路径
 #   state/<sid>/               每个会话一份：<名>.json（每份 transcript 的 lines / consumed_bytes / checkpoint_*）、
@@ -86,7 +86,7 @@ vt_fprint(){ # vt_fprint <文件> <已消费字节> → "inode:开头 4 KB 的 s
 # 目录补充：
 #   state/<sid>/turns/<turn_id>.{start,stop,gap,fail}.json  hook 侧记的轮次证据：UserPromptSubmit 记轮起快照（start）、每次 Stop 覆盖一份
 #                              轮止快照与本轮 commit（stop）、没有 Stop 的轮在下一轮开始或会话结束时补一份（gap）、StopFailure（fail）；
-#                              映射层关轮时读它们（map-events.jq 的 $hook_turns），拼出 turn.end 的 status / vcs / commits
+#                              映射层关轮时读它们（map-events.jq 的 ${hook_turns}），拼出 turn.end 的 status / vcs / commits
 #   state/<sid>/last_turn      hook 最近开的一轮的 turn_id；state/<sid>/session.json  会话级：model、source
 VT_RUNTIME_VERSION=0.2.0-dev   # vibetrail 自己的版本，进每条事件的 extensions.vibetrail.version
 VT_NS=6c90e594-0cb4-59d0-9186-740d215c8b7f     # uuid5(NS_URL, "vibetrail")，DESIGN §4.2

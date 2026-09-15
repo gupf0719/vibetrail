@@ -3,6 +3,9 @@
 # 临时 git 仓当被观测项目，临时目录当 ~/.vibetrail 与 ~/.claude/projects，逐步追加 transcript、逐个触发 hook。
 # 断言：A4 未登记零写入；登记后 spool == 对最终 transcript 的一次全量映射；stdout 永远为空、exit 0；重复触发不重复写；
 # 锁被占时跳过、之后补上；半行等写完再读；文件被重写后不重复；打断后没有 Stop 也不漏；子 agent；回放副本；SessionStart 补做别的会话；scope=user。
+# 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
+# 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
+export LC_ALL=C
 set -uo pipefail
 cd "$(dirname "$0")"; SELF=$PWD
 T=$(mktemp -d "${TMPDIR:-/tmp}/vibetrail-test-hook.XXXXXX"); trap 'rm -rf "$T"' EXIT
@@ -54,6 +57,15 @@ replay(){ # 按 scenario 的步骤回放：append 追加一行（cwd 换成临�
 NORM='del(.payload.vcs.head_sha, .payload.vcs.dirty, .commits, .extensions["vibetrail.commit_method"], .extensions["vibetrail.commit_attribution"])'
 spool_events(){ cat "$SPOOL"/*.jsonl 2>/dev/null | jq -S -c "select(.provenance.rule_version == \"diverge-v1\") | $NORM" | sort; }
 full_map(){ bash "$SELF/vibetrail-map" "$TR" --no-turns --sid "$SID" --project-id "$REPO" --workspace-id "$REPO" --ledger /dev/null | jq -S -c "$NORM" | sort; }
+
+echo "════ 0. 脚本里没有「变量名后直接跟非 ASCII 字符」，入口脚本都固定了 C locale ════"
+# macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟变量名的中文首字节算进变量名：变量名后紧跟「）」时，找的是「V 加上「）」的首字节」这个变量（用户 09-15 装机时踩到）。
+# 要把变量名用花括号包起来再接中文；入口脚本另在开头 export LC_ALL=C 兜底。.jq 文件不管：jq 的标识符只认 ASCII，不受 locale 影响
+SCRIPTS="$SELF/vibetrail $SELF/vibetrail-hook $SELF/vibetrail-lib.sh $SELF/vibetrail-map $SELF/test-map.sh $SELF/test-hook-flow.sh $SELF/test-extract.sh $SELF/../experiments/collect-demo/demo.sh"
+bad_vars=$(perl -ne 'if (/\$[A-Za-z_][A-Za-z0-9_]*[\x80-\xff]/) { print "$ARGV:$.\n" } close ARGV if eof' $SCRIPTS)
+check "没有变量名后直接跟非 ASCII 的写法${bad_vars:+：$bad_vars}" '[ -z "$bad_vars" ]'
+no_c=$(for f in $SCRIPTS; do [ "$f" = "$SELF/vibetrail-lib.sh" ] || grep -q '^export LC_ALL=C$' "$f" || echo "$f"; done)
+check "入口脚本都有 export LC_ALL=C${no_c:+：$no_c}" '[ -z "$no_c" ]'
 
 echo "════ 1. A4：scope=project、未登记的仓，回放整段会话，本机什么都不写 ════"
 replay

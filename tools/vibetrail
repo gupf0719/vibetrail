@@ -20,6 +20,9 @@
 #
 # 环境变量：VIBETRAIL_HOME（默认 ~/.vibetrail）、VIBETRAIL_CLAUDE_SETTINGS（默认 ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json）、
 #   VIBETRAIL_CLAUDE_PROJECTS（默认 ${CLAUDE_CONFIG_DIR:-~/.claude}/projects）、VIBETRAIL_CLAUDE_BINARIES（冒号分隔，覆盖自动找到的 Claude Code 可执行文件）
+# 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
+# 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
+export LC_ALL=C
 set -uo pipefail
 SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$SELF/vibetrail-lib.sh"
@@ -130,7 +133,7 @@ JQ_STRIP='def ours: ((.command? // "") | tostring | contains("vibetrail-hook"));
 settings_read(){ # settings_read → stdout 当前 settings（没有文件当 {}）；不是 JSON 对象就报错退出，不动它
     if [ -s "$SETTINGS" ]; then
         "$JQ" -e 'if type == "object" then . else error("settings 不是 JSON 对象") end' "$SETTINGS" 2>/dev/null \
-            || die "读不了 $SETTINGS（不是合法的 JSON 对象）。先修好它再装，vibetrail 不会去改一份读不懂的 settings"
+            || die "读不了 ${SETTINGS}（不是合法的 JSON 对象）。先修好它再装，vibetrail 不会去改一份读不懂的 settings"
     else echo '{}'; fi
 }
 
@@ -172,7 +175,7 @@ cmd_init(){
         rm -rf "$VT_HOME/bin.old"; [ -d "$VT_HOME/bin" ] && mv "$VT_HOME/bin" "$VT_HOME/bin.old"
         mv "$VT_HOME/bin.new" "$VT_HOME/bin" && rm -rf "$VT_HOME/bin.old"
     fi
-    say "✓ 运行时 → $VT_HOME/bin/（$(printf '%s\n' $RUNTIME_FILES | wc -l | tr -d ' ') 个文件，版本 $VT_RUNTIME_VERSION）"
+    say "✓ 运行时 → $VT_HOME/bin/（$(printf '%s\n' $RUNTIME_FILES | wc -l | tr -d ' ') 个文件，版本 ${VT_RUNTIME_VERSION}）"
 
     # 2. 配置：已有的值不动，只补缺的；--scope 显式给了才改
     [ -n "$scope" ] && conf_set scope "$scope"
@@ -184,7 +187,7 @@ cmd_init(){
     [ -n "$(vt_conf push_max_events)" ] || conf_set push_max_events 100
     grep -q '^endpoint=' "$VT_HOME/config" || conf_set endpoint ""
     chmod 600 "$VT_HOME/config"
-    say "✓ 配置 → $VT_HOME/config（scope=$(vt_conf scope)，jq=$JQ）"
+    say "✓ 配置 → $VT_HOME/config（scope=$(vt_conf scope)，jq=${JQ}）"
 
     # 3. settings 条目
     local events bins; events=$(events_for "$mode"); bins=$(claude_binaries | sort -u)
@@ -192,7 +195,7 @@ cmd_init(){
     local entries; entries=$(entries_json $events)
     printf '%s' "$cur" | "$JQ" --argjson e "$entries" "$JQ_STRIP"' | reduce $e[] as $x (.; .hooks[$x.event] = ((.hooks[$x.event] // []) + [$x.group]))' \
         | settings_write || die "写不了 $SETTINGS"
-    say "✓ hook 条目 → $SETTINGS（$(printf '%s\n' $events | wc -l | tr -d ' ') 个事件：$events）"
+    say "✓ hook 条目 → ${SETTINGS}（$(printf '%s\n' $events | wc -l | tr -d ' ') 个事件：${events}）"
     if [ "$mode" = auto ]; then
         if [ -n "$bins" ]; then say "  按本机 $(printf '%s\n' "$bins" | wc -l | tr -d ' ') 个 Claude Code 可执行文件都认识的事件登记（--events all 可全登记）"
         else say "  ⚠ 没找到 Claude Code 可执行文件，只登记老版本也有的 6 个事件"; fi
@@ -201,7 +204,7 @@ cmd_init(){
 
     # 4. 登记本仓
     if [ "$(vt_conf scope project)" = project ] && [ $register = 1 ]; then
-        local m; m=$(vt_main_checkout "$PWD" 2>/dev/null) && { vt_register "$PWD" && say "✓ 已登记本仓 $m（它的所有 worktree 都采）"; } \
+        local m; m=$(vt_main_checkout "$PWD" 2>/dev/null) && { vt_register "$PWD" && say "✓ 已登记本仓 ${m}（它的所有 worktree 都采）"; } \
             || say "  当前目录不在 git 仓里，没登记项目；在要采的仓里跑：$VT_HOME/bin/vibetrail projects add"
     elif [ "$(vt_conf scope project)" = user ]; then
         say "  scope=user：本机所有目录的会话都采，不看登记表"
@@ -223,7 +226,7 @@ cmd_uninstall(){
         else say "  $SETTINGS 里没有 vibetrail 的条目"; fi
     fi
     if [ $purge = 1 ]; then
-        rm -rf "$VT_HOME"; say "✓ 已删除 $VT_HOME（含 spool 里还没发出去的数据）"
+        rm -rf "$VT_HOME"; say "✓ 已删除 ${VT_HOME}（含 spool 里还没发出去的数据）"
     else
         rm -rf "$VT_HOME/bin" "$VT_HOME/state" "$VT_HOME/logs"
         say "✓ 已删除 $VT_HOME/bin、state、logs"
@@ -314,7 +317,7 @@ cmd_doctor(){
     ok(){ printf '  ✓ %s\n' "$*"; }
     bad(){ printf '  ✗ %s\n' "$*"; fatal=1; }
     note(){ printf '  ⚠ %s\n' "$*"; warn=1; }
-    say "vibetrail doctor（VT_HOME=$VT_HOME）"
+    say "vibetrail doctor（VT_HOME=${VT_HOME}）"
     # 运行时
     if [ -f "$VT_HOME/bin/MANIFEST" ]; then
         local drift=0 miss=0 h f
@@ -345,10 +348,10 @@ cmd_doctor(){
             if [ -n "$bins" ]; then
                 local unk="" kb; while IFS= read -r b; do
                     kb=$(known_events_of "$b")
-                    for a in $have; do case "$kb" in *" $a "*) ;; *) unk="$unk $a（$b）";; esac; done
+                    for a in $have; do case "$kb" in *" $a "*) ;; *) unk="$unk ${a}（${b}）";; esac; done
                 done <<< "$bins"
                 [ -z "$unk" ] && ok "本机 $(printf '%s\n' "$bins" | wc -l | tr -d ' ') 个 Claude Code 都认识这些事件" \
-                    || bad "有 Claude Code 不认识登记的事件:$unk——它会把整份 settings 跳过；重跑 vibetrail init（默认按本机版本登记）"
+                    || bad "有 Claude Code 不认识登记的事件:${unk}——它会把整份 settings 跳过；重跑 vibetrail init（默认按本机版本登记）"
             fi
         fi
     else bad "读不了 $SETTINGS"; fi
@@ -359,7 +362,7 @@ cmd_doctor(){
     else
         local np; np=$(ls "$VT_HOME/projects" 2>/dev/null | wc -l | tr -d ' ')
         [ "$np" -gt 0 ] && ok "scope=project，登记了 $np 个项目" || note "scope=project 但一个项目都没登记——什么都不会采（vibetrail projects add）"
-        if [ -n "$here" ]; then vt_registered "$here" && ok "本仓已登记：$here" || note "本仓没登记：$here（vibetrail projects add）"; fi
+        if [ -n "$here" ]; then vt_registered "$here" && ok "本仓已登记：$here" || note "本仓没登记：${here}（vibetrail projects add）"; fi
     fi
     # 采集证据
     local nst=0 nch=0 nev=0 oldest=""

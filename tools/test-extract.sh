@@ -8,6 +8,9 @@
 # ⚠️ 必须同时检查 jq 是否报错：jq 在某条规则上抛错时，该记录之后的规则不再求值、之前的
 #    命中照常输出，然后继续下一条；退出码只反映最后一条输入。末尾规则抛错时输出一条不差，
 #    只比对输出恒绿——「去掉 toolUseResult 类型守卫」这个真 bug 就是这样漏过的（实测假绿）。
+# 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
+# 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
+export LC_ALL=C
 set -uo pipefail
 cd "$(dirname "$0")"
 fail=0; n=0

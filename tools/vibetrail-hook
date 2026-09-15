@@ -20,6 +20,9 @@
 # 纪律（§3.4）：stdout 永远为空、永远 exit 0、失败日志只留元数据；scope=project 时未登记的仓什么都不写（A4）。
 # 环境变量（测试用）：VIBETRAIL_HOME（本机数据根）、VIBETRAIL_CLAUDE_PROJECTS（~/.claude/projects）、
 #   VIBETRAIL_STABLE_WAIT=0（不等写稳）、VIBETRAIL_FOREGROUND=1（不丢后台，全部同步做完）
+# 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
+# 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
+export LC_ALL=C
 set -uo pipefail
 SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$SELF/vibetrail-lib.sh"
