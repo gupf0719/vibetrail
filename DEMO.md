@@ -61,7 +61,7 @@ bash tools/vibetrail init
 |---|---|
 | 会话开始 | `session.start`（来源、model、HEAD） |
 | 说一句话 | `turn.start`（HEAD、分支、有没有改动） |
-| 模型答完 | `turn.end`（状态、token 用量、本轮的 commit、这一轮里插了几句话）。同一块里还有这一轮的调用 trace：每次模型调用一条 `message.assistant`（不带正文：model、token、stop_reason、调了哪些工具及其调用 id、API 重试次数）、每次工具调用一条 `tool.end`（工具名、成功 / 出错 / 取消、耗时）；以及分歧事件：`permission.decision`（拒绝）、`tool.request`（被拒的命令）、`message.user`（之后人说的话） |
+| 模型答完 | `turn.end`（状态、token 用量、本轮的 commit、这一轮里插了几句话）。同一块里还有这一轮的调用 trace：每次模型调用一条 `message.assistant`（不带正文：model、token、stop_reason、调了哪些工具及其调用 id）、API 请求失败重试一次一条 `ext.claude.api_error`、每次工具调用一条 `tool.end`（工具名、成功 / 出错 / 取消、耗时）；以及分歧事件：`permission.decision`（拒绝）、`tool.request`（被拒的命令）、`message.user`（之后人说的话） |
 | 子 agent 起止 | `subagent.start` / `subagent.end`；压缩、起标题这类 Claude Code 内部 agent 只记 `ext.claude.subagent_stop`（internal） |
 | 弹权限框 | `ext.claude.permission_request`（工具名、权限模式，不带参数）；用来分「人拒绝」与「按停止打断工具」 |
 | 工具失败、权限弹框、CLAUDE.md 加载 | `ext.claude.*`，只有事件头 |

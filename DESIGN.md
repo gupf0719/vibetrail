@@ -415,7 +415,7 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
 | 问题 | Pilot | teamai | 我们 |
 |---|---|---|---|
 | K9 内部 agent（压缩、起标题、提示建议……）也触发 SubagentStop | 碰不到（从父会话的 Agent 调用找子 agent），但 id 留在 state 里不清 | 碰不到（不挂这两个 hook） | 二进制：内部 agent 的 `agent_type` 为空、没有 SubagentStart、给的 transcript 路径不存在。`agent_type` 为空就只记 `ext.claude.subagent_stop`（internal），不发 `subagent.end`；结束标记改用 payload 的 `agent_transcript_path` |
-| U15 `system/api_error` 重试 | 不采 | 不采 | 这次调用之前的重试次数与等待记进 `vibetrail.call.retries` / `retry_wait_ms` |
+| U15 `system/api_error` 重试 | 不采 | 不采 | 每条发一条 `ext.claude.api_error`（第几次、等多久、错误类型），挂回那次调用的 `response_id`。这类记录要到这一轮结束才一起落盘，总在调用之后，挂不到已经发出的调用事件上；按时间挂（失败落在请求发出与回复到达之间），不按父记录链——一起落盘的几条后一条的父记录是前一条，会把一轮里几次调用各自的断网都算到第一次头上（本机 8 条全部挂上，其中相隔 11 分钟的三次分属三次调用） |
 | U15 `origin.kind` | 不读（任务通知被当成人话开了一轮） | 不读（人话多算 8 条） | 有 `origin.kind` 就以它判人话，没有（老版本、斜杠命令、本地命令输出、压缩摘要）走原来的排除清单 |
 | K10 轮里插话（`attachment/queued_command`） | 丢掉 | 丢掉 | 实测「拒绝之后插话纠正」不会发生：本机 14 次分歧之后人的下一句 9 次都是正常人话、0 次插话——主会话里拒绝与打断都当场结束这一轮。插话本身以前完全没记，改为在 `turn.end` 上记 `vibetrail.queued_prompts`（只计数，不带正文） |
 | 调用挂不回去 | 有：OTLP 的 trace_id（一轮一个）/ span_id（入口 → agent → step → llm / tool），随机生成 | 没有调用这一级 | 协议信封没有 trace / span 字段，层级靠会话、轮、子 agent 实例、父调用、调用这几个 id；原先 `message.assistant` 只记了工具名，`tool.end` 挂不回是哪次调用发起的——补上 `vibetrail.call.tool_call_ids` |

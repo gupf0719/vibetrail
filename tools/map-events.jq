@@ -134,7 +134,7 @@ def init: {
   pending: null,          # {after: [uuid…], kind, since}：等「人的下一句」；since＝第一个触发所在轮的开头行
   pturn: null,            # 按 promptId 切的当前轮（轮次元数据一路）：{id, line, last_ts, usage, model, interrupted, denied, git_commit, closed}
   call: null,             # trace：正在累计的这次模型调用（同一 message.id 的几条记录）
-  retries: 0, retry_ms: 0, # trace：这次调用之前的 API 重试（system / api_error）次数与等待
+  calls_seen: [],         # trace：最近 200 次调用的 {mid, turn, started_at, first_ts}——api_error 按时间挂回它那次调用
   prev_end_ts: null,      # trace：下一次模型调用的请求开始＝最近一条 user 记录与上一次模型调用结尾里晚的那个（Pilot 只看工具结果，
                           #   连着几次调用之间没有工具结果时——如连续撞 max_tokens——会一直停在最早那条上，耗时越算越长）
   last_ts: null, version: null, entrypoint: null, branch: null,
@@ -493,7 +493,6 @@ def flushCall($eof):
        | .payload = ({author_type: "agent"} + opt("model"; $c.model))
        | .provenance = {kind: "transcript", rule_version: "call-v1", source_event_id: $c.last_uuid}
        | .extensions += {"vibetrail.call": ({kind: "llm", stop_reason: $c.stop_reason, tool_calls: $c.tools, tool_call_ids: ($c.tool_ids // []), thinking: $c.thinking}
-                          + (if ($c.retries // 0) > 0 then {retries: $c.retries, retry_wait_ms: $c.retry_ms} else {} end)
                           + opt("response_id"; $c.mid) + opt("request_id"; $c.rid) + opt("usage"; usageOne($c.usage))
                           + opt("started_at"; if $c.started_at != null and $c.last_ts != null and $c.started_at > $c.last_ts then $c.last_ts else $c.started_at end))}   # 开始不晚于结束（照 Pilot 的 normalizeRequestStart）
        | ._key = ($c.key + "|llm.call")) as $e
@@ -521,20 +520,39 @@ def toolEnds($r; $s):
                   | .provenance = {kind: "transcript", rule_version: "call-v1", source_event_id: $s.uuid}
                   | ._key = ($cid + "|tool.end") ) end end);
 
+# API 请求失败、Claude Code 重试（system / api_error，source request_retry）：每条发一条 ext.claude.api_error，只带元数据，挂回那次调用的 response_id（U15）。
+# 这类记录要等这一轮结束、下一句人话前才一起落盘（与 stop_hook_summary 一样），总在它那次调用之后、有时晚几十行——不能挂在调用事件上（Stop 时调用已经发了）。
+# 按时间挂：失败时刻落在「请求发出（started_at）之后、回复第一条记录之前」的那次调用里最早的一个。不按父记录链——一起落盘的几条，
+# 后一条的父记录是前一条，会把一轮里几次调用各自的失败都算到第一次头上（09-15 本机 aeb3a412 相隔 11 分钟的三次断网）
+def apiError($r; $s):
+  if $r.type == "system" and $r.subtype == "api_error" then
+    ($s.ts // "") as $at
+    | ([.calls_seen[] | select(.started_at != null and .first_ts != null and .started_at <= $at and .first_ts >= $at)] | min_by(.first_ts)) as $req
+    | (($r.error | if type == "string" then (fromjson? // {}) elif type == "object" then . else {} end)) as $err
+    | ({id: ($req.turn.id // .turn // $s.uuid), inferred: ($req.turn.inferred // (.turn == null))}) as $t
+    | emit( base($s; "ext.claude.api_error"; $s.uuid; $s.ts; $t)
+            | .content_state = "omitted"
+            | .payload = ({} + opt("retry_attempt"; $r.retryAttempt) + opt("retry_in_ms"; $r.retryInMs) + opt("max_retries"; $r.maxRetries)
+                         + opt("source"; $r.source) + opt("error"; (($err.formatted // $err.message // null) | if type == "string" then .[0:200] else null end))
+                         + opt("status"; ($err.status // null)))
+            | .provenance = {kind: "transcript", rule_version: "call-v1", source_event_id: $s.uuid}
+            | .extensions += opt("vibetrail.response_id"; $req.mid)
+            | ._key = ($s.uuid + "|api_error") )
+  else . end;
+
 def traceStep($r; $s):
   # user 记录不结束这次调用：2.1.260 边生成边执行工具，工具结果会夹在同一次调用的几条记录中间（09-15 本机 96 次调用曾因此被拆开）
-  (if $s.type == "user" then toolEnds($r; $s) | .prev_end_ts = ([.prev_end_ts, $s.ts] | max) | .retries = 0 | .retry_ms = 0 else . end)   # 只往后走：重写的旧记录带着旧时间
-  # API 请求失败重试（system / api_error，带 retryInMs）：记到接下来那次调用上（U15）
-  | (if $r.type == "system" and $r.subtype == "api_error" then .retries += 1 | .retry_ms += (($r.retryInMs | if type == "number" then . else 0 end)) else . end)
+  (if $s.type == "user" then toolEnds($r; $s) | .prev_end_ts = ([.prev_end_ts, $s.ts] | max) else . end)   # 只往后走：重写的旧记录带着旧时间
+  | apiError($r; $s)
   | (if $s.type == "assistant" and ($s.synthetic | not) then
        ($s.mid // $s.rid // $s.uuid) as $k
        | (if .call != null and .call.key != $k then flushCall(false) else . end)
        | if .call == null
          then .call = {key: $k, mid: $s.mid, rid: $s.rid, model: $s.model, usage: $s.usage, stop_reason: stopReasonOf($r),
                        tools: [$s.tools[] | .name], tool_ids: [$s.tools[] | .id | strings], thinking: thinkingIn($r), last_ts: $s.ts, last_uuid: $s.uuid, ck: baseCheckpoint,
-                       started_at: .prev_end_ts, agent: $s.agent, turn: {id: (.turn // $s.uuid), inferred: (.turn == null)},
-                       retries: .retries, retry_ms: .retry_ms}
-              | .retries = 0 | .retry_ms = 0
+                       started_at: .prev_end_ts, agent: $s.agent, turn: {id: (.turn // $s.uuid), inferred: (.turn == null)}}
+              | .calls_seen += [{mid: $k, turn: .call.turn, started_at: .call.started_at, first_ts: $s.ts}]
+              | (if (.calls_seen | length) > 200 then .calls_seen = .calls_seen[1:] else . end)
          else .call.last_ts = ($s.ts // .call.last_ts) | .call.last_uuid = $s.uuid
               | .call.stop_reason = (stopReasonOf($r) // .call.stop_reason)
               | .call.tools += [$s.tools[] | .name] | .call.tool_ids += [$s.tools[] | .id | strings] | .call.thinking = (.call.thinking or thinkingIn($r))

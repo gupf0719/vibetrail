@@ -304,9 +304,10 @@ check "子 agent 文件里的 User rejected tool use：按停止，发 subagent.
     '[ "$(map_r "$SUBF" --ledger /dev/null --parent-instance main | jq -s -c "[(map(select(.type == \"permission.decision\")) | length), (map(select(.type == \"subagent.end\")) | .[0] | [.payload.status.code, .extensions[\"vibetrail.kind\"], .extensions[\"vibetrail.split_by\"]])]")" = "[0,[\"cancelled\",\"interrupt_tool\",\"subagent_rejected\"]]" ]'
 R5=$T/k15-main.jsonl
 { rec m1 "" P1 user '"跑一下"' '{"permissionMode":"auto","origin":{"kind":"human"}}' | jq -c '.parentUuid = null'
-  jq -n -c --arg sid "$SID" '{type: "system", subtype: "api_error", uuid: "m1e1", parentUuid: "m1", retryInMs: 600, retryAttempt: 1, sessionId: $sid, timestamp: "2026-09-15T12:00:01.000Z"}'
-  jq -n -c --arg sid "$SID" '{type: "system", subtype: "api_error", uuid: "m1e2", parentUuid: "m1e1", retryInMs: 1200, retryAttempt: 2, sessionId: $sid, timestamp: "2026-09-15T12:00:03.000Z"}'
-  rec m2 m1 P1 assistant '[]' '{"message":{"id":"mm1","model":"claude-opus-5","role":"assistant","content":[{"type":"tool_use","id":"mt1","name":"Bash","input":{"command":"rm -rf build"}}]}}'
+  rec m2 m1 P1 assistant '[]' '{"timestamp":"2026-09-15T12:00:05.000Z","message":{"id":"mm1","model":"claude-opus-5","role":"assistant","content":[{"type":"tool_use","id":"mt1","name":"Bash","input":{"command":"rm -rf build"}}]}}'
+  # 两次重试发生在请求发出（12:00:00）与回复到达（12:00:05）之间，但记录要等之后才落盘（真实顺序：写在它那次调用之后；后一条的父记录是前一条）
+  jq -n -c --arg sid "$SID" '{type: "system", subtype: "api_error", uuid: "m1e1", parentUuid: "m1", retryInMs: 600, retryAttempt: 1, maxRetries: 10, source: "request_retry", error: "{\"message\":\"Connection error.\",\"formatted\":\"Connection dropped (ECONNRESET)\"}", sessionId: $sid, timestamp: "2026-09-15T12:00:01.000Z"}'
+  jq -n -c --arg sid "$SID" '{type: "system", subtype: "api_error", uuid: "m1e2", parentUuid: "m1e1", retryInMs: 1200, retryAttempt: 2, maxRetries: 10, source: "request_retry", sessionId: $sid, timestamp: "2026-09-15T12:00:03.000Z"}'
   rec m3 m2 P1 user "$(jq -n -c --arg t "$REJ" '[{type: "tool_result", tool_use_id: "mt1", is_error: true, content: $t}]')" '{"toolUseResult":"Error: The user doesn'"'"'t want to proceed with this tool use.","userFeedback":"别删 build"}'
   rec m4 m3 P1 user '[{"type":"text","text":"[Request interrupted by user for tool use]"}]'
   rec m5 m4 P2 user '"后台任务跑完了"' '{"origin":{"kind":"task-notification"}}'
@@ -316,8 +317,8 @@ R5=$T/k15-main.jsonl
 } > "$R5"
 k15(){ map_r "$R5" --ledger /dev/null --close-last stop --stop-turn P3 | jq -S -s -c "$1"; }
 check "toolUseResult 以 Error: 开头（带了拒绝理由）：auto 模式下也仍是拒绝" '[ "$(k15 "[(map(select(.type == \"permission.decision\")) | length), (map(select(.extensions[\"vibetrail.kind\"] == \"interrupt_tool\")) | length)]")" = "[1,0]" ]'
-check "API 重试两次（600 + 1200 ms）记在接下来那次调用上；调用带上它发起的工具调用 id" \
-    '[ "$(k15 "map(select(.type == \"message.assistant\" and .extensions[\"vibetrail.call\"].response_id == \"mm1\")) | .[0].extensions[\"vibetrail.call\"] | [.retries, .retry_wait_ms, .tool_call_ids]")" = "[2,1800,[\"mt1\"]]" ]'
+check "API 重试两次：各发一条 ext.claude.api_error（第几次、等多久、错误类型），按时间挂回那次调用 mm1；调用带上它发起的工具调用 id" \
+    '[ "$(k15 "[(map(select(.type == \"ext.claude.api_error\")) | map([.payload.retry_attempt, .payload.retry_in_ms, .extensions[\"vibetrail.response_id\"]])), (map(select(.type == \"ext.claude.api_error\")) | .[0].payload.error), (map(select(.type == \"message.assistant\" and .extensions[\"vibetrail.call\"].response_id == \"mm1\")) | .[0].extensions[\"vibetrail.call\"].tool_call_ids)]")" = "[[[1,600,\"mm1\"],[2,1200,\"mm1\"]],\"Connection dropped (ECONNRESET)\",[\"mt1\"]]" ]'
 check "origin 是 task-notification 的不算人话（不当拒绝之后的下一句）；origin 是人的算" \
     '[ "$(k15 "[map(select(.type == \"message.user\")) | .[].payload.text]")" = "[\"换成 make clean\"]" ]'
 check "轮里插了一句话：turn.end 记 vibetrail.queued_prompts = 1（只计数、不带正文）" \

@@ -224,7 +224,7 @@ cmd_init(){
         if [ -n "$bins" ]; then say "  按本机 $(printf '%s\n' "$bins" | wc -l | tr -d ' ') 个 Claude Code 可执行文件都认识的事件登记（--events all 可全登记）"
         else say "  ⚠ 没找到 Claude Code 可执行文件，只登记老版本也有的 6 个事件"; fi
     fi
-    [ "$written" = 1 ] && say "  改之前的备份在 $VT_HOME/backup/（装之前的原样是 settings.json.before-vibetrail）；settings 热加载，已开着的会话从下一次 hook 起生效"
+    [ "$written" = 1 ] && say "  改之前的备份在 $VT_HOME/backup/$([ -e "$VT_HOME/backup/settings.json.before-vibetrail" ] && echo "（装之前的原样是 settings.json.before-vibetrail）")；settings 热加载，已开着的会话从下一次 hook 起生效"
 
     # PermissionRequest 挂上的时刻：之后的 user-rejected 能查这次调用弹没弹过权限框，之前的只能按 permissionMode 粗分（K7）
     if printf '%s\n' $events | grep -qx PermissionRequest; then
