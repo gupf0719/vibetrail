@@ -2,24 +2,35 @@
 # ——分歧一路（DESIGN §4.1 / §4.2）。判据 include 自 diverge-rules.jq，本文件只做映射。
 #
 # 用法（由 vibetrail-map 调）：
-#   jq -n -c -L tools --arg sid … --arg project_id … --arg workspace_id … --argjson from_line N \
-#         --argjson meta <子 agent 的 meta.json 或 null> --arg vt_version … --arg rule_version diverge-v1 \
-#         -f map-events.jq < transcript.jsonl
+#   jq -n -c -L tools --arg sid … --arg project_id … --arg workspace_id … --arg parent_instance main \
+#         --argjson start_line S --argjson from_line N --argjson meta <子 agent 的 meta.json 或 null> \
+#         --slurpfile seen_uuids <前几次记下的 [uuid, 行号] 数组> \
+#         --arg vt_version … --arg rule_version diverge-v1 -f map-events.jq < 从第 S 行起的 transcript
 # 输出：每行一个协议事件（event_id 为 null、多一个 _key，由 vibetrail-map 算 UUIDv5 后填上并删掉 _key），
-#      最后一行 {"_ledger": …} 账本（进出条数、反查方式、跳过的记录）。
+#      最后一行 {"_ledger": …} 账本（进出条数、反查方式、跳过的记录、下次的起读行 checkpoint_line）。
 #
-# 增量：整个文件从头读一遍（索引 tool_use、parentUuid 链、当前轮），但只对**触发记录行号 > $from_line**
-#      的分歧发事件。派生事件（被拒调用的 tool.request、被打断的回复、打断后的人话）跟着触发记录走，
-#      所以「先扫到一半、再扫全文」发出的事件集合与一次扫全文完全相同（test-map.sh 逐个切点钉着）。
+# 增量（U11，DESIGN §4.2）：从 $start_line 读起（上次账本给的 checkpoint_line＝本轮开头），行号保持绝对值；
+#      只对**触发记录行号 > $from_line** 的分歧发事件。映射要回看的东西都在同一轮里（被拒的 tool_use、
+#      被打断的回复、本轮用量、拒绝配对），所以从本轮开头读与从文件头读发出的事件相同（test-map.sh 逐个切点钉着）。
+#      派生事件（被拒调用的 tool.request、被打断的回复、之后人的下一句）跟着触发记录走。
 #
 # 状态都有上界：tool_use 索引 500 条、记录链 400 条——分歧引用的永远是最近几条记录。
 # 铁律见 diverge-rules.jq 头部；本文件同样只读字段，任何多态字段先判 type。
+# 回放副本（09-15 语料 43 个主会话里 4 个有）：Claude Code 会把旧记录原样再追加进同一个文件，uuid、时间戳不变，
+#      只把 promptId 改成回放时那一轮的。副本不上报（用户 09-15）。只认会产生事件的两种记录——触发记录（分歧）与
+#      人话记录（打字、斜杠命令）——的副本，整条跳过，不触发、不结束等待：
+#        · 本次读取里同一 uuid 已经出现过；
+#        · uuid 在 $seen_uuids 里、但行号对不上（前几次记下的 [uuid, 行号]）。行号对得上的是从 checkpoint 起的正常重读。
+#      其余记录（assistant、工具结果……）的副本照常过：它们不产生事件，登记它们会让首次整读慢一倍（106 MB 11 s → 22 s）。
+#      不用「时间戳倒退」判：真实触发记录 405 条从不倒退，但真实 user 记录有 63 条倒退超过一分钟（09-15 语料），会误伤。
+#      Pilot / teamai 都不处理：Pilot 只在一条消息内按工具调用 id 去重，teamai 只按消息 id 给 token 去重。
+# ⚠️ jq 的函数参数在调用处的输入上求值：`$r | slim(.ln)` 里的 .ln 是 $r.ln（null），不是状态的行号。
+#    状态里的值一律先 `as $x` 绑定再往下传（这里曾让所有记录的行号都是 null，断链兜底从未生效）。
 
 include "diverge-rules";
 
 def opt($k; $v): if $v == null then {} else {($k): $v} end;
 def codeOk: type == "string" and test("^[a-z][a-z0-9]*([._-][a-z0-9]+)*$");
-def clean: with_entries(select(.value != null));
 
 # ---------- 记录的精简形态（进链、进索引的就是它） ----------
 # text：user / assistant 记录的正文——只取 text 块（不含 thinking / tool_result），去掉 <system-reminder> 块
@@ -34,38 +45,55 @@ def toolUses:
   if (msg.content | type) == "array"
   then [msg.content[]? | objects | select(.type == "tool_use") | {id: (.id // null), name: (.name // null), input: (.input // null)}]
   else [] end;
-# 「人的一句话」：主会话里非注入的 user 文本记录。注入型（system-reminder、local-command-*、command-name、
-# task-notification、bash-*）与 isMeta / isCompactSummary 都不算；子 agent 文件里的 user 记录是父 agent 派活，也不算。
-def injectedText: sub("^\\s+"; "") | test("^<(system-reminder|local-command-[a-z]+|command-[a-z]+|task-notification|bash-[a-z]+)");
-def isHumanPrompt:
-  .type == "user" and (.isSidechain != true) and (.isMeta != true) and (.isCompactSummary != true)
-  and (.agentId == null)
+def mainUser:          # 主会话里人发出的 user 记录的公共条件：子 agent 文件里的 user 记录是父 agent 派活，不算
+  .type == "user" and (.isSidechain != true) and (.isMeta != true) and (.isCompactSummary != true) and (.agentId == null)
   and ((msg.content | type) == "string"
-       or ((msg.content | type) == "array" and (any(msg.content[]? | objects; .type == "tool_result") | not)))
-  and (textOf | length > 0 and (isInterruptText | not) and (injectedText | not));
-def slim($ln): {
+       or ((msg.content | type) == "array" and (any(msg.content[]? | objects; .type == "tool_result") | not)));
+# 「人的一句话」：注入型（system-reminder、local-command-*、command-*、task-notification、bash-*）都不算
+def injectedText: sub("^\\s+"; "") | test("^<(system-reminder|local-command-[a-z]+|command-[a-z]+|task-notification|bash-[a-z]+)");
+def isHumanPrompt: mainUser and (textOf | length > 0 and (isInterruptText | not) and (injectedText | not));
+# 斜杠命令是人敲的（Pilot 也把 <command-name> 当人的动作，transcript-parser.mjs:34），不是注入。
+# 规范成 "/model claude-opus-5" 这样的一句；/model、/compact 常在分歧之后出现（09-15 语料 17 / 272）
+def slashText:
+  (textOf) as $t
+  | ($t | capture("<command-name>\\s*(?<n>[^<]*?)\\s*</command-name>")? // null) as $n
+  | if $n == null then null else
+      ((($t | capture("<command-args>(?<a>[^<]*)</command-args>")?) // {}) | (.a // "") | sub("^\\s+"; "") | sub("\\s+$"; "")) as $a
+      | ($n.n | if startswith("/") then . else "/" + . end) + (if $a == "" then "" else " " + $a end) end;
+def isSlashCommand: mainUser and (textOf | sub("^\\s+"; "") | startswith("<command-name>"));
+def slim($ln): (isSlashCommand) as $slash | {
   uuid, parentUuid: (.parentUuid // null), type, ln: $ln,
   ts: (.timestamp // null), promptId: (.promptId // null),
-  text: (if .type == "assistant" or .type == "user" then textOf else "" end),
+  text: (if $slash then (slashText // textOf) elif .type == "assistant" or .type == "user" then textOf else "" end),
   tools: (if .type == "assistant" then toolUses else [] end),
-  human: isHumanPrompt,
-  mid: (msg.id // null), model: (msg.model // null),
+  human: isHumanPrompt, slash: $slash,
+  # 合成记录（model "<synthetic>"：No response requested.、额度用尽、API 报错）不是模型回复，不当被打断的回复、不计用量
+  # （Pilot 同样跳过，transcript-parser.mjs:71）
+  synthetic: (.type == "assistant" and msg.model == "<synthetic>"),
+  mid: (msg.id // null), rid: (.requestId // null), model: (msg.model // null),
   usage: (if (msg.usage | type) == "object" then msg.usage else null end),
   agent: (.agentId // null)
 };
 
 # ---------- 状态 ----------
 def init: {
-  ln: 0, turn: null, turn_line: 0,
+  ln: ($start_line - 1), turn: null, turn_line: 0,
+  run_uuids: {},          # 本次读取见过的触发记录与人话记录 uuid（同一次读取内的副本）
+  prior: (($seen_uuids[0] // []) | map({(.[0]): .[1]}) | add // {}),   # 前几次记下的 uuid → 行号（跨次的副本）
   tools: {}, tool_order: [],
   chain: {}, chain_order: [],
   turn_usage: {}, turn_model: null,
   seen: {},               # 已派生事件的 _key（去重）
   denials: [],            # 当前轮里 permission_denied 记录的 uuid，给 for-tool-use 配对
-  pending: null,          # {after: [uuid…], kind}：等「人的下一句」
+  pending: null,          # {after: [uuid…], kind, since}：等「人的下一句」；since＝第一个触发所在轮的开头行
   last_ts: null, version: null, entrypoint: null, branch: null,
   ledger: {in: {}, in_total: {}, out: {}, events: {}, absorbed_for_tool_use: 0, unpaired_for_tool_use: 0,
-           lookup: {index: 0, regex: 0, missing: 0}, dedup: 0, records: 0, skipped_no_uuid: 0, skipped_non_object: 0},
+           lookup: {index: 0, regex: 0, missing: 0}, dedup: 0, records: 0, skipped_no_uuid: 0, skipped_non_object: 0,
+           # G6 哨兵：被拒记录的 toolUseResult 是 "User rejected tool use"，与正文判据是两个独立字段（09-15 语料逐条吻合）。
+           # marker_without_hit > 0 ＝ 有这个标记、判据却没认出人拒——判据漂了
+           sentinel: {marker: 0, marker_without_hit: 0},
+           replayed: 0,       # 跳过的回放副本条数
+           sources: []},      # 本次新读到的触发记录与人话记录的 [uuid, 行号]——交给下一次当 $seen_uuids
   out: []
 };
 
@@ -104,7 +132,8 @@ def base($s; $type; $src_uuid; $ts; $t):
     payload: {},
     extensions: ({"vibetrail.version": $vt_version} + opt("vibetrail.branch"; .branch))
   }
-  + (if $s.agent != null then {parent_agent_instance_id: "main"} + opt("parent_call_id"; $meta.toolUseId) else {} end);
+  # 父实例：一级子 agent 是 main；被子 agent 派出的（meta.spawnDepth ≥ 2）是派它的那个子 agent，由 vibetrail-map 查兄弟文件得出
+  + (if $s.agent != null then {parent_agent_instance_id: $parent_instance} + opt("parent_call_id"; $meta.toolUseId) else {} end);
 
 def toolRequest($s; $t; $cid; $tu; $ext):
   base($s; "tool.request"; $tu.uuid; $tu.ts; $t)
@@ -132,6 +161,11 @@ def usageSum:          # 当前轮的 token 用量：同一 message.id 的多条
     | with_entries(select(.value | type == "number"))
     end;
 
+def turnStart: if .turn_line > 0 then .turn_line else $start_line end;
+def addPending($uuid; $kind):
+  turnStart as $ts
+  | .pending = {after: ((.pending.after // []) + [$uuid]), kind: $kind, since: (.pending.since // $ts)};
+
 # ---------- 三类 is_error 分歧 → permission.decision（+ 被拒调用的 tool.request） ----------
 def decisions($r; $s; $h):
   ($r | errBlocks | map(select(.text | kindPred($h.kind)))) as $blocks
@@ -152,18 +186,19 @@ def decisions($r; $s; $h):
               | .raw = {event_name: ("diverge." + $h.kind), data: $h}
               | .extensions += {"vibetrail.kind": $h.kind, "vibetrail.human": $h.human, "vibetrail.tool_lookup": $nm.how}
               | ._key = ($s.uuid + "|permission.decision|" + ($cid // "") + "|" + $h.kind) ))
-  | (if $h.human then .denials += [$s.uuid] | .pending = {after: ((.pending.after // []) + [$s.uuid]), kind: $h.kind} else . end);
+  | (if $h.human then .denials += [$s.uuid] | addPending($s.uuid; $h.kind) else . end);
 
 # ---------- 打断 → turn.end(interrupted) / subagent.end(cancelled) + 被打断的回复 ----------
-def walkUp($u; $n):    # 沿 parentUuid 回溯到最近的 assistant 记录；碰到人的提示词（轮首）或链断就停
+def walkUp($u; $n):    # 沿 parentUuid 回溯到最近的真实 assistant 记录；越过合成记录；碰到人的提示词（轮首）或链断就停
   if $n == 0 or $u == null then null else
     (.chain[$u] // null) as $c
     | if $c == null then null
-      elif $c.type == "assistant" then $c
-      elif $c.human then null
+      elif $c.type == "assistant" and ($c.synthetic | not) then $c
+      elif $c.human or $c.slash then null
       else walkUp($c.parentUuid; $n - 1) end end;
-def lastAssistantInTurn($s):   # 链断了的兜底：按文件顺序取本轮里最近的 assistant 记录
-  . as $st | [.chain_order[] | $st.chain[.] | select(.type == "assistant" and .ln > $st.turn_line and .ln < $s.ln)] | last;
+def lastAssistantInTurn($s):   # 链断了的兜底：按文件顺序取本轮里最近的真实 assistant 记录
+  . as $st | turnStart as $from
+  | [.chain_order[] | $st.chain[.] | select(.type == "assistant" and (.synthetic | not) and .ln >= $from and .ln < $s.ln)] | last;
 
 def interrupted($r; $s; $h; $detail):
   turnOf($s) as $t
@@ -186,13 +221,13 @@ def interrupted($r; $s; $h; $detail):
           | .raw = {event_name: ("diverge." + $h.kind), data: $h}
           | .extensions += ({"vibetrail.kind": $h.kind, "vibetrail.human": true} + opt("vibetrail.interrupted_uuid"; $reply.uuid))
           | ._key = ($s.uuid + "|" + .type) )
-  | .pending = {after: ((.pending.after // []) + [$s.uuid]), kind: $h.kind};
+  | addPending($s.uuid; $h.kind);
 
 # for-tool-use 变体：同一轮里前面有 permission_denied 就是它的伴随记录，不另发事件（计一次）；
 # 没有配对的（语料里未见）按打断处理，不丢事件
 def forToolUse($r; $s; $h):
   if (.denials | length) > 0
-  then .ledger.absorbed_for_tool_use += 1 | .pending = {after: ((.pending.after // []) + [$s.uuid]), kind: "interrupt_for_tool_use"}
+  then .ledger.absorbed_for_tool_use += 1 | addPending($s.uuid; "interrupt_for_tool_use")
   else .ledger.unpaired_for_tool_use += 1 | interrupted($r; $s; $h; "unpaired interrupt_for_tool_use: " + $s.text) end;
 
 def handle($r; $s; $h):
@@ -202,29 +237,48 @@ def handle($r; $s; $h):
      else decisions($r; $s; $h) end)
   | (if .ln > $from_line then .ledger.out[$h.kind] += 1 else . end);
 
-# 分歧之后人的下一句 → message.user，extensions 指回触发它的记录
+# 分歧之后人的动作 → message.user，extensions 指回触发它的记录。
+# 斜杠命令发一条但不结束等待——判责要的那句话通常是之后打的字；打字才结束等待
 def emitAfter($s):
   .pending as $p
-  | emit(message($s; turnOf($s); $s; "message.user"; "user"; {"vibetrail.after": $p.after, "vibetrail.after_kind": $p.kind}))
-  | .pending = null;
+  | emit(message($s; turnOf($s); $s; "message.user"; "user";
+         {"vibetrail.after": $p.after, "vibetrail.after_kind": $p.kind} + (if $s.slash then {"vibetrail.slash_command": true} else {} end)))
+  | (if $s.human then .pending = null else . end);
 
 def step($r):
-  .out = [] | .ln += 1
+  .out = [] | .ln += 1 | .ln as $ln
   | if ($r | type) != "object" then .ledger.skipped_non_object += 1
     elif ($r.uuid | type) != "string" then .ledger.skipped_no_uuid += 1
     else
-      .ledger.records += 1
+      ($r | slim($ln)) as $s | [$r | diverge] as $hits
+      | (($hits | length) > 0 or $s.human or $s.slash) as $keyrec
+      | if $keyrec and (.run_uuids[$r.uuid] or (.prior[$r.uuid] != null and .prior[$r.uuid] != $ln)) then .ledger.replayed += 1
+    else
+      (if $keyrec then .run_uuids[$r.uuid] = true else . end)
+      | .ledger.records += 1
       | .last_ts = ($r.timestamp // .last_ts) | .version = ($r.version // .version)
       | .entrypoint = ($r.entrypoint // .entrypoint) | .branch = ($r.gitBranch // .branch)
       | (if ($r.promptId | type) == "string" and $r.promptId != .turn then .turn = $r.promptId | .denials = [] else . end)
-      | ($r | slim(.ln)) as $s
       | index($s)
       | (if $s.human then .turn_usage = {} | .turn_model = null | .turn_line = $s.ln else . end)
-      | (if $s.type == "assistant" and $s.usage != null then .turn_usage[($s.mid // $s.uuid)] = $s.usage | .turn_model = ($s.model // .turn_model) else . end)
-      | reduce ($r | diverge) as $h (.; handle($r; $s; $h))
-      | (if $s.human and .pending != null then emitAfter($s) else . end)
+      | (if $s.type == "assistant" and $s.usage != null and ($s.synthetic | not)
+         then .turn_usage[($s.mid // $s.rid // $s.uuid)] = $s.usage | .turn_model = ($s.model // .turn_model) else . end)
+      | (if $ln > $from_line and $keyrec then .ledger.sources += [[$s.uuid, $ln]] else . end)
+      | (if ($r.toolUseResult | type) == "string" and ($r.toolUseResult | startswith("User rejected tool use"))
+         then .ledger.sentinel.marker += 1
+              | (if any($hits[]; .kind == "permission_denied") then . else .ledger.sentinel.marker_without_hit += 1 end)
+         else . end)
+      | reduce $hits[] as $h (.; handle($r; $s; $h))
+      | (if ($s.human or $s.slash) and .pending != null then emitAfter($s) else . end)
+    end
     end;
+
+# 下次的起读行：本轮开头；还有没等到人话的分歧时，退到那个分歧所在轮的开头
+def checkpoint: turnStart as $ts | if .pending != null then ([.pending.since, $ts] | min) else $ts end;
 
 foreach (inputs, {"__vibetrail_eof__": true}) as $r (init;
   if $r == {"__vibetrail_eof__": true} then . else step($r) end;
-  if $r == {"__vibetrail_eof__": true} then {"_ledger": (.ledger + {from_line: $from_line, lines: .ln})} else .out[] end)
+  if $r == {"__vibetrail_eof__": true}
+  then {"_ledger": (.ledger + {start_line: $start_line, from_line: $from_line, lines: .ln, checkpoint_line: checkpoint,
+                               sources: (.ledger.sources | unique)})}
+  else .out[] end)

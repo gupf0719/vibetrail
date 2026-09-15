@@ -23,7 +23,7 @@ JSONL 而非单个 JSON 对象：追加即写，崩溃不会留下半个文件�
 Vibetrail-Id: 8cfb718c-f3d2-4945-bf58-97e8b9acdd6b
 ```
 
-由 `tools/prepare-commit-msg` 在每次 `git commit` 时写入（**每个 commit 都要有**——人工提交也会被闸门要求审计），
+由 `old/prepare-commit-msg` 在每次 `git commit` 时写入（**每个 commit 都要有**——人工提交也会被闸门要求审计），
 `--if-exists doNothing` 保证幂等；rebase / cherry-pick 重放期间早退，不碰重放的 message。读取：
 
 ```bash
@@ -64,7 +64,7 @@ git log -1 --format='%(trailers:key=Vibetrail-Id,valueonly)' <sha>
 这是「双层防护遮蔽」的实例，改这段代码时留意。
 
 git hook 本身的四个静默坑（rebase 重放把人的 commit 记成 agent 的、非编辑器路径的 merge 把 trailer 粘进 subject、另起一段追加会把已有
-trailer 挤出 trailer 区、`-m ''` 绕过空消息拒绝）与十二场景实测矩阵，见 `tools/test-hook.sh` 与 git 历史里的旧 §2.0。
+trailer 挤出 trailer 区、`-m ''` 绕过空消息拒绝）与十二场景实测矩阵，见 `old/test-hook.sh` 与 git 历史里的旧 §2.0。
 
 ## 3. 记录信封：对齐 Agent Trace 的字段名，但**不声称合规**
 

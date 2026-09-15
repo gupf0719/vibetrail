@@ -1,7 +1,8 @@
 # vibetrail 设计：用 hook 把 Claude Code 会话的两路数据传上云
 
 > **状态**（2026-09-15）：需求与设计定稿；第 1 步「提取器扩展与协议映射」已做（`tools/map-events.jq` + `tools/vibetrail-map`，细则 §4.2），
-> hook 分发、安装、push 未开工。沿用的判据见 [spec/diverge-v1.md](spec/diverge-v1.md)。
+> 同日对照 Pilot / teamai 补强并定下 U11（只在 Stop / SessionEnd / 补做里解析、从本轮开头读，§3.1、§3.3）；hook 分发、安装、push 未开工。
+> 沿用的判据见 [spec/diverge-v1.md](spec/diverge-v1.md)。G7 之前的代码与测试 09-15 归档到 `old/`，`tools/` 只留新代码。
 > 上一版设计（留痕数据投影进被观测仓、git hook 写 `Claude-Session` trailer）已于 2026-09-14 退役，见 §7 D4；仍在用的审计记录线见 §8。
 > 2026-09-15 D5：不传 transcript 原文件，正文只随人机分歧事件走，云端定为 paas-coding-hook 事件协议 1.0，索引保留 30 天够用。
 >
@@ -104,19 +105,20 @@ Pilot 的拦截器路线（[对比 §6.3](third-party/teamai-cli-vs-vibetrail.md
 | 事件 | 动作 | 同步 / 异步 |
 |---|---|---|
 | `SessionStart` | 门控（按 scope，§5）→ 发 `session.start`（`source`、capabilities）、记 git 状态 → **补做**：本仓（按 `git worktree list` 归属）所有 offset 落后于文件大小的 transcript，各补一次解析（分歧 + 轮次元数据）与 push。agent 崩溃、被杀、`-p` 模式下 Stop / SessionEnd 都不来，全靠这一步 | 门控与记录同步；补做丢后台 |
-| `UserPromptSubmit` | 发 `turn.start`（`prompt_id` 作 turn_id、model、git 状态）；顺手解析一次新增记录（不 push）——打断只能在这里或下面两处补读 | 30 s 上限；stdout 会进模型上下文，**必须为空** |
-| `Stop` | 解析新增记录 + 发 `turn.end`（status、usage、git 状态、`rev-list` 出的 commits）+ **push 一批**（本轮新增的，连同之前没传成的；端点未配置时这一步只记账不发） | `async: true`：不阻塞、不计 timeout |
+| `UserPromptSubmit` | 只发 `turn.start`（`prompt_id` 作 turn_id、model、git 状态），**不读 transcript**（U11，09-15 定）：这里解析的结果本来也不 push、云端看到的时间不变，同步 hook 却要让人等；Pilot、teamai 也都不在这里读 | 30 s 上限；stdout 会进模型上下文，**必须为空** |
+| `Stop` | 等 transcript 写稳（照 Pilot，最多 1.5 s，异步所以不卡人）→ 从本轮开头解析（§3.3）+ 发 `turn.end`（status、usage、git 状态、`rev-list` 出的 commits）+ **push 一批**（本轮新增的，连同之前没传成的；端点未配置时这一步只记账不发）。同一会话一把 mkdir 锁（照 Pilot），已在跑就跳过，下一次 hook 补上 | `async: true`：不阻塞、不计 timeout |
 | `SubagentStart` / `SubagentStop` | 发 `subagent.start` / `subagent.end`（`agent_id` 作实例 id、`agent_type`、父实例 `main`、派生它的 `parent_call_id`）；Stop 时再扫一遍 `subagents/` 目录——后台子 agent 在父 Stop 之后才结束 | 异步 |
 | `PostToolUseFailure` / `PermissionDenied` / `StopFailure` / `Notification`（`permission_prompt`） | 只记事件头，发 `ext.claude.<事件名>`：`tool_use_id`、`error` / `reason` / `notification_type`、时间。类型化信号，见 §3.2 | 同步，毫秒级 |
 | `InstructionsLoaded` | 记 `file_path`、`load_reason`、正文 sha；正文不传（D5，有必要再补） | 官方说明它本身异步跑 |
 | `CwdChanged` | 记 `old_cwd` / `new_cwd`（G11 接手检测的同一挂载点） | 同步 |
-| `SessionEnd` | 发 `session.end`（`reason`、status）；预算 1.5 s（`CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` 可抬），来不及的交给下一次 SessionStart 补做 | 同步 |
+| `SessionEnd` | 发 `session.end`（`reason`、status）+ 从本轮开头解析最后一轮（最大一轮约 0.2 s，放得进预算）；预算 1.5 s（`CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` 可抬），来不及的交给下一次 SessionStart 补做 | 同步 |
 
 不挂 `PreToolUse` / `PostToolUse`：每次工具调用多跑一个进程，而它们给的 `tool_input` / `tool_response` transcript 里全有，且 D5 后除被拒调用的输入外都不传。
 hook payload 里的 `tool_input` / `tool_response` 也不另存一份——transcript 全有。Pilot 的输出里每份内容出现 3 次（`tool.call`、`llm.response`、
 下一次 `llm.request` 的输入增量各一份），就是同一内容多处存的下场。
 
-**什么时候读**：每次 hook 触发读一次 transcript，有新的就提取、就传（用户原话「hook触发的时候采集一下，有就传」），没有实时的要求。
+**什么时候读**：Stop、SessionEnd 与 SessionStart 补做时读 transcript，有新的就提取、就传（用户原话「hook触发的时候采集一下，有就传」），没有实时的要求。
+打断时 Stop 不来，打断记录等到下一轮的 Stop 读到；offset 只在解析成功后前移，所以只是晚一轮，不会漏。
 `transcript_path` 是异步写的、可能落后于内存里的对话，Stop 时读到的可能缺本轮最后几条，下一次 hook 补上。都不是缺口，是机制。
 
 ### 3.2 分歧一路为什么还是要读 transcript
@@ -130,10 +132,15 @@ hook payload 里的 `tool_input` / `tool_response` 也不另存一份——trans
 
 ### 3.3 增量解析与本机 outbox
 
-- 每个 transcript 文件记消费到的 byte offset 与行号，存 `~/.vibetrail/state/<sid>.json`；每次只解析到源文件**最后一个换行符**为止（源可能正在写半行）。不复制文件。
-  映射层按行号门控、整文件重读（§4.2）：索引每次重建，只对新触发记录发事件。
+- 每个 transcript 文件在 `~/.vibetrail/state/<sid>.json` 记：读到的行号与字节（`lines` / `consumed_bytes`）、下次起读的
+  `checkpoint_line` / `checkpoint_byte`（本轮开头）、触发记录与人话记录的 `[uuid, 行号]` 清单（认回放副本用，§4.2）。
+  每次只解析到源文件**最后一个换行符**为止（源可能正在写半行）。不复制文件，按字节偏移跳读。
+- **从本轮开头读，不从文件头读**（U11，09-15 定）。映射要回看的东西都在同一轮里，所以只重读本轮：106 MB 的会话一次从 10.5 s
+  降到 0.19 s；676 轮里九成不超过 0.4 MB。借的是 Pilot「只读新字节」的思路，但它不保留上下文、全靠 Stop 恰好切在轮边界，
+  我们退到本轮开头，边界落在轮中间也不丢上下文。首次整读仍是 O(文件)，106 MB 约 12 s，只发生一次、在后台。
 - 源文件长度 < offset 时从 0 重读（重写守卫）。transcript 目前是 append-only，但 `file-history-snapshot` 带 `isSnapshotUpdate` 字段，不能假设永远是。
-- 首次全读、无单次上限。Pilot 首次只读最后一轮、单次超过 50 MB 只读尾部，那份 111 MB 的会话前段整个丢掉，4 条拒绝没了。
+- 首次全读、无单次上限。Pilot 首次只读最后一轮、单次超过 50 MB 只读尾部，那份 111 MB 的会话前段整个丢掉，4 条拒绝没了；
+  teamai 超过 50 MB 整份不扫。两种上限都会丢分歧，不学。
 - 子 agent 文件按 `<sid>/subagents/` 目录扫，不只信 hook 递来的那一个路径——teamai 栽在这里，58% 的人拒在子 agent 文件里
   （[对比 §3.2](third-party/teamai-cli-vs-vibetrail.md)）。
 - 产物写临时文件 + 原子 rename；每个会话一个目录，多 worktree 并发不共享文件，不加锁。失败日志只留元数据，不留 payload
@@ -214,29 +221,45 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
 ### 4.2 映射细则
 
 实现 `tools/map-events.jq`（include 判据模块 `diverge-rules.jq`），驱动 `tools/vibetrail-map`（填 `event_id`、出账本），
-回归 `tools/test-map.sh`（8 份 fixtures + scenario 回放；断言 + golden + schema + A2 对账 + 每个切点的增量等价）。
+回归 `tools/test-map.sh`（11 份 fixtures + scenario 回放；断言 + golden + schema + A2 对账 + 每个切点的增量等价 + event_id 用 python 独立重算）。
 
 - **触发与派生。** 每条分歧命中是一个触发记录；它派生出的事件（被拒调用的 `tool.request`、被打断的回复、之后人的下一句）
   都挂在触发记录上：`extensions.vibetrail.trigger` / `vibetrail.after` 指回触发记录的 uuid，`vibetrail.kind` 记原始 kind，
   `raw` 保留提取器的原始命中（A3 对账用），`provenance.source_event_id` 是事件自己来源记录的 uuid。
-- **增量按行号门控、整文件重读。** 每次从文件头读到最后一个换行符，只对**触发记录**行号 > 上次消费行号的分歧发事件；
-  索引（tool_use、`parentUuid` 链、当前轮）每次重建。派生事件按 `_key` 去重，**登记不看门控**——「先扫到一半、再扫全文」发出的
-  集合与一次扫全文相同（test-map.sh 对每个切点钉着；两种变异各被抓到一次）。账本记 `consumed_bytes` 与 `lines`。
-  代价：106 MB / 4.9 万行的 transcript 纯映射 10.5 s，5.8 MB 0.7 s（09-15，C02FM）——挂 UserPromptSubmit 前要定（U11）。
-- **`event_id`** = UUIDv5(固定命名空间 uuid5(NS_URL, "vibetrail"), "`<sid>|<记录 uuid>|<事件类型>|<限定符>`")，限定符是 `call_id` / kind；
-  同一输入重跑同一个 id，重发幂等靠它。SHA-1 用 `shasum` / `sha1sum`，不引入 python。
+- **增量：从本轮开头读，按行号门控。** 每次从上次账本的 `checkpoint_line`（本轮开头；还有没等到人话的分歧时退到那个分歧所在轮的开头）
+  读到最后一个换行符，只对**触发记录**行号 > 上次 `lines` 的分歧发事件；索引（tool_use、`parentUuid` 链、当前轮）在这一段里重建。
+  派生事件按 `_key` 去重，**登记不看门控**。「前段 + 从 checkpoint 起的后段」与一次扫全文发出的事件相同：fixtures 每个切点钉着，
+  本机 44 个主会话各三个切点实跑一致（09-15）；把 checkpoint 改成「上次读到哪就从哪读」的变异在 8 份 fixtures 上都被抓到。
+- **回放副本不上报**（用户 09-15）。Claude Code 会把旧记录原样再追加进同一个文件：uuid、时间戳不变，只把 promptId 改成回放时那一轮的。
+  本机 44 个主会话里 4 个有，共 1402 条。不跳过的话，副本里的打断会再报一次，还会把回放之后人打的第一句挂成它的「下一句」。
+  规则只管会产生事件的两种记录（触发记录、人话记录）：本次读取里 uuid 出现过的跳过；uuid 在 state 的 `[uuid, 行号]` 清单里但行号
+  对不上的跳过，对得上的是正常重读。不用「时间戳倒退」判：真实触发记录 405 条从不倒退，但真实 user 记录有 63 条倒退超过一分钟。
+  Pilot、teamai 都不处理这种副本：Pilot 只在一条消息内按工具调用 id 去重，teamai 只按消息 id 给 token 去重。
+- **`event_id`** = UUIDv5(uuid5(NS_URL, "vibetrail") = `6c90e594-0cb4-59d0-9186-740d215c8b7f`, "`<sid>|<记录 uuid>|<事件类型>|<限定符>`")，
+  限定符是 `call_id` / kind；同一输入重跑同一个 id，重发幂等靠它。所有名字一次交给 `shasum` / `sha1sum` 算完，运行时不引入 python；
+  测试里用 python 的 `uuid.uuid5` 独立重算核对（09-15 发现先前的命名空间常量误用了测试串算出的值，未发布过，已改正）。
 - **`turn_id`** = 记录的 promptId；没有就取最近见到的 promptId，再没有就用记录 uuid，后两种 provenance.kind 标 `inferred`（带 `rule_version`）。
   派生事件跟触发记录的轮次走。
-- **实例。** 主会话 `agent_instance_id` = `main`；子 agent 文件里 = `agentId`（每条记录都带），`parent_agent_instance_id` = `main`，
-  `parent_call_id` = 同名 `meta.json` 的 `toolUseId`，`agent_type` 取 `agentType`；`session_id` 都是父会话 id（文件名 / 上两级目录名）。
+- **实例。** 主会话 `agent_instance_id` = `main`；子 agent 文件里 = `agentId`（每条记录都带），`parent_call_id` = 同名 `meta.json` 的 `toolUseId`，
+  `agent_type` 取 `agentType`；`session_id` 都是父会话 id（文件名 / 上两级目录名）。`parent_agent_instance_id`：一级子 agent 是 `main`；
+  被子 agent 派出的（`spawnDepth` ≥ 2，本机 80 个，76 个有 transcript）是派它的那个子 agent——在兄弟文件里找 `toolUseId` 所在的
+  `agent-<id>.jsonl`，取其 id。两家都不处理孙级：Pilot 明确只展开主会话的直接子 agent，teamai 不读子 agent 文件。
   子 agent 文件里的 user 记录是父 agent 派活或注入，不算「人的下一句」。
 - **正文取法。** 回复正文 = text 块拼接（不含 thinking）；人话 = 字符串正文或 text 块，去掉 `<system-reminder>` 块；
-  以 `<system-reminder>` / `<local-command-*>` / `<command-name>` / `<task-notification>` / `<bash-*>` 开头的、`isMeta`、`isCompactSummary` 都不算人话
+  以 `<system-reminder>` / `<local-command-*>` / `<task-notification>` / `<bash-*>` 开头的、`isMeta`、`isCompactSummary` 都不算人话
   （09-15 抽样：`system-reminder` 是 `isMeta:false` 的字符串，`local-command-caveat` 才是 `isMeta:true`，所以不能只看 isMeta）。
-- **`turn.end(interrupted)` 的 usage** = 本轮 assistant 记录按 `message.id` 去重后求和（同一 id 的 4 条记录 usage 相同）：
+  合成的 assistant 记录（model `<synthetic>`：No response requested.、额度用尽、API 报错）不算回复，找被打断的回复时越过它，也不计用量（照 Pilot）。
+- **斜杠命令算人的动作。** `<command-name>` 开头的 user 记录是人敲的，规范成「/model claude-opus-5」这样的一句发 `message.user`，
+  标 `vibetrail.slash_command`，**不结束等待**——之后打的字照样作为下一句发出。本机分歧之后人的第一个动作：打字 255、/model 13、/compact 4。
+  Pilot 识别 `<command-name>` 是为了统计 skill，我们拿来补判责上下文；teamai 不认。
+- **`turn.end(interrupted)` 的 usage** = 本轮 assistant 记录按 `message.id` 去重后求和（同一 id 的 4 条记录 usage 相同；缺 message.id 时
+  退到 `requestId`，照 teamai；本机没有缺 id 的记录，纯防御）：
   input = `input_tokens` + `cache_creation_input_tokens`，cached = `cache_read_input_tokens`，reasoning = `thinking_tokens`，total = 三者之和。
   vcs 只有 branch——transcript 里没有 HEAD，hook 侧补。Stop 路径的 `turn.end` 用同一定义。
+- **哨兵（G6）。** 被拒记录的 `toolUseResult` 是字符串 `User rejected tool use`（或 `Error: Permission to use …` 原文），与正文判据是两个独立字段；
+  账本记 `sentinel.marker`（带这个标记的记录数）与 `sentinel.marker_without_hit`（有标记、判据却没认出人拒）。本机 45 个标记、0 次漏判。
 - **状态有上界**：tool_use 索引 500 条、记录链 400 条；分歧引用的永远是最近几条记录。多态字段一律先判 type（判据的铁律照用）。
+  jq 的函数参数在调用处的输入上求值：`$r | slim(.ln)` 里的 `.ln` 是 `$r.ln`，第一版因此所有行号都是 null，断链兜底从未生效（09-15 修，fixture 钉着）。
 - **默认值**：`project_id` / `workspace_id` 没传就取 transcript 第一条记录的 `cwd`，hook 分发入口会传真值；`vibetrail.version` 先填 `0.2.0-dev`。
 
 ## 5. 安装与范围
@@ -343,7 +366,7 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
   push 的内容，先让人看；push 动作第一版就在，端点没配置时不发只记账。G9 的本地查看在端点配置后改看清单与元数据。
 - **安装照 teamai：机器级装一次**，不再每个 clone 装。hook 条目只写 HOME 的 `~/.claude/settings.json`；「项目级 / 用户级」是 scope 配置，默认 `project`（U1，09-15 定）。
 - **被观测仓里零写入。** `prepare-commit-msg` 的 `Claude-Session` trailer 退役——不再往任何仓的 `.git/hooks` 写东西，仓内 vendor、`.gitattributes`
-  也不再需要。commit ↔ session 改从每轮起止的 HEAD 推（§3.5）；trailer 机制的实测结论留在 git 历史与 `tools/test-hook.sh`。
+  也不再需要。commit ↔ session 改从每轮起止的 HEAD 推（§3.5）；trailer 机制的实测结论留在 git 历史与 `old/test-hook.sh`。
 - **实现栈 bash + jq + curl**，不做 Go（§5.3）。
 
 代价写明：端点配置之前，「team 可见、换机器不丢」都没有，只有本机；`git log` 里不再直接看到会话 id；端点未配置阶段 spool 会积到本机全量的量级。

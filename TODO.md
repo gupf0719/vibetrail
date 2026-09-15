@@ -19,9 +19,13 @@
 - [x] 分歧一路第 1 步——提取器扩展与协议映射（09-15）：判据拆成 `diverge-rules.jq` 模块、命中多带 `call_id`；`map-events.jq` + `vibetrail-map` 把五类 kind 映射成
   `permission.decision` / `turn.end(interrupted)` / `subagent.end(cancelled)`，`tool_name` / `input` 按 `tool_use_id` 反查（G5 关），带被打断的回复与之后人的下一句，
   `event_id` UUIDv5；`test-map.sh` 8 份 fixtures + scenario 回放 + schema + A2 对账 + 每个切点增量等价，89 项全绿。细则 DESIGN §4.2。
-- [ ] 分歧一路第 2 步——挂 hook：`vibetrail-map` 挂到 UserPromptSubmit / Stop / SessionEnd / SessionStart 补做，manifest 记 `consumed_bytes` / `lines`，
-  子 agent 按 `<sid>/subagents/` 目录扫（连同 meta.json）；`vibetrail-sync` 退役。⚠️ 先定 U11：106 MB 的 transcript 纯映射 10.5 s，UserPromptSubmit
-  是同步 hook（30 s 上限），大文件要不要跳过、只在 Stop 异步做。
+- [x] 第 1 步补强（09-15，对照 Pilot / teamai 后改，不照搬）：从本轮开头读（`--start-line` / `--start-byte`，账本给 `checkpoint_line` / `checkpoint_byte`，U11 定）；
+  回放副本不上报（本次读取内按 uuid、跨次按 `[uuid, 行号]` 清单 `--seen-uuids` / `--sources-out`）；嵌套子 agent 的父实例查兄弟文件；斜杠命令算人的动作；
+  越过合成记录；缺 message.id 退到 requestId；字段哨兵；修掉行号全是 null 的错；命名空间常量改成真正的 uuid5(NS_URL, "vibetrail")。
+  `test-map.sh` 11 份 fixtures 139 项全绿；本机 44 个主会话各三个切点实跑与全量一致，750 条事件全过 schema。
+- [ ] 分歧一路第 2 步——挂 hook：`vibetrail-map` 挂到 Stop（异步）/ SessionEnd / SessionStart 补做，**不挂 UserPromptSubmit**（U11 已定）；
+  state 记 `lines` / `consumed_bytes` / `checkpoint_line` / `checkpoint_byte` 与 `[uuid, 行号]` 清单，下次按它们调；同一会话一把 mkdir 锁、已在跑就跳过；
+  Stop 里先等 transcript 写稳；文件变短（重写）时清 state 从 0 重读；子 agent 按 `<sid>/subagents/` 目录扫（连同 meta.json）。
 - [ ] 轮次元数据一路：每轮 `turn.start` / `turn.end`（status、usage、vcs）、`InstructionsLoaded` 只记路径与 sha；不传 transcript 原文件、不传非分歧正文（D5）；先做 Claude Code。
 - [ ] commit ↔ session 推导：每轮起止 HEAD + `rev-list`（DESIGN §3.5）；`vibetrail show` 按 commit 查改走它。
 - [ ] push：`vibetrail push [--list | --show]`，端点与 token 从 `~/.vibetrail/config` 读、没配不发；配了按协议打批（≤ 100 条 / 16 MiB）、每条先过 schema、`event_id` 幂等、accepted + duplicate 推进水位并删本机块、失败重发；
@@ -29,7 +33,8 @@
 - [ ] 完整性钉子：每类记录条数进出相等、映射后事件全部过 schema（这两条测试期已在 `test-map.sh` 钉住；运行时要进账本与 doctor）、超 1 MiB 被拒计数、未知记录类型 / 事件名告警（A11；G10、G6）。
 - [ ] 回归：两路各有带断言的测试，输入用 [experiments/collect-demo/scenario.json](experiments/collect-demo/scenario.json) 回放，补上 SessionStart 补做、
   打断后无 Stop、后台子 agent 晚于父 Stop、一轮多 commit、端点未配置 / 配置后断网五个场景。
-- [ ] 查询端只留 push 前本地预览（G9，读取不归本项目）；删退役脚本（CAPABILITIES §1 退役表）；OPEN-ISSUES 关 G7。
+- [ ] 查询端只留 push 前本地预览（G9，读取不归本项目）；OPEN-ISSUES 关 G7。退役脚本 09-15 已按用户要求归档到 `old/`（`old/README.md`），
+  审计线的几份随 U6 定去留。
 
 ## G11 多个会话改、一个会话提交：追回每一行出自哪个会话
 

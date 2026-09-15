@@ -5,10 +5,11 @@
 #   3. A2 进出对账：提取器单独跑出的每类命中数 == 映射出的对应事件数（人拒 → decided_by user，分类器 → policy，
 #      链路 → system，打断 → turn.end / subagent.end，for-tool-use → 吸收 + 未配对）
 #   4. 增量等价：对每个切点 L，「前 L 行全量扫」∪「全文从 L 起扫」== 「全文全量扫」——派生事件跟触发记录走、去重不看门控，
-#      这两条不成立时这里会红
+#      这两条不成立时这里会红；再加一路「从前段账本给的 checkpoint_line（本轮开头）读起」，钉住 U11 的按轮增量
 # 用法：test-map.sh [--update]   --update 重新生成 golden（先看 diff 再提交）
 set -uo pipefail
 cd "$(dirname "$0")"; SELF=$PWD; FX=$SELF/fixtures-map
+FILES=("$FX"/*.jsonl "$FX"/fx-*/subagents/agent-*.jsonl)
 T=$(mktemp -d "${TMPDIR:-/tmp}/vibetrail-test-map.XXXXXX"); trap 'rm -rf "$T"' EXIT
 update=0; [ "${1:-}" = "--update" ] && update=1
 fail=0; pass=0
@@ -39,7 +40,7 @@ if run scenario "$T/scenario.jsonl" --sid 11111111-2222-4333-8444-555555555555 -
 fi
 
 echo "════ 2. fixtures：断言 + schema + golden ════"
-for f in "$FX"/*.jsonl "$FX"/fx-sub/subagents/agent-a1.jsonl; do
+for f in "${FILES[@]}"; do
     n=$(basename "$f" .jsonl)
     run "$n" "$f" || continue
     e=$T/$n.events; lg=$T/$n.ledger
@@ -92,11 +93,27 @@ check "denied-then-interrupt: 账本记到 1 次去重" '.[0]' <(jq -c '.dedup =
 e=$T/noise.events
 check "noise: 非对象行、字符串 message、缺字段的块都不炸；只出一条 turn.end" 'length == 1 and .[0].type == "turn.end" and .[0].turn_id == "p1"' "$e"
 check "noise: 账本计数" '.[0]' <(jq -c '.skipped_non_object == 3 and .skipped_no_uuid == 1 and .records == 5' "$T/noise.ledger")
+check "noise: 没有 parentUuid 的打断按本轮顺序兜底找到回复（曾因行号全是 null 从未生效）" '.[0].extensions["vibetrail.interrupted_uuid"] == "m3"' "$e"
+e=$T/edge-cases.events
+check "edge: 越过合成记录找到真实回复，model 与用量不含合成记录" '.[0].type == "message.assistant" and .[0].payload.text == "我先删掉安装那一节。" and .[1].payload.model == "claude-opus-5" and .[1].payload.usage == {input_tokens:4,cached_input_tokens:40,output_tokens:9,total_tokens:53} and .[1].extensions["vibetrail.interrupted_uuid"] == "a1"' "$e"
+check "edge: 斜杠命令规范成一句发出，标 slash_command，不结束等待" '.[2].type == "message.user" and .[2].payload.text == "/model claude-opus-5" and .[2].extensions["vibetrail.slash_command"] == true and .[2].extensions["vibetrail.after"] == ["i1"]' "$e"
+check "edge: 之后打的字照样发，指回同一次打断；本地命令输出不算人话" '.[3].payload.text == "换个模型再试，只删安装那一节" and .[3].extensions["vibetrail.after"] == ["i1"] and (.[3].extensions | has("vibetrail.slash_command") | not) and all(.[]; .payload.text != "<local-command-stdout>Set model to claude-opus-5</local-command-stdout>")' "$e"
+check "edge: 缺 message.id 时按 requestId 去重，断链时按本轮顺序兜底" '.[5].type == "turn.end" and .[5].payload.usage == {input_tokens:6,cached_input_tokens:60,output_tokens:12,total_tokens:78} and .[5].extensions["vibetrail.interrupted_uuid"] == "a3" and .[4].payload.text == "好，只删安装一节，其余不动。"' "$e"
+check "edge: 共 7 条事件，没认出的新拒绝措辞不发事件" 'length == 7 and all(.[]; .type != "permission.decision")' "$e"
+check "edge: 哨兵——有 User rejected tool use 标记而判据没认出，账本记 1；checkpoint 是最后一轮开头" '.[0]' <(jq -c '.sentinel == {marker:1, marker_without_hit:1} and .checkpoint_line == 12' "$T/edge-cases.ledger")
+e=$T/replay.events
+check "replay: 回放副本整条跳过，原来的事实各报一次" 'length == 9 and ([.[] | .event_id] | length == (unique | length)) and ([.[] | select(.type == "turn.end")] | map(.provenance.source_event_id) == ["r-i1", "r-i9"])' "$e"
+check "replay: 副本里的旧人话不会被当成打断后的下一句；回放后人打的第一句挂在原来的打断上" '[.[] | select(.type == "message.user") | [.payload.text, .extensions["vibetrail.after"]]] == [["先别跑测试，直接看代码", ["r-d1","r-f1"]], ["接着昨天的继续", ["r-i1"]], ["够了", ["r-i9"]]]' "$e"
+check "replay: 账本记 5 条副本（触发与人话记录；assistant 副本照常过），交给下一次的清单是它们的 uuid + 行号" '.[0]' <(jq -c '.replayed == 5 and (.sources | map(.[0]) | index("r-i1") != null) and ([.sources[] | select(.[0] == "r-u1")] == [["r-u1", 1]])' "$T/replay.ledger")
+e=$T/agent-b2.events
+check "nest: 被子 agent 派出的子 agent，父实例是派它的 b1，不是 main" 'length == 2 and all(.[]; .agent_instance_id == "b2" and .parent_agent_instance_id == "b1" and .parent_call_id == "toolu_spawn_b2" and .session_id == "fx-nest") and .[1].payload.agent_type == "Explore"' "$e"
+check "nest: 一级子 agent 的父实例仍是 main" '.[0]' <(jq -c '.parent_instance == "main"' "$T/agent-b1.ledger")
 
 echo "════ 3. A2 对账：提取器单独跑 == 映射出的事件 ════"
-for f in "$FX"/*.jsonl "$FX"/fx-sub/subagents/agent-a1.jsonl "$T/scenario.jsonl"; do
+for f in "${FILES[@]}" "$T/scenario.jsonl"; do
     n=$(basename "$f" .jsonl); e=$T/$n.events; lg=$T/$n.ledger
-    hits=$(jq -c -L "$SELF" -f "$SELF/extract-diverge.jq" "$f" 2>/dev/null | jq -S -s -c 'group_by(.kind) | map({key: .[0].kind, value: length}) | from_entries')
+    # 提取器逐行判、不认回放副本，按 (记录 uuid, kind) 去重后才是「发生过几次」
+    hits=$(jq -c -L "$SELF" -f "$SELF/extract-diverge.jq" "$f" 2>/dev/null | jq -S -s -c 'unique_by([.turn, .kind]) | group_by(.kind) | map({key: .[0].kind, value: length}) | from_entries')
     got=$(jq -S -s -c --argjson lg "$(cat "$lg")" '{
         permission_denied: ([.[] | select(.type=="permission.decision" and .payload.decided_by=="user")] | length),
         classifier_blocked: ([.[] | select(.type=="permission.decision" and .payload.decided_by=="policy")] | length),
@@ -107,25 +124,35 @@ for f in "$FX"/*.jsonl "$FX"/fx-sub/subagents/agent-a1.jsonl "$T/scenario.jsonl"
     if [ "$hits" = "$got" ]; then ok; else ko "$n: 提取器 $hits ≠ 映射 $got"; fi
     # 提取器命中与 raw.data 逐字一致（A3）
     raws=$(jq -c 'select(.raw != null) | .raw.data' "$e" | jq -s -c 'unique_by(.turn) | sort_by(.turn)')
-    want=$(jq -c -L "$SELF" -f "$SELF/extract-diverge.jq" "$f" 2>/dev/null | jq -s -c --argjson lg "$(cat "$lg")" '[.[] | select(.kind != "interrupt_for_tool_use" or $lg.unpaired_for_tool_use > 0)] | sort_by(.turn)')
+    want=$(jq -c -L "$SELF" -f "$SELF/extract-diverge.jq" "$f" 2>/dev/null | jq -s -c --argjson lg "$(cat "$lg")" '[.[] | select(.kind != "interrupt_for_tool_use" or $lg.unpaired_for_tool_use > 0)] | unique_by([.turn, .kind]) | sort_by(.turn)')
     if [ "$raws" = "$want" ]; then ok; else ko "$n: raw.data 与提取器输出不一致"; fi
 done
 
 echo "════ 4. 增量等价：每个切点 L，前 L 行 ∪ 从 L 起 == 全量 ════"
-for f in "$FX"/*.jsonl "$FX"/fx-sub/subagents/agent-a1.jsonl "$T/scenario.jsonl"; do
+for f in "${FILES[@]}" "$T/scenario.jsonl"; do
     n=$(basename "$f" .jsonl); N=$(wc -l < "$f" | tr -d ' '); full=$T/$n.norm
     [ -f "$full" ] || jq -S -c . "$T/$n.events" > "$full"
     bad=0
     sid=$(jq -r .sid "$T/$n.ledger"); pid=$(jq -r '.[0].project_id // "x"' -s "$T/$n.events"); wid=$(jq -r '.[0].workspace_id // "x"' -s "$T/$n.events")
     meta=(); [ -f "${f%.jsonl}.meta.json" ] && meta=(--meta "${f%.jsonl}.meta.json")
+    par=$(jq -r .parent_instance "$T/$n.ledger")   # 切出来的前段在临时目录里，查不到兄弟文件，父实例照全量那次给
+    common=(--sid "$sid" --parent-instance "$par" --project-id "$pid" --workspace-id "$wid" ${meta[@]+"${meta[@]}"})
+    sort "$full" > "$T/full.sorted"; badc=0
     for L in $(seq 1 $((N-1))); do
         head -n "$L" "$f" > "$T/cut.jsonl"
-        bash "$SELF/vibetrail-map" "$T/cut.jsonl" --sid "$sid" ${meta[@]+"${meta[@]}"} --ledger "$T/cut.ledger" --project-id "$pid" --workspace-id "$wid" > "$T/a.events" 2> "$T/a.err" || { echo "    $n 切点 $L：前段失败 $(head -c 120 "$T/a.err")"; }
-        bash "$SELF/vibetrail-map" "$f" --sid "$sid" ${meta[@]+"${meta[@]}"} --from-line "$L" --ledger "$T/b.ledger" --project-id "$pid" --workspace-id "$wid" > "$T/b.events" 2> "$T/b.err" || { echo "    $n 切点 $L：后段失败 $(head -c 120 "$T/b.err")"; }
-        cat "$T/a.events" "$T/b.events" | jq -S -c . | sort > "$T/ab.norm"; sort "$full" > "$T/full.sorted"
+        rm -f "$T/cut.src"
+        bash "$SELF/vibetrail-map" "$T/cut.jsonl" "${common[@]}" --ledger "$T/cut.ledger" --sources-out "$T/cut.src" > "$T/a.events" 2> "$T/a.err" || { echo "    $n 切点 $L：前段失败 $(head -c 120 "$T/a.err")"; }
+        bash "$SELF/vibetrail-map" "$f" "${common[@]}" --from-line "$L" --ledger "$T/b.ledger" > "$T/b.events" 2> "$T/b.err" || { echo "    $n 切点 $L：后段失败 $(head -c 120 "$T/b.err")"; }
+        cat "$T/a.events" "$T/b.events" | jq -S -c . | sort > "$T/ab.norm"
         if ! cmp -s "$T/ab.norm" "$T/full.sorted"; then bad=$((bad+1)); [ $bad -le 2 ] && { echo "    $n 切点 $L："; diff "$T/full.sorted" "$T/ab.norm" | head -4 | cut -c1-160 | sed 's/^/      /'; }; fi
+        # U11：后段改从前段账本的 checkpoint_line 读起
+        C=$(jq -r .checkpoint_line "$T/cut.ledger"); CB=$(jq -r .checkpoint_byte "$T/cut.ledger")
+        bash "$SELF/vibetrail-map" "$f" "${common[@]}" --start-line "$C" --start-byte "$CB" --from-line "$L" --seen-uuids "$T/cut.src" --ledger "$T/c.ledger" > "$T/c.events" 2> "$T/c.err" || { echo "    $n 切点 $L：checkpoint 段失败 $(head -c 120 "$T/c.err")"; }
+        cat "$T/a.events" "$T/c.events" | jq -S -c . | sort > "$T/ac.norm"
+        if ! cmp -s "$T/ac.norm" "$T/full.sorted"; then badc=$((badc+1)); [ $badc -le 2 ] && { echo "    $n 切点 $L（从第 $C 行读）："; diff "$T/full.sorted" "$T/ac.norm" | head -4 | cut -c1-160 | sed 's/^/      /'; }; fi
     done
     if [ $bad -eq 0 ]; then ok; else ko "$n: $bad 个切点不等价（共 $((N-1)) 个）"; fi
+    if [ $badc -eq 0 ]; then ok; else ko "$n: 从 checkpoint 读起时 $badc 个切点不等价（共 $((N-1)) 个）"; fi
 done
 
 echo "════ 5. 尾部半行、幂等 ════"
@@ -136,6 +163,22 @@ run half "$T/half.jsonl" --sid interrupt-text && {
     if cmp -s <(jq -S -c . "$T/half.events") "$T/interrupt-text.norm"; then ok; else ko "半行: 事件应与整行文件一致"; fi
 }
 run again "$FX/denials.jsonl" && { if cmp -s <(sids "$T/again.events") <(sids "$T/denials.events"); then ok; else ko "幂等: 两次运行 event_id 不同"; fi; }
+# event_id 的算法用 python 独立重算一遍：UUIDv5(uuid5(NS_URL, "vibetrail"), "<sid>|<key>")，key 由事件内容还原
+if python3 - "$T/denials.events" "$T/replay.events" "$T/agent-b2.events" > "$T/uuid.out" 2>&1 <<'EOF'
+import json, sys, uuid
+ns = uuid.uuid5(uuid.NAMESPACE_URL, "vibetrail")
+bad = 0
+for path in sys.argv[1:]:
+    for line in open(path):
+        e = json.loads(line); t = e["type"]; src = e["provenance"].get("source_event_id")
+        if t == "tool.request": key = f'{src}|tool.request|{e["payload"]["call_id"]}'
+        elif t == "permission.decision": key = f'{src}|permission.decision|{e["payload"].get("call_id", "")}|{e["extensions"]["vibetrail.kind"]}'
+        else: key = f'{src}|{t}'
+        if str(uuid.uuid5(ns, f'{e["session_id"]}|{key}')) != e["event_id"]:
+            bad += 1; print("mismatch", t, key)
+sys.exit(1 if bad else 0)
+EOF
+then ok; else ko "event_id 与 python 的 UUIDv5 不一致: $(head -3 "$T/uuid.out")"; fi
 
 echo
 if [ $fail -eq 0 ]; then echo "  ✅ $pass/$pass 通过"; else echo "  ❌ $fail 失败 / $pass 通过"; exit 1; fi

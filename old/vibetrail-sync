@@ -9,7 +9,9 @@
 # 幂等：整份重生成而非追加。JSONL 的 append-only 是**记录流的语义**，不是写入机制的约束。
 set -uo pipefail
 SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-JQF="$SELF/extract-diverge.jq"
+# 判据在 tools/（本仓，2026-09-15 起旧脚本归档到 old/）或同目录（被 vendor 进观测仓时）
+JQD="$SELF"; [ -f "$JQD/extract-diverge.jq" ] || JQD="$SELF/../tools"
+JQF="$JQD/extract-diverge.jq"
 PROJ="$HOME/.claude/projects"
 cd "$(git rev-parse --show-toplevel)" || exit 1
 OUT=.claude/trace/sessions; mkdir -p "$OUT"
@@ -60,7 +62,7 @@ while IFS= read -r tp; do
         cwd:.cwd, branch:(.gitBranch // null)
     }' "$tp" 2>/dev/null | head -1 >> "$tmp"
     # ── 分歧（主 + 子，按时间排序）
-    for p in "${parts[@]}"; do jq -c -L "$SELF" -f "$JQF" "$p" 2>/dev/null; done \
+    for p in "${parts[@]}"; do jq -c -L "$JQD" -f "$JQF" "$p" 2>/dev/null; done \
       | jq -c --slurp 'sort_by(.at)[]' 2>/dev/null >> "$tmp"
     # ── 收尾汇总
     bytes=$(wc -c < "$tp" | tr -d ' ')

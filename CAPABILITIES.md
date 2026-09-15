@@ -17,8 +17,8 @@
 |---|---|---|
 | 人机分歧判据 | ✅ 已实现，755 会话实测精确率 100% | `tools/diverge-rules.jq`（jq 模块）+ 入口 `tools/extract-diverge.jq`（调用要带 `-L tools`），规范 [spec/diverge-v1.md](spec/diverge-v1.md) |
 | 判据回归 | ✅ | `tools/fixtures.jsonl` + `tools/test-extract.sh`（27 条正负例，比对整条输出并查 jq 报错） |
-| 协议映射（分歧一路） | ✅ 2026-09-15 | `tools/map-events.jq`（include 判据模块）+ `tools/vibetrail-map`（`event_id` UUIDv5、账本、只读到最后一个换行）；五类 kind → `permission.decision` / `turn.end(interrupted)` / `subagent.end(cancelled)`，带被拒调用的 `tool.request`、被打断的回复、之后人的下一句；规则 [DESIGN §4.2](DESIGN.md) |
-| 映射回归 | ✅ | `tools/test-map.sh`：8 份 fixtures（`tools/fixtures-map/`，golden 在 `expect/`）+ scenario 回放；断言 + golden + 每条过协议 schema（`tools/schema-check.py`，python3 + jsonschema，只在测试用）+ A2 对账（提取器命中数 == 事件数）+ 每个切点的增量等价 + 半行 + 幂等，89 项 |
+| 协议映射（分歧一路） | ✅ 2026-09-15 | `tools/map-events.jq`（include 判据模块）+ `tools/vibetrail-map`（`event_id` UUIDv5、账本、只读到最后一个换行、按字节偏移从本轮开头读、回放副本不上报）；五类 kind → `permission.decision` / `turn.end(interrupted)` / `subagent.end(cancelled)`，带被拒调用的 `tool.request`、被打断的回复、之后人的下一句（含斜杠命令）；规则 [DESIGN §4.2](DESIGN.md) |
+| 映射回归 | ✅ | `tools/test-map.sh`：11 份 fixtures（`tools/fixtures-map/`，golden 在 `expect/`）+ scenario 回放；断言 + golden + 每条过协议 schema（`tools/schema-check.py`，python3 + jsonschema，只在测试用）+ A2 对账（提取器命中按记录去重后 == 事件数）+ 每个切点的增量等价（从头读、从 checkpoint 读两路）+ 半行 + 幂等 + event_id 用 python 重算，139 项 |
 | hook 机制探针 | ✅ | `experiments/hook-probe.sh`（DESIGN §6.1 的实证来源） |
 | 采集回放样本 | ✅ | `experiments/collect-demo/scenario.json`：同一段示例会话，Pilot / teamai 实跑样例就是用它截的；G7 的回归输入 |
 
@@ -29,31 +29,31 @@
 | `vibetrail init` / `uninstall` | ❌ | 机器级装一次：`~/.vibetrail/bin`、HOME settings 条目（带 marker）、scope 配置、登记；DESIGN §5 |
 | hook 分发入口 `vibetrail-hook <事件>` | ❌ | 读 stdin、按 scope 门控、发 session / turn / subagent 起止事件与 `ext.claude.*` 事件头，写 `events.jsonl`；DESIGN §3.1、§4.1 |
 | 增量解析 | ❌ | 每个 transcript 文件一个 byte offset、截到最后一个换行、子 agent 按目录扫、原子写；不复制文件；DESIGN §3.3 |
-| 分歧提取挂 hook | ❌ | `vibetrail-map` 在 UserPromptSubmit / Stop / SessionEnd / SessionStart 补做时跑，按行号门控（DESIGN §4.2）；子 agent 按目录扫；`vibetrail-sync` 退役。大文件的同步代价先定 U11 |
+| 分歧提取挂 hook | ❌ | `vibetrail-map` 在 Stop（异步）/ SessionEnd / SessionStart 补做时跑，不挂 UserPromptSubmit（U11 已定）；state 记 checkpoint 与 `[uuid, 行号]` 清单；会话锁；子 agent 按目录扫 |
 | commit ↔ session 推导 | ❌ | 每轮起止 HEAD + `rev-list`；DESIGN §3.5 |
 | `vibetrail push [--list \| --show]` | ❌ | 端点没配不发；配了按协议打批、每条过 schema、`event_id` 幂等、ack 即删；DESIGN §4 |
-| doctor 扩展 | 🔁 | 现有 `tools/vibetrail-doctor` 查的是退役的 git hook 与仓内 vendor，要改成 DESIGN §5 的自检项 |
-| 本地预览 | 🔁 | 现有 `tools/vibetrail`（show / log / session / diverge）读仓内 `sessions/` 与 `Claude-Session` trailer，两者都退役；只留 push 前预览（`push --list / --show`），读取与分析不归本项目（D5） |
+| doctor 扩展 | 🔁 | 现有 `old/vibetrail-doctor` 查的是退役的 git hook 与仓内 vendor，要改成 DESIGN §5 的自检项 |
+| 本地预览 | 🔁 | 现有 `old/vibetrail`（show / log / session / diverge）读仓内 `sessions/` 与 `Claude-Session` trailer，两者都退役；只留 push 前预览（`push --list / --show`），读取与分析不归本项目（D5） |
 | 完整性钉子 | 🔁 | 映射后事件全部过 schema、每类命中数 == 事件数已在 `test-map.sh` 钉住（测试期）；运行时的条数进出、超 1 MiB 被拒计数、未知类型 / 事件名告警待做（G10、G6） |
 
-### 退役（2026-09-14，D4；代码在 G7 落地时删）
+### 退役（2026-09-14，D4；2026-09-15 代码归档到 `old/`，见 `old/README.md`）
 
 | 功能 | 原实现 | 为什么退 |
 |---|---|---|
-| 每个 clone 接入 | `tools/vibetrail-install`：装 git hook、vendor 运行时到 `.claude/vibetrail/`、写 `.gitattributes`、建 `.claude/trace/` | 被观测仓零写入；机器级装一次 |
-| commit ↔ session 的 `Claude-Session` trailer | `tools/prepare-commit-msg` + `tools/test-hook.sh`（12 场景回归 + 5 组变异） | 不装 git hook；改从每轮起止 HEAD 推（DESIGN §3.5）。同一个 hook 还写审计线的 `Vibetrail-Id`，见下 |
-| 会话流水投影进仓 | `tools/vibetrail-sync`（按 worktree 清单认领会话、整份重生成） | 两路数据不进 git；它的归属判据（`git worktree list` + realpath）沿用到 hook 的门控 |
+| 每个 clone 接入 | `old/vibetrail-install`：装 git hook、vendor 运行时到 `.claude/vibetrail/`、写 `.gitattributes`、建 `.claude/trace/` | 被观测仓零写入；机器级装一次 |
+| commit ↔ session 的 `Claude-Session` trailer | `old/prepare-commit-msg` + `old/test-hook.sh`（12 场景回归 + 5 组变异） | 不装 git hook；改从每轮起止 HEAD 推（DESIGN §3.5）。同一个 hook 还写审计线的 `Vibetrail-Id`，见下 |
+| 会话流水投影进仓 | `old/vibetrail-sync`（按 worktree 清单认领会话、整份重生成） | 两路数据不进 git；它的归属判据（`git worktree list` + realpath）沿用到 hook 的门控 |
 | 仓内 vendor 运行时与 MANIFEST | `vibetrail-install` 的一部分 | 运行时只在 `~/.vibetrail/bin/` 一份 |
 
 ### 另一条线：审计记录（不属 G7）
 
 | 功能 | 状态 | 实现 |
 |---|---|---|
-| 审计过程留痕 | ✅ | `tools/vibetrail-audit`（record / show / stats / check），写 `<repo>/.claude/trace/audits/<vibetrailId>.jsonl`，格式 [spec/trace-v1.md](spec/trace-v1.md) |
-| 审计回归 | ✅ | `tools/test-audit.sh` |
-| 闸门故障注入套件 | ✅ | `tools/test-faults.sh`：每条注入一个故障，断言闸门 / 自检必须 fail-closed（vendored 运行时缺失、丢 +x、缺 jq、`merge=union`、doctor 假绿等）。它依赖 `vibetrail-install` 的 vendor 与 MANIFEST，所以这两样随审计线一起等 U6，不随 G7 退役 |
-| Stop 闸门 | ✅ | `tools/fixtures/check-audit-stop.sh`（agentDock 的三个 Stop hook 之一）：缺记录 block，空锚放行 |
-| 锚 | ✅ | `Vibetrail-Id` trailer，由 `tools/prepare-commit-msg` 写——**这条线仍依赖 git hook、仍落在被观测仓里**，去向暂不定（OPEN-ISSUES U6） |
+| 审计过程留痕 | ✅ | `old/vibetrail-audit`（record / show / stats / check），写 `<repo>/.claude/trace/audits/<vibetrailId>.jsonl`，格式 [spec/trace-v1.md](spec/trace-v1.md) |
+| 审计回归 | ✅ | `old/test-audit.sh` |
+| 闸门故障注入套件 | ✅ | `old/test-faults.sh`：每条注入一个故障，断言闸门 / 自检必须 fail-closed（vendored 运行时缺失、丢 +x、缺 jq、`merge=union`、doctor 假绿等）。它依赖 `vibetrail-install` 的 vendor 与 MANIFEST，所以这两样随审计线一起等 U6，不随 G7 退役 |
+| Stop 闸门 | ✅ | `old/fixtures/check-audit-stop.sh`（agentDock 的三个 Stop hook 之一）：缺记录 block，空锚放行 |
+| 锚 | ✅ | `Vibetrail-Id` trailer，由 `old/prepare-commit-msg` 写——**这条线仍依赖 git hook、仍落在被观测仓里**，去向暂不定（OPEN-ISSUES U6） |
 | 行级归属 | ❌ 已否决 | DESIGN §7 |
 
 ## 2. 沿用部分的实现原理
@@ -95,9 +95,12 @@ hook 层的回归要在它上面补：SessionStart 补做、打断后无 Stop、
 `message.assistant` / `tool.request`；分歧之后人的下一句发 `message.user`。`interrupt_for_tool_use` 吸收进同一轮的拒绝、不另发。
 `tools/vibetrail-map` 包一层：从路径推 sid 与 meta、只读到最后一个换行、算 UUIDv5 的 `event_id`、出账本（进出条数、反查来路、消费到的行号与字节）。
 
-两条经验：① `emit(base(…) | .payload = …)` 里管道之后的 `.` 已经是事件不是状态——状态里的值先绑成变量再用，第一次跑真语料就在这里炸；
+几条经验：① `emit(base(…) | .payload = …)` 里管道之后的 `.` 已经是事件不是状态——状态里的值先绑成变量再用，第一次跑真语料就在这里炸；
+同一个坑的另一面：`$r | slim(.ln)` 里的 `.ln` 是 `$r.ln`，第一版所有行号都是 null，断链兜底从未生效，fixtures 的链都完整所以没测出来。
 ② 同一个 `tool_use` 会被两次分歧各派生一次（拒绝之后紧接打断），去重必须**不看门控**登记，否则分段扫比全量扫多一条——
 fixtures 里没有这个形态时变异测试恒绿，是 106 MB 真语料照出来的，补了 `denied-then-interrupt`。
+③ fixtures 全绿不等于真语料对：「从本轮开头读」在 fixtures 上等价，放到 43 个真会话上有 1 个不一致，查出来是回放副本（DESIGN §4.2）。
+④ 对照三方时先量再学：两家的 50 MB 上限都会丢分歧、不学；「时间戳倒退就算副本」看着省事，量下来会误伤 63 条真实记录、不用。
 
 ## 3. 还缺什么
 

@@ -56,8 +56,9 @@ echo "✓ .claude/trace/ 就绪"
 VD=.claude/vibetrail; mkdir -p "$VD"
 VT_FILES="vibetrail vibetrail-audit vibetrail-sync vibetrail-doctor vibetrail-install prepare-commit-msg extract-diverge.jq diverge-rules.jq"
 for f in $VT_FILES; do
-    [ -f "$SELF_DIR/$f" ] || continue
-    cp "$SELF_DIR/$f" "$VD/$f"
+    src="$SELF_DIR/$f"; [ -f "$src" ] || src="$SELF_DIR/../tools/$f"   # 判据文件留在 tools/，其余在 old/
+    [ -f "$src" ] || continue
+    cp "$src" "$VD/$f"
     case "$f" in *.jq) ;; *) chmod +x "$VD/$f";; esac
 done
 
