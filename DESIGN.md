@@ -1,7 +1,8 @@
 # vibetrail 设计：用 hook 把 Claude Code 会话的两路数据传上云
 
 > **状态**（2026-09-15）：需求与设计定稿；第 1 步「提取器扩展与协议映射」已做（`tools/map-events.jq` + `tools/vibetrail-map`，细则 §4.2），
-> 同日对照 Pilot / teamai 补强并定下 U11（只在 Stop / SessionEnd / 补做里解析、从本轮开头读，§3.1、§3.3）；hook 分发、安装、push 未开工。
+> 同日对照 Pilot / teamai 补强并定下 U11（只在 Stop / SessionEnd / 补做里解析、从本轮开头读，§3.1、§3.3）；随后分歧一路挂上 hook
+> （`tools/vibetrail-hook`：门控、会话锁、state、spool 块文件，§3.3）。session / turn 事件、安装、push 未开工。
 > 沿用的判据见 [spec/diverge-v1.md](spec/diverge-v1.md)。G7 之前的代码与测试 09-15 归档到 `old/`，`tools/` 只留新代码。
 > 上一版设计（留痕数据投影进被观测仓、git hook 写 `Claude-Session` trailer）已于 2026-09-14 退役，见 §7 D4；仍在用的审计记录线见 §8。
 > 2026-09-15 D5：不传 transcript 原文件，正文只随人机分歧事件走，云端定为 paas-coding-hook 事件协议 1.0，索引保留 30 天够用。
@@ -132,23 +133,30 @@ hook payload 里的 `tool_input` / `tool_response` 也不另存一份——trans
 
 ### 3.3 增量解析与本机 outbox
 
-- 每个 transcript 文件在 `~/.vibetrail/state/<sid>.json` 记：读到的行号与字节（`lines` / `consumed_bytes`）、下次起读的
-  `checkpoint_line` / `checkpoint_byte`（本轮开头）、触发记录与人话记录的 `[uuid, 行号]` 清单（认回放副本用，§4.2）。
-  每次只解析到源文件**最后一个换行符**为止（源可能正在写半行）。不复制文件，按字节偏移跳读。
+- 每个会话一个 state 目录 `~/.vibetrail/state/<sid>/`，里面每份 transcript（主文件 `main`、子 agent `agent-<id>`）各一份
+  `<名>.json`：读到的行号与字节（`lines` / `consumed_bytes`）、下次起读的 `checkpoint_line` / `checkpoint_byte`（本轮开头）；
+  各一份 `<名>.seen`：触发记录与人话记录的 `uuid<TAB>行号`（认回放副本用，§4.2；行号按文件算，所以按文件分开存）；
+  会话级一份 `ids`：已写进 spool 的 event_id。每次只解析到源文件**最后一个换行符**为止（源可能正在写半行）。不复制文件，按字节偏移跳读。
+  实现 `tools/vibetrail-hook`（共用函数 `tools/vibetrail-lib.sh`），回归 `tools/test-hook-flow.sh`（scenario 回放，21 项）。
 - **从本轮开头读，不从文件头读**（U11，09-15 定）。映射要回看的东西都在同一轮里，所以只重读本轮：106 MB 的会话一次从 10.5 s
   降到 0.19 s；676 轮里九成不超过 0.4 MB。借的是 Pilot「只读新字节」的思路，但它不保留上下文、全靠 Stop 恰好切在轮边界，
   我们退到本轮开头，边界落在轮中间也不丢上下文。首次整读仍是 O(文件)，106 MB 约 12 s，只发生一次、在后台。
-- 源文件长度 < offset 时从 0 重读（重写守卫）。transcript 目前是 append-only，但 `file-history-snapshot` 带 `isSnapshotUpdate` 字段，不能假设永远是。
+- 源文件长度 < offset 时从 0 重读（重写守卫），清掉这份文件的 state 与 `.seen`，`ids` 留着——重读出的同一批事件在写 spool 前按 event_id 拦下。
+  transcript 目前是 append-only，但 `file-history-snapshot` 带 `isSnapshotUpdate` 字段，不能假设永远是。
 - 首次全读、无单次上限。Pilot 首次只读最后一轮、单次超过 50 MB 只读尾部，那份 111 MB 的会话前段整个丢掉，4 条拒绝没了；
   teamai 超过 50 MB 整份不扫。两种上限都会丢分歧，不学。
 - 子 agent 文件按 `<sid>/subagents/` 目录扫，不只信 hook 递来的那一个路径——teamai 栽在这里，58% 的人拒在子 agent 文件里
   （[对比 §3.2](third-party/teamai-cli-vs-vibetrail.md)）。
-- 产物写临时文件 + 原子 rename；每个会话一个目录，多 worktree 并发不共享文件，不加锁。失败日志只留元数据，不留 payload
-  （teamai 上报失败把整份 context 连 prompt 摘要写盘，别学）。
+- 产物写临时文件 + 原子 rename；每个会话一个目录，多 worktree 并发不共享文件。同一会话的几次 hook 可能重叠（大会话首次整读约 12 s，
+  轮次比它短），用 `state/<sid>/.lock`（mkdir 原子锁，照 Pilot；陈旧阈值 300 s）挡住，已在跑就跳过，下一次 hook 补上。
+  失败日志 `logs/errors.log` 只留元数据（时间、事件、会话、阶段、退出码），不留 payload（teamai 上报失败把整份 context 连 prompt 摘要写盘，别学）。
 - **本机不是存档，spool 是过手的 outbox**：push 在产出数据的同一个 hook 里发（Stop 异步；SessionStart 补做也发），服务端 ack 即删；本机常驻只有
   `state/`（offset、push 水位，KB 级）与还没 ack 的块。端点未配置的现阶段它才是「全部」，文件可读、不压缩，就是用户要先看的「输出内容」。
-- 布局：`~/.vibetrail/spool/<项目键>/<sid>/` 下 `events.jsonl`（协议形状的事件，分歧与轮次元数据都在，每行一条、按 `event_id` 幂等）与
-  `manifest.json`（每个 transcript 文件的 offset、Claude Code 版本、push 水位）。不再有副本目录；分歧提取器的原始输出是中间产物，A3 拿它对账。
+- 布局：`~/.vibetrail/spool/<项目键>/<sid>/` 下是**块文件**：每次 hook 产出一块 `<UTC 时间>-<pid>-<名>.jsonl`（协议形状的事件，每行一条），
+  临时文件 + rename 写入；push 按块发、ack 后整块删，不用改写一个不断增长的 `events.jsonl`（09-15 改，原写法是单个 events.jsonl + manifest.json）。
+  offset 等进度在 `state/`（上一条），不放 spool。项目键 = 主 checkout 目录名 + 路径 sha1 前 16 位。
+  `project_id` 取 `origin` 远端（去掉协议、用户名和 `.git`），没有远端就用主 checkout 路径；`workspace_id` 取主 checkout 路径（§4.1）。
+  不再有副本目录；分歧提取器的原始输出是中间产物，A3 拿它对账。
   批次按协议打（≤ 100 条 / 16 MiB），不另立 spool spec，事件形状以协议 schema 为准（[原件进仓](third-party/collection-batch-1.0.schema.json)作回归输入）。
 
 ### 3.4 hook 纪律

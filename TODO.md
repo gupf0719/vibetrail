@@ -15,7 +15,9 @@
   默认值：`client.name` 照填 `paas-coding-hook`，`policy_version` 填 `none-0`（DESIGN §4.1）。
 - [ ] 机器级安装：`vibetrail init [--scope user|project]`——`~/.vibetrail/bin` + HOME settings 条目（带 marker）+ `config`（含 jq 绝对路径）+ 登记；
   `vibetrail uninstall`；doctor 改成 DESIGN §5 的自检项。被观测仓里零写入（A8）。
-- [ ] hook 分发入口 `vibetrail-hook <事件>`：读 stdin、按 scope 门控、发 session / turn / subagent 起止事件与 `ext.claude.*` 事件头、git 状态，写 `events.jsonl`（DESIGN §3.1、§4.1）；纪律照 §3.4。
+- [ ] hook 分发入口 `vibetrail-hook <事件>`：读 stdin、按 scope 门控、发 session / turn / subagent 起止事件与 `ext.claude.*` 事件头、git 状态，写 spool 块（DESIGN §3.1、§4.1）；纪律照 §3.4。
+  09-15 已有：入口、stdin 解析、scope 门控（登记表在 `~/.vibetrail/projects/`）、会话锁、state、spool 块、失败日志（分歧一路用，见下一项）；
+  还缺：session / turn / subagent 起止事件、`ext.claude.*` 事件头、git 状态。
 - [x] 分歧一路第 1 步——提取器扩展与协议映射（09-15）：判据拆成 `diverge-rules.jq` 模块、命中多带 `call_id`；`map-events.jq` + `vibetrail-map` 把五类 kind 映射成
   `permission.decision` / `turn.end(interrupted)` / `subagent.end(cancelled)`，`tool_name` / `input` 按 `tool_use_id` 反查（G5 关），带被打断的回复与之后人的下一句，
   `event_id` UUIDv5；`test-map.sh` 8 份 fixtures + scenario 回放 + schema + A2 对账 + 每个切点增量等价，89 项全绿。细则 DESIGN §4.2。
@@ -23,16 +25,18 @@
   回放副本不上报（本次读取内按 uuid、跨次按 `[uuid, 行号]` 清单 `--seen-uuids` / `--sources-out`）；嵌套子 agent 的父实例查兄弟文件；斜杠命令算人的动作；
   越过合成记录；缺 message.id 退到 requestId；字段哨兵；修掉行号全是 null 的错；命名空间常量改成真正的 uuid5(NS_URL, "vibetrail")。
   `test-map.sh` 11 份 fixtures 139 项全绿；本机 44 个主会话各三个切点实跑与全量一致，750 条事件全过 schema。
-- [ ] 分歧一路第 2 步——挂 hook：`vibetrail-map` 挂到 Stop（异步）/ SessionEnd / SessionStart 补做，**不挂 UserPromptSubmit**（U11 已定）；
-  state 记 `lines` / `consumed_bytes` / `checkpoint_line` / `checkpoint_byte` 与 `[uuid, 行号]` 清单，下次按它们调；同一会话一把 mkdir 锁、已在跑就跳过；
-  Stop 里先等 transcript 写稳；文件变短（重写）时清 state 从 0 重读；子 agent 按 `<sid>/subagents/` 目录扫（连同 meta.json）。
+- [x] 分歧一路第 2 步——挂 hook（09-15）：`tools/vibetrail-hook`（共用函数 `tools/vibetrail-lib.sh`）在 Stop / SubagentStop / SessionEnd / SessionStart 补做时
+  调 `vibetrail-map`，**不挂 UserPromptSubmit**（U11）；state 按 transcript 分文件记 checkpoint 与 `[uuid, 行号]` 清单，会话级记已发 event_id；会话锁、已在跑就跳过；
+  Stop 先等 transcript 写稳；文件变短时清 state 从 0 重读；子 agent 按 `<sid>/subagents/` 目录扫；spool 改成块文件（DESIGN §3.3）。
+  回归 `tools/test-hook-flow.sh` 21 项：scenario 回放 + 未登记零写入、重复触发、锁、半行、回放副本、子 agent、重写、补做别的会话、scope=user；
+  两个变异（去掉会话锁、ids 去重换回 `NR == FNR`）都被抓到。
 - [ ] 轮次元数据一路：每轮 `turn.start` / `turn.end`（status、usage、vcs）、`InstructionsLoaded` 只记路径与 sha；不传 transcript 原文件、不传非分歧正文（D5）；先做 Claude Code。
 - [ ] commit ↔ session 推导：每轮起止 HEAD + `rev-list`（DESIGN §3.5）；`vibetrail show` 按 commit 查改走它。
 - [ ] push：`vibetrail push [--list | --show]`，端点与 token 从 `~/.vibetrail/config` 读、没配不发；配了按协议打批（≤ 100 条 / 16 MiB）、每条先过 schema、`event_id` 幂等、accepted + duplicate 推进水位并删本机块、失败重发；
   Stop 异步顺手调；测试对手先用一个只记录请求并按 schema 校验的桩端点（Pilot / teamai 实跑样例就是这么截的）。
 - [ ] 完整性钉子：每类记录条数进出相等、映射后事件全部过 schema（这两条测试期已在 `test-map.sh` 钉住；运行时要进账本与 doctor）、超 1 MiB 被拒计数、未知记录类型 / 事件名告警（A11；G10、G6）。
 - [ ] 回归：两路各有带断言的测试，输入用 [experiments/collect-demo/scenario.json](experiments/collect-demo/scenario.json) 回放，补上 SessionStart 补做、
-  打断后无 Stop、后台子 agent 晚于父 Stop、一轮多 commit、端点未配置 / 配置后断网五个场景。
+  打断后无 Stop、后台子 agent 晚于父 Stop、一轮多 commit、端点未配置 / 配置后断网五个场景。分歧一路已有 `test-hook-flow.sh`，其中补做与打断后无 Stop 已覆盖。
 - [ ] 查询端只留 push 前本地预览（G9，读取不归本项目）；OPEN-ISSUES 关 G7。退役脚本 09-15 已按用户要求归档到 `old/`（`old/README.md`），
   审计线的几份随 U6 定去留。
 

@@ -19,6 +19,8 @@
 | 判据回归 | ✅ | `tools/fixtures.jsonl` + `tools/test-extract.sh`（27 条正负例，比对整条输出并查 jq 报错） |
 | 协议映射（分歧一路） | ✅ 2026-09-15 | `tools/map-events.jq`（include 判据模块）+ `tools/vibetrail-map`（`event_id` UUIDv5、账本、只读到最后一个换行、按字节偏移从本轮开头读、回放副本不上报）；五类 kind → `permission.decision` / `turn.end(interrupted)` / `subagent.end(cancelled)`，带被拒调用的 `tool.request`、被打断的回复、之后人的下一句（含斜杠命令）；规则 [DESIGN §4.2](DESIGN.md) |
 | 映射回归 | ✅ | `tools/test-map.sh`：11 份 fixtures（`tools/fixtures-map/`，golden 在 `expect/`）+ scenario 回放；断言 + golden + 每条过协议 schema（`tools/schema-check.py`，python3 + jsonschema，只在测试用）+ A2 对账（提取器命中按记录去重后 == 事件数）+ 每个切点的增量等价（从头读、从 checkpoint 读两路）+ 半行 + 幂等 + event_id 用 python 重算，139 项 |
+| 分歧一路挂 hook | ✅ 2026-09-15 | `tools/vibetrail-hook`（共用函数 `tools/vibetrail-lib.sh`）：Stop / SubagentStop / SessionEnd / SessionStart 补做时调 `vibetrail-map`，不挂 UserPromptSubmit（U11）；scope 门控、会话锁、按 transcript 分文件的 state、spool 块文件、失败日志只留元数据；DESIGN §3.1、§3.3 |
+| hook 回归 | ✅ | `tools/test-hook-flow.sh`：scenario 在临时仓里真实回放，21 项——未登记零写入、spool 等于全量映射、重复触发、锁、半行、回放副本、子 agent、文件重写、补做别的会话、scope=user |
 | hook 机制探针 | ✅ | `experiments/hook-probe.sh`（DESIGN §6.1 的实证来源） |
 | 采集回放样本 | ✅ | `experiments/collect-demo/scenario.json`：同一段示例会话，Pilot / teamai 实跑样例就是用它截的；G7 的回归输入 |
 
@@ -27,9 +29,7 @@
 | 功能 | 状态 | 形态 |
 |---|---|---|
 | `vibetrail init` / `uninstall` | ❌ | 机器级装一次：`~/.vibetrail/bin`、HOME settings 条目（带 marker）、scope 配置、登记；DESIGN §5 |
-| hook 分发入口 `vibetrail-hook <事件>` | ❌ | 读 stdin、按 scope 门控、发 session / turn / subagent 起止事件与 `ext.claude.*` 事件头，写 `events.jsonl`；DESIGN §3.1、§4.1 |
-| 增量解析 | ❌ | 每个 transcript 文件一个 byte offset、截到最后一个换行、子 agent 按目录扫、原子写；不复制文件；DESIGN §3.3 |
-| 分歧提取挂 hook | ❌ | `vibetrail-map` 在 Stop（异步）/ SessionEnd / SessionStart 补做时跑，不挂 UserPromptSubmit（U11 已定）；state 记 checkpoint 与 `[uuid, 行号]` 清单；会话锁；子 agent 按目录扫 |
+| hook 分发入口里的元数据事件 | 🔁 | 入口、门控、锁、state、spool 已在（上表「分歧一路挂 hook」）；还缺 session / turn / subagent 起止事件、`ext.claude.*` 事件头、git 状态；DESIGN §3.1、§4.1 |
 | commit ↔ session 推导 | ❌ | 每轮起止 HEAD + `rev-list`；DESIGN §3.5 |
 | `vibetrail push [--list \| --show]` | ❌ | 端点没配不发；配了按协议打批、每条过 schema、`event_id` 幂等、ack 即删；DESIGN §4 |
 | doctor 扩展 | 🔁 | 现有 `old/vibetrail-doctor` 查的是退役的 git hook 与仓内 vendor，要改成 DESIGN §5 的自检项 |

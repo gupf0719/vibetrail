@@ -1,0 +1,120 @@
+#!/bin/bash
+# vibetrail-hook <事件>：Claude Code hook 的分发入口（DESIGN §3.1）。stdin 是 Claude Code 给 hook 的 JSON。
+#
+#   SessionStart       补做：本仓所有 worktree 下落后的 transcript 各补一次（后台跑，hook 立即返回）
+#   Stop / SubagentStop  等 transcript 写稳 → 从本轮开头解析本会话主文件与 subagents/ 下全部文件 → 写 spool（配 async: true）
+#   SessionEnd         同上但不等写稳（预算 1.5 s；来不及的交给下一次 SessionStart）
+#   UserPromptSubmit   不读 transcript（U11）；turn.start 由轮次元数据一路发（TODO 下一项）
+#
+# 纪律（§3.4）：stdout 永远为空、永远 exit 0、失败日志只留元数据；scope=project 时未登记的仓什么都不写（A4）。
+# 环境变量（测试用）：VIBETRAIL_HOME（本机数据根）、VIBETRAIL_CLAUDE_PROJECTS（~/.claude/projects）、
+#   VIBETRAIL_STABLE_WAIT=0（不等写稳）、VIBETRAIL_FOREGROUND=1（补做不丢后台）
+set -uo pipefail
+SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$SELF/vibetrail-lib.sh"
+exec 1>/dev/null            # stdout 必须为空：SessionStart / UserPromptSubmit 的 stdout 会进模型上下文
+CLAUDE_PROJECTS=${VIBETRAIL_CLAUDE_PROJECTS:-$HOME/.claude/projects}
+
+event=${1:-}
+[ -t 0 ] && exit 0          # 人手在终端里跑、没有 payload
+payload=$(cat)
+JQ=$(vt_conf jq jq); export JQ
+command -v "$JQ" >/dev/null 2>&1 || { vt_log_error "$event" "" "missing_jq" 127; exit 0; }
+
+# 用 \x1f 分隔：tab 是 IFS 空白字符，连续的 tab 会被合并，某个字段为空时后面的字段整体错位
+IFS=$'\x1f' read -r sid tpath cwd hname < <(printf '%s' "$payload" | "$JQ" -r \
+    '[(.session_id // ""), (.transcript_path // ""), (.cwd // ""), (.hook_event_name // "")] | map(tostring) | join("")' 2>/dev/null) || exit 0
+[ -n "$event" ] || event=$hname
+case "$sid" in ''|*/*|.*) exit 0;; esac   # 会话 id 要能当目录名
+
+# ---- 门控（scope，DESIGN §5；G8）----
+scope=$(vt_conf scope project)
+main=$(vt_main_checkout "${cwd:-.}") || main=""
+if [ "$scope" = "project" ]; then
+    [ -n "$main" ] && vt_registered "$main" || exit 0
+fi
+workspace=${main:-$(vt_realpath "${cwd:-.}")}
+project=$(git -C "$workspace" remote get-url origin 2>/dev/null | sed -E 's#^[a-z+]+://([^@/]*@)?##; s#^[^@/]*@##; s#:#/#; s#\.git$##')
+project=${project:-$workspace}
+pkey=$(vt_project_key "$workspace")
+
+# ---- 一份 transcript 文件：从 checkpoint 起映射 → 去重 → 写一块 spool → 推进 state ----
+process_file(){ # process_file <sid> <state 目录> <文件> <名>
+    local sid=$1 sd=$2 f=$3 name=$4 st="$2/$4.json" seen="$2/$4.seen"
+    local size lines=0 consumed=0 ckl=1 ckb=0 tmp rc
+    size=$(wc -c < "$f" 2>/dev/null | tr -d ' ') || return 0
+    if [ -f "$st" ]; then
+        IFS=$'\t' read -r lines consumed ckl ckb < <("$JQ" -r '[.lines, .consumed_bytes, .checkpoint_line, .checkpoint_byte] | @tsv' "$st" 2>/dev/null)
+        lines=${lines:-0}; consumed=${consumed:-0}; ckl=${ckl:-1}; ckb=${ckb:-0}
+    fi
+    [ "$size" -eq "$consumed" ] && return 0                       # 没有新字节
+    if [ "$size" -lt "$consumed" ]; then                           # 文件变短：被重写过，从 0 重读（ids 留着，重复事件照样拦下）
+        rm -f "$st" "$seen"; lines=0; consumed=0; ckl=1; ckb=0
+    fi
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/vibetrail-hook.XXXXXX") || return 0
+    bash "$SELF/vibetrail-map" "$f" --sid "$sid" --project-id "$project" --workspace-id "$workspace" \
+        --start-line "$ckl" --start-byte "$ckb" --from-line "$lines" --seen-uuids "$seen" \
+        --ledger "$tmp/ledger" --sources-out "$tmp/src" > "$tmp/ev" 2> "$tmp/err"
+    rc=$?
+    if [ $rc -ne 0 ]; then vt_log_error "$event" "$sid" "map:$name" "$rc"; rm -rf "$tmp"; return 0; fi
+    # 已写进 spool 的 event_id 不再写（进程在写 spool 与推进 state 之间被杀时，下一次会重发同一批）
+    # ⚠️ 不用 `NR == FNR` 读 ids：首次运行 ids 是空文件，NR == FNR 会对后一个文件也成立，事件全被当成 id 吞掉
+    touch "$sd/ids"
+    awk -v idsf="$sd/ids" 'BEGIN { while ((getline l < idsf) > 0) seen[l] = 1 }
+         { if (match($0, /"event_id":"[0-9a-f-]+"/)) { id = substr($0, RSTART + 12, RLENGTH - 13); if (id in seen) next; seen[id] = 1 }
+           print }' "$tmp/ev" > "$tmp/new"
+    if [ -s "$tmp/new" ]; then
+        local dest="$VT_HOME/spool/$pkey/$sid" chunk
+        mkdir -p "$dest" && chunk="$(date -u +%Y%m%dT%H%M%SZ)-$$-$name.jsonl"
+        cp "$tmp/new" "$dest/.$chunk.tmp" && mv "$dest/.$chunk.tmp" "$dest/$chunk" \
+            || { vt_log_error "$event" "$sid" "spool:$name" 1; rm -rf "$tmp"; return 0; }
+        sed -n 's/.*"event_id":"\([0-9a-f-]*\)".*/\1/p' "$tmp/new" >> "$sd/ids"
+    fi
+    [ -f "$tmp/src" ] && cat "$tmp/src" >> "$seen"
+    "$JQ" -c '{lines, consumed_bytes, file_bytes, checkpoint_line, checkpoint_byte, parent_instance, updated_at: (now | todate)}' \
+        "$tmp/ledger" > "$st.tmp" && mv "$st.tmp" "$st"
+    rm -rf "$tmp"
+}
+
+process_session(){ # process_session <sid> <主 transcript>
+    local sid=$1 main_t=$2 sd="$VT_HOME/state/$1" f
+    mkdir -p "$sd" || return 0
+    vt_lock "$sd" || return 0                                      # 同一会话已在跑：跳过，下一次 hook 补上
+    [ -f "$main_t" ] && process_file "$sid" "$sd" "$main_t" main
+    for f in "$(dirname "$main_t")/$sid/subagents"/agent-*.jsonl; do
+        [ -f "$f" ] && process_file "$sid" "$sd" "$f" "$(basename "$f" .jsonl)"
+    done
+    vt_unlock "$sd"
+}
+
+wait_stable(){ # 照 Pilot：文件大小连续两次不变才读，最多 1.5 s（Stop 是 async，不卡人）
+    [ "${VIBETRAIL_STABLE_WAIT:-1}" = "0" ] && return 0
+    local prev=-1 same=0 i s
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        s=$(wc -c < "$1" 2>/dev/null | tr -d ' ') || return 0
+        if [ "$s" = "$prev" ]; then same=$((same + 1)); [ $same -ge 2 ] && return 0; else same=0; fi
+        prev=$s; sleep 0.15
+    done
+}
+
+catch_up(){ # 本仓每个 worktree 对应的 Claude 项目目录里，落后的 transcript 各补一次
+    local wt dir t
+    git -C "$workspace" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | while IFS= read -r wt; do
+        dir="$CLAUDE_PROJECTS/$(vt_slug "$wt")"
+        [ -d "$dir" ] || continue
+        for t in "$dir"/*.jsonl; do [ -f "$t" ] && process_session "$(basename "$t" .jsonl)" "$t"; done
+    done
+    [ -n "$main" ] || { [ -f "$tpath" ] && process_session "$sid" "$tpath"; }   # scope=user 且不在 git 仓：只补本会话
+}
+
+case "$event" in
+    SessionStart|session-start)
+        if [ "${VIBETRAIL_FOREGROUND:-0}" = "1" ]; then catch_up
+        else ( catch_up ) </dev/null >/dev/null 2>&1 & disown; fi ;;
+    Stop|stop|SubagentStop|subagent-stop)
+        [ -f "$tpath" ] && { wait_stable "$tpath"; process_session "$sid" "$tpath"; } ;;
+    SessionEnd|session-end)
+        [ -f "$tpath" ] && process_session "$sid" "$tpath" ;;
+    *) ;;
+esac
+exit 0
