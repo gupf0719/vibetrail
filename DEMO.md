@@ -22,7 +22,7 @@ bash tools/vibetrail init
 
 | 写到哪 | 是什么 |
 |---|---|
-| `~/.claude/settings.json` | 加 12 个 hook 条目（命令里带 `vibetrail-hook`），别的设置原样保留 |
+| `~/.claude/settings.json` | 加 13 个事件的 hook 条目（命令里带 `vibetrail-hook`；按本机 Claude Code 认识的事件登记），别的设置原样保留 |
 | `~/.vibetrail/backup/` | settings 的备份：`settings.json.before-vibetrail` 是第一次装之前的原样（只存一次、永不覆盖；原来没有 settings 就没有它），另外每次改动前存一份带时间的（留最近 10 份）。重跑 `init` 没有变化时不写也不备份 |
 | `~/.vibetrail/bin/` | 运行时 |
 | `~/.vibetrail/config` | scope（默认 project，只采登记过的仓）、jq 路径等 |
@@ -61,8 +61,9 @@ bash tools/vibetrail init
 |---|---|
 | 会话开始 | `session.start`（来源、model、HEAD） |
 | 说一句话 | `turn.start`（HEAD、分支、有没有改动） |
-| 模型答完 | `turn.end`（状态、token 用量、本轮的 commit）。同一块里还有这一轮的调用 trace：每次模型调用一条 `message.assistant`（不带正文：model、token、stop_reason、调了哪些工具）、每次工具调用一条 `tool.end`（工具名、成功 / 出错 / 取消、耗时）；以及分歧事件：`permission.decision`（拒绝）、`tool.request`（被拒的命令）、`message.user`（之后人说的话） |
-| 子 agent 起止 | `subagent.start` / `subagent.end` |
+| 模型答完 | `turn.end`（状态、token 用量、本轮的 commit、这一轮里插了几句话）。同一块里还有这一轮的调用 trace：每次模型调用一条 `message.assistant`（不带正文：model、token、stop_reason、调了哪些工具及其调用 id、API 重试次数）、每次工具调用一条 `tool.end`（工具名、成功 / 出错 / 取消、耗时）；以及分歧事件：`permission.decision`（拒绝）、`tool.request`（被拒的命令）、`message.user`（之后人说的话） |
+| 子 agent 起止 | `subagent.start` / `subagent.end`；压缩、起标题这类 Claude Code 内部 agent 只记 `ext.claude.subagent_stop`（internal） |
+| 弹权限框 | `ext.claude.permission_request`（工具名、权限模式，不带参数）；用来分「人拒绝」与「按停止打断工具」 |
 | 工具失败、权限弹框、CLAUDE.md 加载 | `ext.claude.*`，只有事件头 |
 | 会话结束 | `session.end` |
 
@@ -73,7 +74,8 @@ bash experiments/collect-demo/report.sh
 ```
 
 把采到的事件分三块整理成 `~/.vibetrail/report.md`：每一轮的全量数据（起止、用时、状态、token、模型 / 工具调用次数、HEAD 起止，每个会话下面折叠着逐次调用的 trace）、人机分歧（谁、对哪次调用、原文、之后人说了什么）、
-commit ↔ 会话（每个提交归到哪个会话哪一轮，提交说明现从本机 git 查）。`-o -` 打到终端，`--session <前缀>` 只看一个会话。这个脚本不装进产品，上线用不到。
+commit ↔ 会话（每个提交归到哪个会话哪一轮，提交说明现从本机 git 查）。`-o -` 打到终端，`--session <前缀>` 只看一个会话。在 desktop 里看要写进工作目录（它的文件查看器打不开 `~/.vibetrail` 下的文件）：
+`bash experiments/collect-demo/report.sh -o experiments/collect-demo/out/report.md`（`out/` 不进 git）。这个脚本不装进产品，上线用不到。
 
 ## 6. 自检与卸载
 
@@ -90,5 +92,6 @@ commit ↔ 会话（每个提交归到哪个会话哪一轮，提交说明现从
 ## 演示时要说清楚的
 
 - **按停止打断的那一轮**，turn.end 要等下一个 hook 才写：打断没有 hook，desktop 里实测按停止什么 hook 都不来。
-- **按停止打断正在跑的工具**，现在会被记成「拒绝」：Claude Code 写进 transcript 的与在权限框里点拒绝一模一样。区分方案待定（[OPEN-ISSUES](OPEN-ISSUES.md) K7）。
+- **按停止打断正在跑的工具**：Claude Code 写进 transcript 的与在权限框里点拒绝一模一样。现在单列成「按停止打断工具」（`interrupt_tool`）：
+  挂上 PermissionRequest 之后按这次调用弹没弹过权限框分，之前的按这一轮的权限模式粗分——auto 模式几乎不弹框，那里的「拒绝」按停止算（DESIGN D9）。
 - **还没有 push**：数据只在本机 spool，端点配置之后才会发。

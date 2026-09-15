@@ -56,6 +56,9 @@ def capabilities: ["session.start", "session.end", "turn.start", "turn.end", "su
     | .extensions += opt("claude.prompt_source"; $p.source) + opt("claude.permission_mode"; $p.permission_mode)
                      + opt("claude.effort"; $p.effort.level) + opt("vibetrail.dirty_files"; $vcs.dirty_files)
     | ._key = (.turn_id + "|turn.start")
+  elif $event == "SubagentStop" and $extra.internal == true then   # Claude Code 内部 agent（agent_type 为空）：不是子 agent，只记事件头（K9）
+    hdr($event; {agent_id: ($p.agent_id // "unknown"), internal: true})
+    | ._key = ("ext|SubagentStop|" + ($p.agent_id // "") + "|" + $now)
   elif $event == "SubagentStart" or $event == "SubagentStop" then
     ($p.agent_id // "unknown") as $aid
     | $b + {type: (if $event == "SubagentStart" then "subagent.start" else "subagent.end" end),
@@ -75,6 +78,9 @@ def capabilities: ["session.start", "session.end", "turn.start", "turn.end", "su
                 + opt("is_interrupt"; $p.is_interrupt) + opt("duration_ms"; $p.duration_ms)
                 + {error_bytes: (($p.error // "") | tostring | utf8bytelength)})
     | ._key = ("ext|PostToolUseFailure|" + ($p.tool_use_id // $now))
+  elif $event == "PermissionRequest" then   # 弹了权限框：只记工具名与模式，不带参数（D5）；分「人拒绝」与「按停止」用的证据另记在 state（K7）
+    hdr($event; {tool_name: ($p.tool_name // "unknown")} + opt("permission_mode"; $p.permission_mode))
+    | ._key = ("ext|PermissionRequest|" + ($p.tool_name // "") + "|" + $now)
   elif $event == "PermissionDenied" then
     hdr($event; {tool_use_id: $p.tool_use_id, tool_name: $p.tool_name} + opt("reason"; (($p.reason // "") | tostring | .[0:1024])))
     | ._key = ("ext|PermissionDenied|" + ($p.tool_use_id // $now))

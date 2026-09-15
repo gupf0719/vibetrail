@@ -16,6 +16,9 @@
 #   --sources-out FILE 把本次新读到的记录按同样格式追加进去（下一次的 --seen-uuids 用它）
 #   --hook-turns FILE  hook 记的轮次证据（vt_hook_turns 的输出：{<turn_id>: {start, stop, gap, fail}}），关轮时拼 status / vcs / commits；
 #                      不给就当 {}（轮次事件照发，只是没有 HEAD、commit，status 多是 unknown）
+#   --hook-perms FILE  hook 记的权限框证据（vt_hook_perms 的输出：[{at, tool_name, agent_id, prompt_id, permission_mode}]），
+#                      分「人拒绝」与「按停止打断正在跑的工具」用（K7）；--perm-since 是 PermissionRequest 挂上的时刻（epoch 秒），
+#                      早于它的拒绝没有证据可查，退回按 permissionMode 粗分
 #   --no-turns         只出分歧事件，不切轮（默认切轮：主会话按 promptId 切，turn.start 补位、模型答完（stop_hook_summary 前没有拦停反馈）或拒绝停下时发 turn.end）；
 #                      分歧判据的回归 test-map.sh 用它，golden 只钉分歧那部分
 #   --close-last WHY   把文件里最后一轮也关掉（WHY = stop / session_end / resume / idle，记进 vibetrail.closed_by）；默认不关，等下一轮开始再关。
@@ -37,7 +40,7 @@ die(){ echo "✗ vibetrail-map: $*" >&2; exit 2; }
 isnum(){ case "$1" in ''|*[!0-9]*) return 1;; esac; }
 
 f=""; sid=""; start_line=1; start_byte=""; from_line=0; project_id=""; workspace_id=""; meta=""; parent=""; ledger=""; vt_version="$VT_RUNTIME_VERSION"
-seen_file=""; sources_out=""; hook_turns=""; close_last=""; turns=true; stop_turn=""
+seen_file=""; sources_out=""; hook_turns=""; hook_perms=""; perm_since=""; close_last=""; turns=true; stop_turn=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --sid) sid=$2; shift 2;;
@@ -52,6 +55,8 @@ while [ $# -gt 0 ]; do
         --seen-uuids) seen_file=$2; shift 2;;
         --sources-out) sources_out=$2; shift 2;;
         --hook-turns) hook_turns=$2; shift 2;;
+        --hook-perms) hook_perms=$2; shift 2;;
+        --perm-since) perm_since=$2; shift 2;;
         --close-last) close_last=$2; shift 2;;
         --stop-turn) stop_turn=$2; shift 2;;
         --no-turns) turns=false; shift;;
@@ -113,7 +118,7 @@ fi
 [ "$start_byte" -le "$consumed" ] || die "起读偏移 $start_byte 超过文件可读长度 ${consumed}（文件被重写过？从 0 重读）"
 
 tmp=$(mktemp "${TMPDIR:-/tmp}/vibetrail-map.XXXXXX") || die "mktemp 失败"
-trap 'rm -rf "$tmp" "$tmp.err" "$tmp.seen" "$tmp.turns"' EXIT
+trap 'rm -rf "$tmp" "$tmp.err" "$tmp.seen" "$tmp.turns" "$tmp.perms"' EXIT
 if [ -n "$seen_file" ] && [ -f "$seen_file" ]; then
     $JQ -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | [.[0], (.[1] | tonumber)])' "$seen_file" > "$tmp.seen" \
         || die "读不了 ${seen_file}（每行应是 uuid<TAB>行号）"
@@ -125,12 +130,19 @@ if [ -n "$hook_turns" ] && [ -s "$hook_turns" ]; then
 else
     echo '{}' > "$tmp.turns"
 fi
+if [ -n "$hook_perms" ] && [ -s "$hook_perms" ]; then
+    $JQ -c 'if type == "array" then . else [] end' "$hook_perms" > "$tmp.perms" 2>/dev/null || die "读不了 ${hook_perms}（要是 JSON 数组）"
+else
+    echo '[]' > "$tmp.perms"
+fi
+case "$perm_since" in ''|*[!0-9]*) perm_since="";; esac
 
 # ---- 映射：从 start_byte 读到最后一个换行（按偏移跳读、走管道，不落临时副本） ----
 tail -c +$((start_byte + 1)) "$f" | head -c $((consumed - start_byte)) | $JQ -n -c -L "$SELF" \
     --arg sid "$sid" --arg project_id "$project_id" --arg workspace_id "$workspace_id" --arg parent_instance "$parent" \
     --argjson start_line "$start_line" --argjson from_line "$from_line" --argjson meta "$meta_json" --slurpfile seen_uuids "$tmp.seen" \
-    --slurpfile hook_turns "$tmp.turns" --arg close_last "$close_last" --arg stop_turn "$stop_turn" --argjson turns "$turns" \
+    --slurpfile hook_turns "$tmp.turns" --slurpfile hook_perms "$tmp.perms" --arg perm_since "$perm_since" \
+    --arg close_last "$close_last" --arg stop_turn "$stop_turn" --argjson turns "$turns" \
     --arg vt_version "$vt_version" --arg rule_version "diverge-v1" \
     -f "$SELF/map-events.jq" > "$tmp" 2>"$tmp.err"
 rc=$?

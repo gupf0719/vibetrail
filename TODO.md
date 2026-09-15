@@ -21,7 +21,7 @@
   （按命令里的 `vibetrail-hook` 认，改前备份）+ `config`（scope、jq 绝对路径、device_id、turn_idle_close、push 两个门槛）+ 登记本仓；`uninstall [--purge]`；`projects`；
   `doctor`（运行时、jq、条目、事件兼容、scope 与登记、积压、落后、错误日志）。**只登记本机每个 Claude Code 都认识的事件**：有错的 settings 会被整个跳过（DESIGN §5）。
   被观测仓零写入（A8）：demo.sh 与 desktop 实跑都核过。doctor 还缺 `stop_hook_summary` 证据与未知类型告警（随完整性钉子）。
-- [x] hook 分发入口（09-15）：`vibetrail-hook` 接 12 个事件，发 session / turn.start / subagent 起止与 `ext.claude.*` 事件头，git 状态（`vt_git_snapshot`），
+- [x] hook 分发入口（09-15）：`vibetrail-hook` 接 12 个事件（09-15 加 PermissionRequest 成 13 个），发 session / turn.start / subagent 起止与 `ext.claude.*` 事件头，git 状态（`vt_git_snapshot`），
   事件构造在 `tools/hook-events.jq`；同步 hook 读完 stdin 就丢后台、约 0.02 s 退出。desktop 2.1.266 上用项目级 settings.local.json 挂到沙箱实跑：
   PostToolUseFailure、SubagentStart / SubagentStop、Stop 的真实 payload 都正确落盘（agent.version 取 `AI_AGENT`、`parent_call_id` 取 meta.json）。
 - [x] 分歧一路第 1 步——提取器扩展与协议映射（09-15）：判据拆成 `diverge-rules.jq` 模块、命中多带 `call_id`；`map-events.jq` + `vibetrail-map` 把五类 kind 映射成

@@ -21,7 +21,9 @@ def sha7: if type == "string" then .[0:7] else "–" end;
 def status_label: {completed: "答完", denied: "拒绝后停下", interrupted: "被打断", cancelled: "被打断", hook_stopped: "hook 叫停", unknown: "未知"}[.] // ("出错：" + .);
 def evidence_label: {hook_stop: "Stop hook", stop_hook_summary: "答完标记", end_turn: "模型收尾", denial: "拒绝记录", stop_failure: "StopFailure", none: "无"}[. // "none"] // .;
 def closed_label: {stop: "Stop 时", summary: "答完标记", next_turn: "下一轮开始", session_end: "会话结束", resume: "会话恢复", idle: "空闲补做", denied: "拒绝处"}[. // ""] // "–";
-def kind_label: {permission_denied: "人拒绝", classifier_blocked: "分类器拦截", permission_infra_fail: "权限链路故障", interrupt: "人打断", interrupt_for_tool_use: "人打断（拒绝时）"}[.] // .;
+def kind_label: {permission_denied: "人拒绝", classifier_blocked: "分类器拦截", permission_infra_fail: "权限链路故障", interrupt: "人打断", interrupt_for_tool_use: "人打断（拒绝时）", interrupt_tool: "按停止打断工具"}[.] // .;
+# 「人拒绝」与「按停止打断工具」是怎么分出来的（DESIGN D9）
+def split_label: {permission_request: "看权限框", permission_mode: "按模式粗分", subagent_rejected: "子 agent 规则"}[.] // null;
 def vcs_s: if type == "object" then "\(.head_sha | sha7)\(if .dirty == true then "*" else "" end)" else "–" end;
 def call_s: (.payload.tool_name // "?") + " " + ((.payload.input | if type == "object" then (.command // .file_path // .pattern // .url // tojson) else tojson end) | clip(90) | code);
 # 同一轮有多条 turn.end（被别的 Stop hook 拦下后又 Stop 一次）取 vibetrail.stops 最大的那条（DESIGN D7）
@@ -53,10 +55,12 @@ map(select(type == "object")) as $ev
   "",
   "生成于 \($generated) · 数据来自 `\($source)`，\($chunks) 块、\($ev | length) 条事件 · 只在本机，还没有 push",
   "",
-  "| 会话 | 项目 | 开始 | 轮数 | 人机分歧 | commit |",
+  "下面表里 8 位的 `ffe1c0f1` 这类是会话 id、轮 id（promptId）的前 8 位；会话总表、各会话标题与 commit 表给完整的会话 id。",
+  "",
+  "| 会话 id | 项目 | 开始 | 轮数 | 人机分歧 | commit |",
   "|---|---|---|---|---|---|",
   ($sessions[] | . as $s
-    | "| `\($s.sid | short)` | \($s.project | cell) | \($s.first | lt("%m-%d %H:%M")) | \([$s.events[] | select(.type == "turn.start" or .type == "turn.end") | .turn_id] | unique | length) | \([$tgroups[] | select(.t.session_id == $s.sid)] | length)\(if ([$tgroups[] | select(.t.session_id != $s.sid and (.also | index($s.sid)))] | length) > 0 then "（另有 " + ([$tgroups[] | select(.t.session_id != $s.sid and (.also | index($s.sid)))] | length | tostring) + " 条复制来的）" else "" end) | \([$commit_turns[] | select(.session_id == $s.sid) | .commits[]] | length) |"),
+    | "| `\($s.sid)` | \($s.project | cell) | \($s.first | lt("%m-%d %H:%M")) | \([$s.events[] | select(.type == "turn.start" or .type == "turn.end") | .turn_id] | unique | length) | \([$tgroups[] | select(.t.session_id == $s.sid)] | length)\(if ([$tgroups[] | select(.t.session_id != $s.sid and (.also | index($s.sid)))] | length) > 0 then "（另有 " + ([$tgroups[] | select(.t.session_id != $s.sid and (.also | index($s.sid)))] | length | tostring) + " 条复制来的）" else "" end) | \([$commit_turns[] | select(.session_id == $s.sid) | .commits[]] | length) |"),
   "",
   "## 一、每一轮的全量数据（轮次 + 调用 trace，不带正文）",
   "",
@@ -70,7 +74,7 @@ map(select(type == "object")) as $ev
     | ($ids | map(. as $id | {id: $id, s: ([$starts[] | select(.turn_id == $id)][0]), e: ([$ends[] | select(.turn_id == $id)][0])})
            | sort_by(.s.occurred_at // .e.occurred_at)) as $turns
     | ($s.events | map(select(.agent.version != null)) | .[0].agent // {}) as $agent
-    | "### 会话 `\($s.sid | short)` · \($s.project | cell) · Claude Code \($agent.version // "?")\(if $agent.surface then "（" + $agent.surface + "）" else "" end)",
+    | "### 会话 `\($s.sid)` · \($s.project | cell) · Claude Code \($agent.version // "?")\(if $agent.surface then "（" + $agent.surface + "）" else "" end)",
       "",
       (if ($dups[$s.sid].n // 0) > 0 then "> 其中 \($dups[$s.sid].n) 轮与更早的会话 \([$dups[$s.sid].from[] | "`" + short + "`"] | join("、")) 相同：desktop 续接会话时复制过来的历史（OPEN-ISSUES K8）。", "" else empty end),
       "| # | 轮 | 开始 | 结束 | 用时 | 状态 | 依据 · 何时关 | 模型 | tokens 入 / 缓存 / 出 | 调用 模型 / 工具 | HEAD 起 → 止 | 分歧 | commit |",
@@ -107,7 +111,7 @@ map(select(type == "object")) as $ev
   "## 二、人机分歧",
   "",
   "来源：transcript 里人打断、人拒绝、分类器拦截、权限链路故障（diverge-v1 判据），只带能判责的最小正文：被拒或被打断的那次调用、拒绝原文、被打断的回复、之后人说的话。",
-  "注意：用户按停止打断正在跑的工具时，Claude Code 写进 transcript 的与拒绝一模一样，现在会显示成「人拒绝」（OPEN-ISSUES K7）。",
+  "按停止打断正在跑的工具时，Claude Code 写进 transcript 的与拒绝一模一样；「按停止打断工具」与「人拒绝」是按有没有弹过权限框、没有证据时按这一轮的 permissionMode 分的（DESIGN D9），类型后面注明依据。",
   "",
   (if ($triggers | length) == 0 then "这段时间内没有人机分歧。", "" else
     "| # | 时间 | 会话 · 轮 | 类型 | 谁决定 | 对哪次调用 | 原文 | 被打断的回复 | 之后人说 |",
@@ -117,7 +121,7 @@ map(select(type == "object")) as $ev
       | ([$ev[] | select(.session_id == $t.session_id and .type == "tool.request" and .extensions["vibetrail.trigger"] == $tid)]) as $calls
       | ([$ev[] | select(.session_id == $t.session_id and .type == "message.assistant" and .extensions["vibetrail.trigger"] == $tid)][0]) as $reply
       | ([$ev[] | select(.session_id == $t.session_id and .type == "message.user" and ((.extensions["vibetrail.after"] // []) | index($tid)))] | sort_by(.occurred_at)) as $after
-      | "| \($i + 1) | \($t.occurred_at | lt("%m-%d %H:%M:%S")) | `\($t.session_id | short)` · `\($t.turn_id | short)`\(if ($also | length) > 0 then "<br>也在 " + ([$also[] | "`" + short + "`"] | join("、")) else "" end) | \($t.extensions["vibetrail.kind"] | kind_label)\(if $t.type == "subagent.end" then "（子 agent）" else "" end) | \($t.payload.decided_by // (if $t.extensions["vibetrail.human"] then "user" else "–" end)) | \(if ($calls | length) > 0 then ([$calls[] | call_s] | join("<br>")) elif $t.payload.tool_name then ($t.payload.tool_name | cell) else "–" end) | \(($t.payload.reason // $t.payload.status.detail // "") | clip(80) | cell) | \(($reply.payload.text // "") | clip(80) | cell) | \(if ($after | length) > 0 then ([$after[] | (.payload.text | clip(80) | cell)] | join("<br>")) else "–" end) |"),
+      | "| \($i + 1) | \($t.occurred_at | lt("%m-%d %H:%M:%S")) | `\($t.session_id | short)` · `\($t.turn_id | short)`\(if ($also | length) > 0 then "<br>也在 " + ([$also[] | "`" + short + "`"] | join("、")) else "" end) | \($t.extensions["vibetrail.kind"] | kind_label)\(if $t.type == "subagent.end" then "（子 agent）" else "" end)\(($t.extensions["vibetrail.split_by"] | split_label) as $sl | if $sl then "<br>依据：" + $sl + (if $t.extensions["vibetrail.permission_mode"] then "（" + $t.extensions["vibetrail.permission_mode"] + "）" else "" end) else "" end) | \($t.payload.decided_by // (if $t.extensions["vibetrail.human"] then "user" else "–" end)) | \(if ($calls | length) > 0 then ([$calls[] | call_s] | join("<br>")) elif $t.payload.tool_name then ($t.payload.tool_name | cell) else "–" end) | \(($t.payload.reason // $t.payload.status.detail // "") | clip(80) | cell) | \(($reply.payload.text // "") | clip(80) | cell) | \(if ($after | length) > 0 then ([$after[] | (.payload.text | clip(80) | cell)] | join("<br>")) else "–" end) |"),
     "" end),
   "## 三、commit ↔ 会话",
   "",
@@ -125,10 +129,10 @@ map(select(type == "object")) as $ev
   "归因「agent 自己提交」＝这一轮 transcript 里 agent 用 Bash 跑过 `git commit`；「推断」＝这段时间里出现的提交，可能是人在别的终端提的。提交说明是生成报告时从本机 git 查的。",
   "",
   (if ($commit_turns | length) == 0 then "这段时间内没有观察到哪一轮新增了 commit。", "" else
-    "| commit | 提交说明 | 会话 | 轮 | 这一轮结束 | 归因 | 怎么推出来的 |",
+    "| commit | 提交说明 | 会话 id | 轮 | 这一轮结束 | 归因 | 怎么推出来的 |",
     "|---|---|---|---|---|---|---|",
     ($commit_turns | sort_by(.occurred_at)[] | . as $t | .commits[]
-      | "| `\(.sha | sha7)` | \(($subjects[.sha] // "（本机查不到）") | clip(60) | cell) | `\($t.session_id | short)` | `\($t.turn_id | short)` | \($t.occurred_at | lt("%m-%d %H:%M:%S")) | \(if $t.extensions["vibetrail.commit_attribution"] == "agent_tool" then "agent 自己提交" else "推断" end) | \(if $t.extensions["vibetrail.commit_method"] == "reflog" then "reflog" else "HEAD 起..止" end) |"),
+      | "| `\(.sha | sha7)` | \(($subjects[.sha] // "（本机查不到）") | clip(60) | cell) | `\($t.session_id)` | `\($t.turn_id | short)` | \($t.occurred_at | lt("%m-%d %H:%M:%S")) | \(if $t.extensions["vibetrail.commit_attribution"] == "agent_tool" then "agent 自己提交" else "推断" end) | \(if $t.extensions["vibetrail.commit_method"] == "reflog" then "reflog" else "HEAD 起..止" end) |"),
     "" end)
   ]
 | .[]

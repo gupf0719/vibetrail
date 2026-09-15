@@ -30,7 +30,7 @@ SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 RUNTIME_FILES="vibetrail vibetrail-hook vibetrail-lib.sh vibetrail-map map-events.jq diverge-rules.jq hook-events.jq"
 CORE_EVENTS="SessionStart UserPromptSubmit Stop SubagentStop SessionEnd Notification"     # 老版本就有
-OPT_EVENTS="SubagentStart PostToolUseFailure PermissionDenied StopFailure InstructionsLoaded CwdChanged"
+OPT_EVENTS="SubagentStart PostToolUseFailure PermissionRequest PermissionDenied StopFailure InstructionsLoaded CwdChanged"
 SETTINGS=$(vt_settings_path)
 
 say(){ printf '%s\n' "$*"; }
@@ -226,6 +226,11 @@ cmd_init(){
     fi
     [ "$written" = 1 ] && say "  改之前的备份在 $VT_HOME/backup/（装之前的原样是 settings.json.before-vibetrail）；settings 热加载，已开着的会话从下一次 hook 起生效"
 
+    # PermissionRequest 挂上的时刻：之后的 user-rejected 能查这次调用弹没弹过权限框，之前的只能按 permissionMode 粗分（K7）
+    if printf '%s\n' $events | grep -qx PermissionRequest; then
+        [ -n "$(vt_conf permission_request_since "")" ] || conf_set permission_request_since "$(date +%s)"
+    else conf_set permission_request_since ""; fi
+
     # 4. 登记本仓
     if [ "$(vt_conf scope project)" = project ] && [ $register = 1 ]; then
         local m; m=$(vt_main_checkout "$PWD" 2>/dev/null) && { vt_register "$PWD" && say "✓ 已登记本仓 ${m}（它的所有 worktree 都采）"; } \
@@ -298,6 +303,9 @@ def clip($n): if type == "string" then (gsub("\\s+"; " ") | if length > $n then 
 def short: if type == "string" then .[0:8] else "-" end;
 def vcs: if (.payload.vcs | type) == "object" then (.payload.vcs | "\(.branch // "?")@\((.head_sha // "-")[0:7])\(if .dirty == true then " 有改动" else "" end)") else "" end;
 def usage: if (.payload.usage | type) == "object" then "tokens \(.payload.usage.total_tokens // "?")" else "" end;
+def kn: if type == "number" then (if . >= 1000000 then "\((. / 100000 | floor) / 10)M" elif . >= 1000 then "\((. / 100 | floor) / 10)k" else tostring end) else "-" end;
+def secs: if type == "string" then (sub("\\.[0-9]+Z$"; "Z") | fromdate) else null end;
+def dur: if type != "number" then "" elif . < 1000 then "\(floor)ms" elif . < 60000 then "\((. / 100 | floor) / 10)s" else "\(. / 60000 | floor)m\((. % 60000) / 1000 | floor)s" end;
 def detail:
   if .type == "session.start" then "source=\(.payload.source) model=\(.extensions["claude.model"] // "?") \(.extensions["vibetrail.vcs"] // {} | "\(.branch // "")@\((.head_sha // "")[0:7])")"
   elif .type == "session.end" then "reason=\(.payload.reason)"
@@ -305,6 +313,10 @@ def detail:
   elif .type == "turn.end" then "\(.payload.status.code) \(usage) \(vcs)\(if .commits then " commits=" + ([.commits[].sha[0:7]] | join(",")) else "" end) \(if .extensions["vibetrail.closed_by"] then "关轮:" + .extensions["vibetrail.closed_by"] else "" end)"
   elif .type == "permission.decision" then "\(.payload.decision) by \(.payload.decided_by) \(.payload.tool_name) “\(.payload.reason | clip(80))”"
   elif .type == "tool.request" then "\(.payload.tool_name) \(.payload.input | if type == "object" then (.command // .file_path // .pattern // tojson) else tojson end | clip(100))"
+  elif .type == "message.assistant" and .content_state == "omitted" then   # 调用 trace（DESIGN D8）：不带正文，只有元数据
+    (.extensions["vibetrail.call"] // {}) as $c
+    | "模型 \(.payload.model // "?")  入/缓存/出 \($c.usage.input_tokens | kn)/\($c.usage.cached_input_tokens | kn)/\($c.usage.output_tokens | kn)  \($c.stop_reason // "-")\(if ($c.tool_calls // []) | length > 0 then " → " + ($c.tool_calls | join(",")) else "" end)\(if $c.thinking then "（有 thinking）" else "" end)\(if $c.started_at then "  用时 " + ((((.occurred_at | secs) - ($c.started_at | secs)) * 1000) | dur) else "" end)"
+  elif .type == "tool.end" then "\(.payload.tool_name) \({success: "成功", error: "出错", cancelled: "取消"}[.payload.status.code] // .payload.status.code)  \(.payload.duration_ms | dur)"
   elif .type == "message.user" or .type == "message.assistant" then "“\(.payload.text | clip(100))”"
   elif .type == "subagent.start" then "\(.payload.agent_type) 父=\(.parent_agent_instance_id)"
   elif .type == "subagent.end" then "\(.payload.status.code) \(.payload.agent_type // "")"

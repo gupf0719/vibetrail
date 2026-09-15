@@ -196,6 +196,12 @@ vt_hook_turns(){ # vt_hook_turns <sid> → 一行 JSON：{<turn_id>: {start, sto
     else echo '{}'; fi
 }
 
+vt_hook_perms(){ # vt_hook_perms <sid> → 一行 JSON 数组：PermissionRequest 记的权限框证据 [{at, tool_name, agent_id, prompt_id, permission_mode}]（K7）
+    local dir="$VT_HOME/state/$1/perms"
+    if ls "$dir"/*.json >/dev/null 2>&1; then "${JQ:-jq}" -s -c 'map(objects)' "$dir"/*.json 2>/dev/null || echo '[]'
+    else echo '[]'; fi
+}
+
 vt_agent_version(){ # vt_agent_version <transcript> → Claude Code 版本：先看 hook 环境的 AI_AGENT（claude-code_2-1-266_agent），再看 transcript 末尾
     local v
     v=$(printf '%s' "${AI_AGENT:-}" | sed -n 's/^claude-code_\([0-9][0-9]*\)-\([0-9][0-9]*\)-\([0-9][0-9]*\).*/\1.\2.\3/p')

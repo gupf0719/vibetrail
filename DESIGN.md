@@ -332,7 +332,7 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
 `~/.claude/settings.json`（权限、别的 hook）一起丢掉。所以 init 默认（`--events auto`）先找本机的 Claude Code 可执行文件（desktop 自带的每个版本、
 PATH 里的 claude、本地安装），从每个里抽出这个事件名数组（在 200 MB 二进制的 157 MB 处，扫一遍约 1.2 s，按「大小:修改时间:路径」缓存），
 只登记它们都认识的；老版本也有的 6 个（SessionStart / UserPromptSubmit / Stop / SubagentStop / SessionEnd / Notification）总登记，一个可执行文件都没找到时也只登这 6 个。
-本机 2.1.260 与 2.1.266 都认识全部 12 个。doctor 按同一办法复查。hook 条目的 timeout 显式给：SessionStart / UserPromptSubmit 10 s、SessionEnd 5 s（三者自己立刻退出）、
+本机 2.1.260 与 2.1.266 都认识当时的全部 12 个；09-15 加 PermissionRequest（K7），本机 2.1.266、2.1.270 都认识。doctor 按同一办法复查。hook 条目的 timeout 显式给：SessionStart / UserPromptSubmit 10 s、SessionEnd 5 s（三者自己立刻退出）、
 Stop / SubagentStop 120 s 且 `async`（Stop 要等 `stop_hook_summary`）、其余 30 s 且 `async`；Notification 登记两组，matcher 分别是 `permission_prompt` 与 `idle_prompt`。命令写成 `/bin/bash '<绝对路径>/vibetrail-hook' <事件>`，不靠可执行位与 PATH。
 
 ### 5.1 怎么参考 teamai
@@ -406,6 +406,46 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
   [Pilot 实跑](third-party/loongsuite-pilot-collection-sample.md)、[Pilot 原始输出](third-party/loongsuite-pilot-collection-output.md)。
 
 ## 7. 决策记录
+
+### D10 — 新发现的几处两家都没解决，自己修：内部 agent、API 重试、origin.kind、轮里插话、调用 id（2026-09-15，现行）
+
+用户原话：「新发现的问题看看两家有没有解决，没有我们再自己修」；看报告时问「trace的话没有span id和trace id这些是么，pilot有这些吗」。
+两份核对都跑了对方自己的代码（Pilot 用 node 调它的处理器，teamai 用 Node 25 加载它的 TypeScript），并读了本机 Claude Code 2.1.266 的二进制：
+
+| 问题 | Pilot | teamai | 我们 |
+|---|---|---|---|
+| K9 内部 agent（压缩、起标题、提示建议……）也触发 SubagentStop | 碰不到（从父会话的 Agent 调用找子 agent），但 id 留在 state 里不清 | 碰不到（不挂这两个 hook） | 二进制：内部 agent 的 `agent_type` 为空、没有 SubagentStart、给的 transcript 路径不存在。`agent_type` 为空就只记 `ext.claude.subagent_stop`（internal），不发 `subagent.end`；结束标记改用 payload 的 `agent_transcript_path` |
+| U15 `system/api_error` 重试 | 不采 | 不采 | 这次调用之前的重试次数与等待记进 `vibetrail.call.retries` / `retry_wait_ms` |
+| U15 `origin.kind` | 不读（任务通知被当成人话开了一轮） | 不读（人话多算 8 条） | 有 `origin.kind` 就以它判人话，没有（老版本、斜杠命令、本地命令输出、压缩摘要）走原来的排除清单 |
+| K10 轮里插话（`attachment/queued_command`） | 丢掉 | 丢掉 | 实测「拒绝之后插话纠正」不会发生：本机 14 次分歧之后人的下一句 9 次都是正常人话、0 次插话——主会话里拒绝与打断都当场结束这一轮。插话本身以前完全没记，改为在 `turn.end` 上记 `vibetrail.queued_prompts`（只计数，不带正文） |
+| 调用挂不回去 | 有：OTLP 的 trace_id（一轮一个）/ span_id（入口 → agent → step → llm / tool），随机生成 | 没有调用这一级 | 协议信封没有 trace / span 字段，层级靠会话、轮、子 agent 实例、父调用、调用这几个 id；原先 `message.assistant` 只记了工具名，`tool.end` 挂不回是哪次调用发起的——补上 `vibetrail.call.tool_call_ids` |
+
+没做的：workflow 子 agent 的 transcript 在 `subagents/workflows/<runId>/` 下，我们只扫 `subagents/` 这一层（本机没有样本，立 K11）；trace / span id 要不要按
+确定性算法补进 extensions，取决于 collector 的 Span 归档规范怎么从事件建 span（`coding-span-spec.md` 不在本机）。回归：`test-hook-flow.sh` 第 15 段（撤掉修复 6 条全失败）。
+
+### D9 — 分「人拒绝」与「按停止打断正在跑的工具」：先按 permissionMode 粗分，挂上 PermissionRequest 精确分（2026-09-15，现行）
+
+用户原话：「K7 按 permissionMode 先粗分，挂上 PermissionRequest，新发现的问题看看两家有没有解决，没有我们再自己修」。
+
+背景（OPEN-ISSUES K7）：按停止打断正在跑的工具，Claude Code 写进 transcript 的与在权限框里点拒绝逐字一样，也没有任何 hook。两家都分不开：
+teamai 把同一条记录同时算成一次拒绝加一次打断（它的贡献度评分、团队排名都吃这两个数）；Pilot 连拒绝、按停止与真正的工具失败都分不开，一律 `ToolError`。
+Pilot 核对读二进制得到的事实：主会话里点「No」而没写理由，与按停止写的逐字一样；写了理由的拒绝、子 agent 里的拒绝记的是 `Error: …` 加 `userFeedback`；
+PermissionRequest 只在真弹出权限框时触发（desktop 里与弹框并行跑），auto 模式下分类器自己放行 / 拦下时不触发（拦下触发的是 PermissionDenied）；
+Notification 的 `permission_prompt` 挂在 6 s 定时器上、人先答了就不发，不能当「弹过框」的证据。
+
+定了什么（规则见 spec/diverge-v1 §2.3）：
+- **挂上 PermissionRequest**（本机 2.1.266、2.1.270 都认识，按版本登记）：弹权限框时记一份证据进 `state/<sid>/perms/`（时间、工具名、agent_id、prompt_id、
+  permission_mode，不带参数），发 `ext.claude.permission_request`（工具名、模式）。这类 hook 能替人回答权限，Claude Code 可能同步等它——
+  像 SessionStart 一样读完就丢后台、立刻退出，不拖慢弹框。`init` 把挂上的时刻记进 config 的 `permission_request_since`。
+- **映射层二次判定**只针对「The user doesn't want to proceed with this tool use」且 `toolUseResult` 不以 `Error:` 开头的：挂上之后看调用与拒绝之间弹没弹过
+  同名工具的框（按工具名与时间对，不比参数）；子 agent 文件里 `toolUseResult` 是「User rejected tool use」的算按停止；挂上之前按这一轮人话记录的
+  `permissionMode`——auto / bypassPermissions / dontAsk 算按停止，其余仍算拒绝；都没有仍算拒绝。「Permission to use … has been denied」只会是拒绝。
+- 判成按停止的不发 `permission.decision`，在随后的打断记录处发 `turn.end(interrupted)`，`vibetrail.kind` = `interrupt_tool`；
+  两种结论都带 `vibetrail.split_by`、`vibetrail.permission_mode`，拒绝另带 `vibetrail.prompt_shown`。
+
+本机效果：3 条 user-rejected（2 条是同一条被复制进两个会话）全在 auto 模式的轮里，都改判成按停止——其中一条就是 09-15 请用户按停止的实测；
+另一条是 09-11 一次 Agent 调用被拒，按粗分判成按停止，当时实际是不是按的停止没法核实。desktop 里 PermissionRequest 会不会触发、payload 与二进制是否一致，
+要在 default 模式的会话里弹一次框、点一次拒绝才能实测（auto 模式下几乎不弹框）；实测前，这部分只有二进制与回归（`test-hook-flow.sh` 第 14、15 段）的依据。
 
 ### D8 — 采调用 trace：照 Pilot 的粒度，一次调用一条，不带正文（2026-09-15，现行）
 

@@ -54,6 +54,10 @@
 include "diverge-rules";
 
 def opt($k; $v): if $v == null then {} else {($k): $v} end;
+# ISO 时间 → 毫秒（trace 的耗时、K7 的权限框时间窗）
+def epochms: if type != "string" then null else
+  (capture("^(?<b>[^.Z]+)(?<f>\\.[0-9]+)?Z$")? // null) as $m
+  | if $m == null then null else ((($m.b + "Z") | fromdateiso8601) * 1000 + (("0" + ($m.f // ".0")) | tonumber * 1000 | floor)) end end;
 def codeOk: type == "string" and test("^[a-z][a-z0-9]*([._-][a-z0-9]+)*$");
 
 # ---------- 记录的精简形态（进链、进索引的就是它） ----------
@@ -84,7 +88,14 @@ def mainUser:          # 主会话里人发出的 user 记录的公共条件：�
 def injectedText: sub("^\\s+"; "")
   | test("^<(system-reminder|local-command-[a-z]+|command-[a-z]+|task-notification|bash-[a-z]+)")
     or startswith("Stop hook feedback") or startswith("This session is being continued");
-def isHumanPrompt: mainUser and (textOf | length > 0 and (isInterruptText | not) and (injectedText | not));
+# 2.1.26x 的人话记录带 origin.kind（human / task-notification）：有就以它为准，没有（老版本、斜杠命令、本地命令输出、压缩摘要、打断标记）走文本排除清单（U15）
+def isHumanPrompt: mainUser and (textOf | length > 0 and (isInterruptText | not))
+  and ((.origin | if type == "object" then .kind else null end) as $k
+       | if ($k | type) == "string" then $k == "human" else (textOf | injectedText | not) end);
+# 人在模型干活时插的话（desktop 排队消息）：attachment / queued_command，commandMode = prompt、origin 是人。不开轮、不带正文，只在 turn.end 上计数（K10）
+def isQueuedHuman($r): $r.type == "attachment" and ($r.attachment | type) == "object" and $r.attachment.type == "queued_command"
+  and (($r.attachment.commandMode // "prompt") == "prompt")
+  and ((($r.attachment.origin | if type == "object" then .kind else null end) // "human") == "human");
 # 斜杠命令是人敲的（Pilot 也把 <command-name> 当人的动作，transcript-parser.mjs:34），不是注入。
 # 规范成 "/model claude-opus-5" 这样的一句；/model、/compact 常在分歧之后出现（09-15 语料 17 / 272）
 def slashText:
@@ -118,14 +129,17 @@ def init: {
   turn_usage: {}, turn_model: null,
   seen: {},               # 已派生事件的 _key（去重）
   denials: [],            # 当前轮里 permission_denied 记录的 uuid，给 for-tool-use 配对
+  stops: [],              # 当前轮里判成「按停止打断正在跑的工具」的那几条 user-rejected（K7）：{uuid, call_id, by, mode}
+  perm_mode: null,        # 最近一条人话记录的 permissionMode（K7 粗分用）
   pending: null,          # {after: [uuid…], kind, since}：等「人的下一句」；since＝第一个触发所在轮的开头行
   pturn: null,            # 按 promptId 切的当前轮（轮次元数据一路）：{id, line, last_ts, usage, model, interrupted, denied, git_commit, closed}
   call: null,             # trace：正在累计的这次模型调用（同一 message.id 的几条记录）
+  retries: 0, retry_ms: 0, # trace：这次调用之前的 API 重试（system / api_error）次数与等待
   prev_end_ts: null,      # trace：下一次模型调用的请求开始＝最近一条 user 记录与上一次模型调用结尾里晚的那个（Pilot 只看工具结果，
                           #   连着几次调用之间没有工具结果时——如连续撞 max_tokens——会一直停在最早那条上，耗时越算越长）
   last_ts: null, version: null, entrypoint: null, branch: null,
   ledger: {in: {}, in_total: {}, out: {}, events: {}, absorbed_for_tool_use: 0, unpaired_for_tool_use: 0,
-           lookup: {index: 0, regex: 0, missing: 0}, dedup: 0, records: 0, skipped_no_uuid: 0, skipped_non_object: 0,
+           lookup: {index: 0, regex: 0, missing: 0}, stop_press: 0, dedup: 0, records: 0, skipped_no_uuid: 0, skipped_non_object: 0,
            # G6 哨兵：被拒记录的 toolUseResult 是 "User rejected tool use"，与正文判据是两个独立字段（09-15 语料逐条吻合）。
            # marker_without_hit > 0 ＝ 有这个标记、判据却没认出人拒——判据漂了
            sentinel: {marker: 0, marker_without_hit: 0},
@@ -221,7 +235,7 @@ def mainRec($r): ($r.isSidechain != true) and ($r.agentId == null);
 def openTurn($s):
   .pturn = {id: $s.promptId, line: $s.ln, last_ts: $s.ts, usage: {}, model: null, answered: false,
             interrupted: false, denied: false, git_commit: false, closed: false, end_turn: false, stop_blocked: false,
-            block_pending: false, summary: null}
+            block_pending: false, summary: null, queued: 0}
   | (if $s.ln > $from_line then .ledger.turns.started += 1 else . end)
   | hookTurn($s.promptId) as $h | vcsMerge(.branch; $h.start.vcs) as $vcs
   | emit( base($s; "turn.start"; $s.uuid; $s.ts; {id: $s.promptId, inferred: false})
@@ -255,7 +269,8 @@ def closeTurn($how; $s; $eof):
                                  "vibetrail.commit_attribution": (if $pt.git_commit then "agent_tool" else "inferred" end)}
           else . end)
        | .extensions += ({"vibetrail.closed_by": $how, "vibetrail.end_evidence": (if $pt.denied then "denial" else $evidence end),
-                          "vibetrail.stops": ($stop.stops // 0)} + opt("vibetrail.dirty_files"; $end.vcs.dirty_files))
+                          "vibetrail.stops": ($stop.stops // 0)} + opt("vibetrail.dirty_files"; $end.vcs.dirty_files)
+                         + opt("vibetrail.queued_prompts"; (if ($pt.queued // 0) > 0 then $pt.queued else null end)))
        # 被别的 Stop hook 拦停、同一轮第 N 次 Stop 时发的那条换一个 event_id（|stopN），读的一方同一 turn_id 取 vibetrail.stops 最大的
        | ._key = ($pt.id + "|turn.end" + (if (($stop.stops // 0) > 1) then "|stop" + ($stop.stops | tostring) else "" end))) as $e
     | (if $eof then emitAlways($e) else emit($e) end)
@@ -268,13 +283,44 @@ def addPending($uuid; $kind):
   turnStart as $ts
   | .pending = {after: ((.pending.after // []) + [$uuid]), kind: $kind, since: (.pending.since // $ts)};
 
+# ---------- K7：「The user doesn't want to proceed with this tool use」是人拒绝，还是按停止打断了正在跑的工具 ----------
+# 按停止时 Claude Code 给还没跑完的工具写的合成结果与在权限框里点拒绝逐字一样（二进制 createSyntheticErrorMessage），后面同样跟
+# 「[Request interrupted by user for tool use]」。能分开的只有「这次调用弹没弹过权限框」（用户 09-15 定：先按 permissionMode 粗分，挂上 PermissionRequest）：
+#   1. 拒绝的时刻 PermissionRequest 已经挂上（$perm_since 之后）：调用与拒绝之间弹过同名工具的框（前后各放 5 s）是拒绝，没弹过是按停止。
+#      按工具名与时间对，不比参数：hook 的 tool_input 与 transcript 里的 input 不保证逐字一样，比参数反而会把真拒绝判成停止
+#   2. 没挂上：看这一轮人话记录的 permissionMode——auto / bypassPermissions / dontAsk 几乎不弹框，算按停止；别的仍算拒绝
+#   3. 子 agent 文件：toolUseResult 是「User rejected tool use」就是按停止——子 agent 里点拒绝记的是「Error: …」加 userFeedback（2.1.266 二进制，Pilot 核对读出，本机没有样本）
+#   4. 都没有（老版本没有 permissionMode）：仍算拒绝
+# 「Permission to use … has been denied」是权限流程写的、toolUseResult 以「Error:」开头的带了拒绝理由，都只会是拒绝，不走这里。
+# ⚠️ 别用 index/1：本文件自己定义了 index($s)（给记录建索引），会盖掉内建的
+def noPromptMode: . as $m | any(("auto", "bypassPermissions", "dontAsk"); . == $m);
+def splitStop($s; $tu; $tur):
+  ($s.ts | epochms) as $at
+  | ((($perm_since | tonumber?) // 0) * 1000) as $since
+  | if $since > 0 and $at != null and $at >= $since then
+      ((($tu.ts // null) | epochms) // ($at - 600000)) as $from
+      | ([($hook_perms[0] // [])[] | objects
+          | select(($tu == null or .tool_name == $tu.name) and (.agent_id == null or .agent_id == $s.agent))
+          | (.at | epochms) as $pa | select($pa != null and $pa >= $from - 5000 and $pa <= $at + 5000)] | length > 0) as $shown
+      | {stop: ($shown | not), by: "permission_request", prompt_shown: $shown, mode: .perm_mode}
+    elif $s.agent != null and $tur == "User rejected tool use" then {stop: true, by: "subagent_rejected"}
+    elif .perm_mode != null then {stop: (.perm_mode | noPromptMode), by: "permission_mode", mode: .perm_mode}
+    else {stop: false, by: "none"} end;
+
 # ---------- 三类 is_error 分歧 → permission.decision（+ 被拒调用的 tool.request） ----------
 def decisions($r; $s; $h):
   ($r | errBlocks | map(select(.text | kindPred($h.kind)))) as $blocks
   | turnOf($s) as $t
-  | reduce $blocks[] as $b (.;
-      ($b.call_id) as $cid
-      | (if $cid != null then .tools[$cid] else null end) as $tu
+  | . as $st | ($r.toolUseResult | if type == "string" then . else null end) as $tur
+  | [$blocks[] | . as $b | (if $b.call_id != null then $st.tools[$b.call_id] else null end) as $tu
+     | {b: $b, tu: $tu,
+        cls: (if $h.kind == "permission_denied" and ($b.text | test("^The user doesn't want to proceed with this tool use")) and (($tur // "") | startswith("Error:") | not)
+              then ($st | splitStop($s; $tu; $tur)) else null end)}] as $items
+  | reduce $items[] as $it (.;
+      if $it.cls.stop == true then   # 按停止打断：这里不发，等紧跟的 for-tool-use 记录按打断发（forToolUse）
+        .stops += [{uuid: $s.uuid, call_id: $it.b.call_id, by: $it.cls.by, mode: $it.cls.mode}] | .ledger.stop_press += 1
+      else
+      $it.b as $b | ($b.call_id) as $cid | $it.tu as $tu
       | (if $tu != null then {name: ($tu.name // "unknown"), how: "index"}
          elif ($b.text | test("^Permission to use \\S+")) then {name: ($b.text | capture("^Permission to use (?<n>\\S+)").n), how: "regex"}
          else {name: "unknown", how: "missing"} end) as $nm
@@ -286,9 +332,14 @@ def decisions($r; $s; $h):
                              decided_by: ({permission_denied: "user", classifier_blocked: "policy", permission_infra_fail: "system"}[$h.kind]),
                              reason: ($b.text | .[0:4096])} + opt("call_id"; $cid))
               | .raw = {event_name: ("diverge." + $h.kind), data: $h}
-              | .extensions += {"vibetrail.kind": $h.kind, "vibetrail.human": $h.human, "vibetrail.tool_lookup": $nm.how}
-              | ._key = ($s.uuid + "|permission.decision|" + ($cid // "") + "|" + $h.kind) ))
-  | (if $h.human then .denials += [$s.uuid] | addPending($s.uuid; $h.kind) else . end);
+              | .extensions += ({"vibetrail.kind": $h.kind, "vibetrail.human": $h.human, "vibetrail.tool_lookup": $nm.how}
+                                + (if ($it.cls.by // "none") != "none"
+                                   then {"vibetrail.split_by": $it.cls.by} + opt("vibetrail.permission_mode"; $it.cls.mode)
+                                        + opt("vibetrail.prompt_shown"; $it.cls.prompt_shown)
+                                   else {} end))
+              | ._key = ($s.uuid + "|permission.decision|" + ($cid // "") + "|" + $h.kind) )
+      end)
+  | (if $h.human and any($items[]; .cls.stop != true) then .denials += [$s.uuid] | addPending($s.uuid; $h.kind) else . end);
 
 # ---------- 打断 → turn.end(interrupted) / subagent.end(cancelled) + 被打断的回复 ----------
 def walkUp($u; $n):    # 沿 parentUuid 回溯到最近的真实 assistant 记录；越过合成记录；碰到人的提示词（轮首）或链断就停
@@ -321,14 +372,14 @@ def wholeReply($near):
       else $near + {text: ([$grp[] | .text] | mergeTexts), tools: ([$grp[] | .tools[]] | unique_by(.id))} end end;
 
 def interrupted($r; $s; $h; $detail):
-  turnOf($s) as $t
+  turnOf($s) as $t | ($h.as_kind // $h.kind) as $kind
   | wholeReply((walkUp($s.parentUuid; 200)) // lastAssistantInTurn($s)) as $reply
   | (if $reply != null and ($reply.text | length) > 0
-     then emit(message($s; $t; $reply; "message.assistant"; "agent"; {"vibetrail.trigger": $s.uuid, "vibetrail.kind": $h.kind}))
+     then emit(message($s; $t; $reply; "message.assistant"; "agent"; {"vibetrail.trigger": $s.uuid, "vibetrail.kind": $kind}))
      else . end)
   | (if $reply != null
      then reduce $reply.tools[] as $tl (.; (if $tl.id != null then .tools[$tl.id] else null end) as $tu
-            | if $tu != null then emit(toolRequest($s; $t; $tl.id; $tu; {"vibetrail.trigger": $s.uuid, "vibetrail.kind": $h.kind})) else . end)
+            | if $tu != null then emit(toolRequest($s; $t; $tl.id; $tu; {"vibetrail.trigger": $s.uuid, "vibetrail.kind": $kind})) else . end)
      else . end)
   | ($s.agent != null) as $sub
   # ⚠️ emit(base(…) | …) 里管道之后的 . 是事件、不是状态：状态里的值必须先绑成变量再用
@@ -345,11 +396,12 @@ def interrupted($r; $s; $h; $detail):
                   | .extensions += {"vibetrail.commit_method": ($hend.commit_method // "rev-list"),
                                     "vibetrail.commit_attribution": (if $gc then "agent_tool" else "inferred" end)}
              else . end)
-          | .raw = {event_name: ("diverge." + $h.kind), data: $h}
-          | .extensions += ({"vibetrail.kind": $h.kind, "vibetrail.human": true} + opt("vibetrail.interrupted_uuid"; $reply.uuid))
+          | .raw = {event_name: ("diverge." + $h.kind), data: ($h | del(.as_kind, .split_by, .permission_mode))}
+          | .extensions += ({"vibetrail.kind": $kind, "vibetrail.human": true} + opt("vibetrail.interrupted_uuid"; $reply.uuid)
+                            + opt("vibetrail.split_by"; $h.split_by) + opt("vibetrail.permission_mode"; $h.permission_mode))
           | ._key = ($s.uuid + "|" + .type) )
   | (if ($sub | not) and .pturn != null and .pturn.id == $t.id then .pturn.interrupted = true else . end)
-  | addPending($s.uuid; $h.kind);
+  | addPending($s.uuid; $kind);
 
 # for-tool-use 变体：同一轮里前面有 permission_denied 就是它的伴随记录，不另发事件（计一次）；
 # 没有配对的（语料里未见）按打断处理，不丢事件
@@ -358,6 +410,8 @@ def forToolUse($r; $s; $h):
   then .ledger.absorbed_for_tool_use += 1 | addPending($s.uuid; "interrupt_for_tool_use")
        # 这一轮是被拒绝停下的：当场关轮，status 记 denied（不算打断，打断只数 turn.end(interrupted)，K5）
        | (if .pturn != null and .pturn.id == turnOf($s).id then .pturn.denied = true | closeTurn("denied"; $s; false) else . end)
+  elif (.stops | length) > 0 then   # 前面的 user-rejected 判成了按停止（K7）：这一条就是那次打断，按打断发
+    .stops[0] as $sp | interrupted($r; $s; $h + {as_kind: "interrupt_tool", split_by: $sp.by, permission_mode: $sp.mode}; $s.text)
   else .ledger.unpaired_for_tool_use += 1 | interrupted($r; $s; $h; "unpaired interrupt_for_tool_use: " + $s.text) end;
 
 def handle($r; $s; $h):
@@ -407,6 +461,7 @@ def turnAccumulate($r; $s):
             | .pturn.end_turn = (($r.message | if type == "object" then .stop_reason else null end) == "end_turn")
        else . end)
     | (if stopFeedback($r; $s) then .pturn.stop_blocked = true else . end)
+    | (if isQueuedHuman($r) then .pturn.queued += 1 else . end)
     | (if $s.type == "assistant" and $s.usage != null and ($s.synthetic | not)
        then ($s.mid // $s.rid // $s.uuid) as $uk
             | (if ((.pturn.usage[$uk].output_tokens // -1) > ($s.usage.output_tokens // 0)) then . else .pturn.usage[$uk] = $s.usage end)
@@ -422,9 +477,6 @@ def baseCheckpoint: turnStart as $ts
   | if .pturn != null then ([$c, .pturn.line] | min) else $c end;
 
 # ---------- trace：每次模型调用、每次工具调用各一条，不带正文 ----------
-def epochms: if type != "string" then null else
-  (capture("^(?<b>[^.Z]+)(?<f>\\.[0-9]+)?Z$")? // null) as $m
-  | if $m == null then null else ((($m.b + "Z") | fromdateiso8601) * 1000 + (("0" + ($m.f // ".0")) | tonumber * 1000 | floor)) end end;
 def usageOne($u): if ($u | type) != "object" then null else
   ({input_tokens: (($u.input_tokens // 0) + ($u.cache_creation_input_tokens // 0)), cached_input_tokens: ($u.cache_read_input_tokens // 0),
     output_tokens: ($u.output_tokens // 0)}
@@ -440,7 +492,8 @@ def flushCall($eof):
        | .content_state = "omitted"
        | .payload = ({author_type: "agent"} + opt("model"; $c.model))
        | .provenance = {kind: "transcript", rule_version: "call-v1", source_event_id: $c.last_uuid}
-       | .extensions += {"vibetrail.call": ({kind: "llm", stop_reason: $c.stop_reason, tool_calls: $c.tools, thinking: $c.thinking}
+       | .extensions += {"vibetrail.call": ({kind: "llm", stop_reason: $c.stop_reason, tool_calls: $c.tools, tool_call_ids: ($c.tool_ids // []), thinking: $c.thinking}
+                          + (if ($c.retries // 0) > 0 then {retries: $c.retries, retry_wait_ms: $c.retry_ms} else {} end)
                           + opt("response_id"; $c.mid) + opt("request_id"; $c.rid) + opt("usage"; usageOne($c.usage))
                           + opt("started_at"; if $c.started_at != null and $c.last_ts != null and $c.started_at > $c.last_ts then $c.last_ts else $c.started_at end))}   # 开始不晚于结束（照 Pilot 的 normalizeRequestStart）
        | ._key = ($c.key + "|llm.call")) as $e
@@ -470,17 +523,21 @@ def toolEnds($r; $s):
 
 def traceStep($r; $s):
   # user 记录不结束这次调用：2.1.260 边生成边执行工具，工具结果会夹在同一次调用的几条记录中间（09-15 本机 96 次调用曾因此被拆开）
-  (if $s.type == "user" then toolEnds($r; $s) | .prev_end_ts = ([.prev_end_ts, $s.ts] | max) else . end)   # 只往后走：重写的旧记录带着旧时间
+  (if $s.type == "user" then toolEnds($r; $s) | .prev_end_ts = ([.prev_end_ts, $s.ts] | max) | .retries = 0 | .retry_ms = 0 else . end)   # 只往后走：重写的旧记录带着旧时间
+  # API 请求失败重试（system / api_error，带 retryInMs）：记到接下来那次调用上（U15）
+  | (if $r.type == "system" and $r.subtype == "api_error" then .retries += 1 | .retry_ms += (($r.retryInMs | if type == "number" then . else 0 end)) else . end)
   | (if $s.type == "assistant" and ($s.synthetic | not) then
        ($s.mid // $s.rid // $s.uuid) as $k
        | (if .call != null and .call.key != $k then flushCall(false) else . end)
        | if .call == null
          then .call = {key: $k, mid: $s.mid, rid: $s.rid, model: $s.model, usage: $s.usage, stop_reason: stopReasonOf($r),
-                       tools: [$s.tools[] | .name], thinking: thinkingIn($r), last_ts: $s.ts, last_uuid: $s.uuid, ck: baseCheckpoint,
-                       started_at: .prev_end_ts, agent: $s.agent, turn: {id: (.turn // $s.uuid), inferred: (.turn == null)}}
+                       tools: [$s.tools[] | .name], tool_ids: [$s.tools[] | .id | strings], thinking: thinkingIn($r), last_ts: $s.ts, last_uuid: $s.uuid, ck: baseCheckpoint,
+                       started_at: .prev_end_ts, agent: $s.agent, turn: {id: (.turn // $s.uuid), inferred: (.turn == null)},
+                       retries: .retries, retry_ms: .retry_ms}
+              | .retries = 0 | .retry_ms = 0
          else .call.last_ts = ($s.ts // .call.last_ts) | .call.last_uuid = $s.uuid
               | .call.stop_reason = (stopReasonOf($r) // .call.stop_reason)
-              | .call.tools += [$s.tools[] | .name] | .call.thinking = (.call.thinking or thinkingIn($r))
+              | .call.tools += [$s.tools[] | .name] | .call.tool_ids += [$s.tools[] | .id | strings] | .call.thinking = (.call.thinking or thinkingIn($r))
               | (if $s.usage != null and (($s.usage.output_tokens // 0) >= (.call.usage.output_tokens // -1)) then .call.usage = $s.usage else . end) end
      else . end);
 
@@ -496,7 +553,8 @@ def step($r):
       | .ledger.records += 1
       | .last_ts = ($r.timestamp // .last_ts) | .version = ($r.version // .version)
       | .entrypoint = ($r.entrypoint // .entrypoint) | .branch = ($r.gitBranch // .branch)
-      | (if ($r.promptId | type) == "string" and $r.promptId != .turn then .turn = $r.promptId | .denials = [] else . end)
+      | (if ($r.promptId | type) == "string" and $r.promptId != .turn then .turn = $r.promptId | .denials = [] | .stops = [] else . end)
+      | (if ($s.human or $s.slash) and ($r.permissionMode | type) == "string" then .perm_mode = $r.permissionMode else . end)
       | turnBoundary($r; $s)
       | index($s)
       | (if $s.human then .turn_usage = {} | .turn_model = null | .turn_line = $s.ln else . end)

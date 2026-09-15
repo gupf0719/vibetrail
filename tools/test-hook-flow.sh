@@ -2,7 +2,7 @@
 # 回归：hook 分发入口 + 分歧一路挂 hook（TODO G7 第 2 步）。用 experiments/collect-demo/scenario.json 在临时目录里真实回放：
 # 临时 git 仓当被观测项目，临时目录当 ~/.vibetrail 与 ~/.claude/projects，逐步追加 transcript、逐个触发 hook。
 # 断言：A4 未登记零写入；登记后 spool == 对最终 transcript 的一次全量映射；stdout 永远为空、exit 0；重复触发不重复写；
-# 锁被占时跳过、之后补上；半行等写完再读；文件被重写后不重复；打断后没有 Stop 也不漏；子 agent（还在跑的不写半截调用）；回放副本；SessionStart 补做别的会话；scope=user；压缩时重写的旧工具结果不重发 tool.end；连续调用的请求开始；init 重跑不动 settings。
+# 锁被占时跳过、之后补上；半行等写完再读；文件被重写后不重复；打断后没有 Stop 也不漏；子 agent（还在跑的不写半截调用）；回放副本；SessionStart 补做别的会话；scope=user；压缩时重写的旧工具结果不重发 tool.end；连续调用的请求开始；init 重跑不动 settings；K7 分拒绝与按停止；内部 agent、API 重试、origin.kind、轮里插话。
 # 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
 # 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
 export LC_ALL=C
@@ -132,7 +132,7 @@ printf '%s\n' '{"agentType":"general-purpose","description":"查","spawnDepth":1
   rec s1a s1u P1 assistant '[]' '{"agentId":"s1","isSidechain":true,"message":{"id":"sm1","model":"claude-sonnet-5","role":"assistant","content":[{"type":"tool_use","id":"st1","name":"Bash","input":{"command":"ls"}}]}}'
   rec s1d s1a P1 user '[{"type":"tool_result","tool_use_id":"st1","content":"Permission to use Bash with command ls has been denied.","is_error":true}]' '{"agentId":"s1","isSidechain":true}'
 } > "$TDIR/$SID/subagents/agent-s1.jsonl"
-hook SubagentStop "$(payload SubagentStop '{"agent_id":"s1"}')"
+hook SubagentStop "$(payload SubagentStop '{"agent_id":"s1","agent_type":"general-purpose"}')"
 check "子 agent 的拒绝进 spool，实例 s1、父实例 main、parent_call_id 取 meta" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"diverge-v1\")) | length == 2 and all(.[]; .agent_instance_id == \"s1\" and .parent_agent_instance_id == \"main\" and .parent_call_id == \"toolu_x\")" >/dev/null'
 check "子 agent 的那次模型调用有 trace：实例 s1、不带正文；被拒的调用不伪造 tool.end" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"call-v1\")) | length == 1 and .[0].type == \"message.assistant\" and .[0].agent_instance_id == \"s1\" and .[0].content_state == \"omitted\" and (.[0].payload | has(\"text\") | not) and .[0].extensions[\"vibetrail.call\"].tool_calls == [\"Bash\"]" >/dev/null'
 
@@ -148,7 +148,7 @@ check "还在跑的子 agent：读到一半的那次调用先不写，工具结�
   rec s2s s2b P1 user '[{"type":"tool_result","tool_use_id":"s2t2","content":"calc.py:1"}]' '{"agentId":"s2","isSidechain":true}'
   rec s2c s2s P1 assistant '[]' '{"agentId":"s2","isSidechain":true,"message":{"id":"sm3","model":"claude-sonnet-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"查完了。"}]}}'
 } >> "$TDIR/$SID/subagents/agent-s2.jsonl"
-hook SubagentStop "$(payload SubagentStop '{"agent_id":"s2"}')"
+hook SubagentStop "$(payload SubagentStop '{"agent_id":"s2","agent_type":"general-purpose"}')"
 check "s2 结束后：夹着工具结果的那次调用仍是一条、两个工具都在，最后一次回答也写出" 'cat "$SPOOL"/*-agent-s2.jsonl 2>/dev/null | jq -s -e "map(select(.type == \"message.assistant\" and .provenance.rule_version == \"call-v1\") | .extensions[\"vibetrail.call\"].tool_calls) == [[\"Read\", \"Grep\"], []]" >/dev/null'
 # s2 被续上（SendMessage）又开始写：结束标记记的是当时的文件大小，文件长了就不算结束，续上的那次调用写一半时不写出
 { rec s2v s2c P1 user '"再查一个"' '{"agentId":"s2","isSidechain":true}'
@@ -157,7 +157,7 @@ check "s2 结束后：夹着工具结果的那次调用仍是一条、两个工�
 hook Notification "$(payload Notification '{"notification_type":"idle_prompt"}')"
 check "s2 被续上、调用写了一半：不写出" '! cat "$SPOOL"/*-agent-s2.jsonl | jq -e "select(.extensions[\"vibetrail.call\"].response_id == \"sm4\")" >/dev/null'
 rec s2x s2w P1 assistant '[]' '{"agentId":"s2","isSidechain":true,"message":{"id":"sm4","model":"claude-sonnet-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"也查完了。"}]}}' >> "$TDIR/$SID/subagents/agent-s2.jsonl"
-hook SubagentStop "$(payload SubagentStop '{"agent_id":"s2"}')"
+hook SubagentStop "$(payload SubagentStop '{"agent_id":"s2","agent_type":"general-purpose"}')"
 check "续上的这段结束后：那次调用完整写出（thinking 与回答合成一条）" 'cat "$SPOOL"/*-agent-s2.jsonl | jq -s -e "map(select(.extensions[\"vibetrail.call\"].response_id == \"sm4\")) | length == 1 and .[0].extensions[\"vibetrail.call\"].stop_reason == \"end_turn\" and .[0].extensions[\"vibetrail.call\"].thinking == true" >/dev/null'
 
 echo "════ 8. 文件被重写（变短）：从 0 重读，不重复 ════"
@@ -254,6 +254,74 @@ vcli init --no-register; n1=$(nhook); vcli init --no-register
 check "两次 init：model 还在、条目没翻倍；第二次没变化，不写也不多备份；装之前的原样另存了一份" '[ "$(nhook)" = "$n1" ] && [ "$n1" -gt 0 ] && jq -e ".model == \"opus\"" "$IS/.claude/settings.json" >/dev/null && [ "$(ls "$IS/.vibetrail/backup"/settings.json.2* | wc -l | tr -d " ")" = 1 ] && jq -e ". == {model: \"opus\"}" "$IS/.vibetrail/backup/settings.json.before-vibetrail" >/dev/null 2>&1'
 vcli uninstall
 check "uninstall 之后回到原样，原样那份备份没被覆盖" 'jq -e ". == {model: \"opus\"}" "$IS/.claude/settings.json" >/dev/null && jq -e ". == {model: \"opus\"}" "$IS/.vibetrail/backup/settings.json.before-vibetrail" >/dev/null 2>&1'
+
+echo "════ 14. K7：「User rejected tool use」是人拒绝还是按停止——先按 permissionMode 粗分，挂上 PermissionRequest 后看弹没弹过框 ════"
+# 场景：人问一句 → 模型跑一个 Bash → 该调用得到「The user doesn't want to proceed…」→ 「[Request interrupted by user for tool use]」→ Stop。
+# 两种来历写进 transcript 的逐字一样；时间戳取「现在」前后，PermissionRequest 的证据（hook 当场记的时间）才落在时间窗里
+k7case(){ # k7case <会话后缀> <permissionMode> <permission_request_since：空=没挂上> <弹没弹过框 0/1>
+    local sid0=$SID tr0=$TR t0 t1 t2
+    SID=77777777-0000-4000-8000-00000000000$1; TR=$TDIR/$SID.jsonl; K7SPOOL=$VT_HOME/spool/$PKEY/$SID
+    t0=$(jq -n -r 'now - 3 | todate'); t1=$(jq -n -r 'now - 1 | todate'); t2=$(jq -n -r 'now | todate')
+    grep -v '^permission_request_since=' "$VT_HOME/config" > "$VT_HOME/config.tmp"; mv "$VT_HOME/config.tmp" "$VT_HOME/config"
+    [ -n "$3" ] && printf 'permission_request_since=%s\n' "$3" >> "$VT_HOME/config"
+    { rec k1 "" pk7 user '"跑一下测试"' "$(jq -n -c --arg m "$2" --arg t "$t0" '{permissionMode: $m, timestamp: $t}')" | jq -c '.parentUuid = null'
+      rec k2 k1 pk7 assistant '[]' "$(jq -n -c --arg t "$t0" '{timestamp: $t, message: {id: "mk7", model: "claude-opus-5", role: "assistant", content: [{type: "tool_use", id: "tk7", name: "Bash", input: {command: "sleep 100"}}]}}')"
+    } > "$TR"
+    [ "$4" = 1 ] && hook PermissionRequest "$(payload PermissionRequest '{"tool_name":"Bash","tool_input":{"command":"sleep 100"}}')"
+    { rec k3 k2 pk7 user '[{"type":"tool_result","tool_use_id":"tk7","is_error":true,"content":"The user doesn'"'"'t want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed."}]' "$(jq -n -c --arg t "$t1" '{timestamp: $t, toolUseResult: "User rejected tool use"}')"
+      rec k4 k3 pk7 user '[{"type":"text","text":"[Request interrupted by user for tool use]"}]' "$(jq -n -c --arg t "$t2" '{timestamp: $t}')"
+    } >> "$TR"
+    hook Stop "$(payload Stop '{"prompt_id":"pk7"}')"
+    SID=$sid0; TR=$tr0
+}
+k7ev(){ cat "$K7SPOOL"/*.jsonl 2>/dev/null | jq -S -s -c "$1"; }
+stopped='map(select(.type == "turn.end" and .extensions["vibetrail.kind"] == "interrupt_tool"))'
+k7case 1 auto "" 0
+check "auto、没挂 PermissionRequest：按停止——不发 permission.decision，发 turn.end(interrupted)、kind = interrupt_tool，被打断的 Bash 照发 tool.request" \
+    '[ "$(k7ev "[(map(select(.type == \"permission.decision\")) | length), ($stopped | length), ($stopped | .[0].payload.status.code), ($stopped | .[0].extensions[\"vibetrail.split_by\"]), ($stopped | .[0].extensions[\"vibetrail.permission_mode\"]), (map(select(.type == \"tool.request\" and .payload.call_id == \"tk7\")) | length)]")" = "[0,1,\"interrupted\",\"permission_mode\",\"auto\",1]" ]'
+k7case 2 default "" 0
+check "default、没挂 PermissionRequest：仍算拒绝，注明按 permissionMode 分的" \
+    '[ "$(k7ev "[(map(select(.type == \"permission.decision\")) | .[0].extensions | [.[\"vibetrail.split_by\"], .[\"vibetrail.permission_mode\"]]), ($stopped | length)]")" = "[[\"permission_mode\",\"default\"],0]" ]'
+k7case 3 default "$(( $(date +%s) - 60 ))" 1
+check "挂上了、弹过框：是拒绝，prompt_shown = true；PermissionRequest 记了事件头（不带参数）" \
+    '[ "$(k7ev "[(map(select(.type == \"permission.decision\")) | .[0].extensions | [.[\"vibetrail.split_by\"], .[\"vibetrail.prompt_shown\"]]), ($stopped | length), (map(select(.type == \"ext.claude.permission_request\")) | .[0].payload)]")" = "[[\"permission_request\",true],0,{\"permission_mode\":\"default\",\"tool_name\":\"Bash\"}]" ]'
+k7case 4 default "$(( $(date +%s) - 60 ))" 0
+check "挂上了、没弹过框：default 模式也是按停止" \
+    '[ "$(k7ev "[(map(select(.type == \"permission.decision\")) | length), ($stopped | .[0].extensions[\"vibetrail.split_by\"])]")" = "[0,\"permission_request\"]" ]'
+
+echo "════ 15. 两家都没解决、我们自己修的：内部 agent（K9）、K7 两处补充、API 重试与 origin.kind（U15）、轮里插话（K10）、调用 id ════"
+hook SubagentStop "$(payload SubagentStop '{"agent_id":"ainternal1","agent_type":""}')"
+check "内部 agent（agent_type 为空）：只记 ext.claude.subagent_stop（internal），不发 subagent.end" \
+    '[ "$(cat "$SPOOL"/*.jsonl | jq -s -c "[(map(select(.type == \"ext.claude.subagent_stop\")) | .[0].payload), (map(select(.type == \"subagent.end\" and .agent_instance_id == \"ainternal1\")) | length)]")" = "[{\"agent_id\":\"ainternal1\",\"internal\":true},0]" ]'
+REJ='The user doesn'"'"'t want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.'
+mkdir -p "$T/k15/$SID/subagents"; SUBF=$T/k15/$SID/subagents/agent-x9.jsonl
+{ rec x1 "" P1 user '"查一下"' '{"agentId":"x9","isSidechain":true}' | jq -c '.parentUuid = null'
+  rec x2 x1 P1 assistant '[]' '{"agentId":"x9","isSidechain":true,"message":{"id":"xm1","model":"claude-sonnet-5","role":"assistant","content":[{"type":"tool_use","id":"xt1","name":"Bash","input":{"command":"sleep 9"}}]}}'
+  rec x3 x2 P1 user "$(jq -n -c --arg t "$REJ" '[{type: "tool_result", tool_use_id: "xt1", is_error: true, content: $t}]')" '{"agentId":"x9","isSidechain":true,"toolUseResult":"User rejected tool use"}'
+  rec x4 x3 P1 user '[{"type":"text","text":"[Request interrupted by user for tool use]"}]' '{"agentId":"x9","isSidechain":true}'
+} > "$SUBF"
+check "子 agent 文件里的 User rejected tool use：按停止，发 subagent.end(cancelled)、kind = interrupt_tool、split_by = subagent_rejected，不发 permission.decision" \
+    '[ "$(map_r "$SUBF" --ledger /dev/null --parent-instance main | jq -s -c "[(map(select(.type == \"permission.decision\")) | length), (map(select(.type == \"subagent.end\")) | .[0] | [.payload.status.code, .extensions[\"vibetrail.kind\"], .extensions[\"vibetrail.split_by\"]])]")" = "[0,[\"cancelled\",\"interrupt_tool\",\"subagent_rejected\"]]" ]'
+R5=$T/k15-main.jsonl
+{ rec m1 "" P1 user '"跑一下"' '{"permissionMode":"auto","origin":{"kind":"human"}}' | jq -c '.parentUuid = null'
+  jq -n -c --arg sid "$SID" '{type: "system", subtype: "api_error", uuid: "m1e1", parentUuid: "m1", retryInMs: 600, retryAttempt: 1, sessionId: $sid, timestamp: "2026-09-15T12:00:01.000Z"}'
+  jq -n -c --arg sid "$SID" '{type: "system", subtype: "api_error", uuid: "m1e2", parentUuid: "m1e1", retryInMs: 1200, retryAttempt: 2, sessionId: $sid, timestamp: "2026-09-15T12:00:03.000Z"}'
+  rec m2 m1 P1 assistant '[]' '{"message":{"id":"mm1","model":"claude-opus-5","role":"assistant","content":[{"type":"tool_use","id":"mt1","name":"Bash","input":{"command":"rm -rf build"}}]}}'
+  rec m3 m2 P1 user "$(jq -n -c --arg t "$REJ" '[{type: "tool_result", tool_use_id: "mt1", is_error: true, content: $t}]')" '{"toolUseResult":"Error: The user doesn'"'"'t want to proceed with this tool use.","userFeedback":"别删 build"}'
+  rec m4 m3 P1 user '[{"type":"text","text":"[Request interrupted by user for tool use]"}]'
+  rec m5 m4 P2 user '"后台任务跑完了"' '{"origin":{"kind":"task-notification"}}'
+  rec m6 m5 P3 user '"换成 make clean"' '{"permissionMode":"auto","origin":{"kind":"human"}}'
+  jq -n -c --arg sid "$SID" '{type: "attachment", uuid: "m6q", parentUuid: "m6", sessionId: $sid, timestamp: "2026-09-15T12:00:09.000Z", attachment: {type: "queued_command", prompt: "顺便看下日志", commandMode: "prompt", origin: {kind: "human"}}}'
+  rec m7 m6q P3 assistant '[]' '{"message":{"id":"mm2","model":"claude-opus-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"好。"}]}}'
+} > "$R5"
+k15(){ map_r "$R5" --ledger /dev/null --close-last stop --stop-turn P3 | jq -S -s -c "$1"; }
+check "toolUseResult 以 Error: 开头（带了拒绝理由）：auto 模式下也仍是拒绝" '[ "$(k15 "[(map(select(.type == \"permission.decision\")) | length), (map(select(.extensions[\"vibetrail.kind\"] == \"interrupt_tool\")) | length)]")" = "[1,0]" ]'
+check "API 重试两次（600 + 1200 ms）记在接下来那次调用上；调用带上它发起的工具调用 id" \
+    '[ "$(k15 "map(select(.type == \"message.assistant\" and .extensions[\"vibetrail.call\"].response_id == \"mm1\")) | .[0].extensions[\"vibetrail.call\"] | [.retries, .retry_wait_ms, .tool_call_ids]")" = "[2,1800,[\"mt1\"]]" ]'
+check "origin 是 task-notification 的不算人话（不当拒绝之后的下一句）；origin 是人的算" \
+    '[ "$(k15 "[map(select(.type == \"message.user\")) | .[].payload.text]")" = "[\"换成 make clean\"]" ]'
+check "轮里插了一句话：turn.end 记 vibetrail.queued_prompts = 1（只计数、不带正文）" \
+    '[ "$(k15 "map(select(.type == \"turn.end\" and .turn_id == \"P3\")) | .[0].extensions[\"vibetrail.queued_prompts\"]")" = "1" ] && ! k15 "." | grep -q "顺便看下日志"'
 
 echo
 [ "$skipped_schema" -gt 0 ] && echo "  ⚠ 本机 python3 没有 jsonschema，协议 schema 校验跳过 $skipped_schema 处（pip install jsonschema 后重跑）"

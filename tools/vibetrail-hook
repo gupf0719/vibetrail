@@ -10,6 +10,9 @@
 #                       stop_hook_summary 要等下一句人话才落盘，不能等它）。被别的 Stop hook 拦下后同一轮再来一次 Stop，再发一条更新后的 turn.end（配 async: true）
 #   SubagentStart/Stop  发 subagent.start / subagent.end（实例 = agent_id，父实例与派生调用取 meta.json）；Stop 时再扫一遍子 agent 文件
 #   SessionEnd          发 session.end（reason）→ 解析并关掉最后一轮
+#   PermissionRequest   弹权限框时：记一份证据（时间、工具名、agent_id、permission_mode，不带参数）进 state/<sid>/perms/，发 ext.claude.permission_request。
+#                       解析时映射层拿它分「人拒绝」与「按停止打断正在跑的工具」——两者写进 transcript 的逐字一样（K7）。像同步 hook 一样丢后台：
+#                       这类 hook 能替人回答权限，Claude Code 可能等它，不能拖慢弹框
 #   PostToolUseFailure / PermissionDenied / StopFailure / Notification / InstructionsLoaded / CwdChanged
 #                       只记事件头，发 ext.claude.<事件名>（不带正文，D5）；StopFailure 另记进本轮，关轮时 status 取 error。
 #                       PostToolUseFailure 带 is_interrupt 时等打断记录落盘后当场解析（二进制里工具抛中止错误时置 true；desktop 按停止实测不触发，
@@ -182,6 +185,8 @@ process_file(){ # process_file <sid> <state 目录> <文件> <名> [close_last] 
     elif [ -n "$close" ]; then
         extra_args=(--close-last "$close")
     fi
+    vt_hook_perms "$sid" > "$tmp/perms"   # 权限框证据：分「人拒绝」与「按停止」（K7）
+    extra_args+=(--hook-perms "$tmp/perms" --perm-since "$(vt_conf permission_request_since "")")
     # bash 3.2 + set -u：空数组展开会报 unbound，写成 ${a[@]+"${a[@]}"}
     bash "$SELF/vibetrail-map" "$f" --sid "$sid" --project-id "$project" --workspace-id "$workspace" \
         --start-line "$ckl" --start-byte "$ckb" --from-line "$lines" --seen-uuids "$seen" \
@@ -257,7 +262,7 @@ catch_up(){ # 本仓与所有登记过的仓，每个 worktree 对应的 Claude 
                  [ -d "$repo" ] && git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p'
              done | awk '!seen[$0]++')
     [ -n "$main" ] || { [ -f "$tpath" ] && process_session "$sid" "$tpath" "$([ "$source" = resume ] && echo resume)"; }   # scope=user 且不在 git 仓
-    find "$VT_HOME/state" -path '*/turns/*.json' -mtime +14 -delete 2>/dev/null   # 轮次证据留两周够关轮用
+    find "$VT_HOME/state" \( -path '*/turns/*.json' -o -path '*/perms/*.json' \) -mtime +14 -delete 2>/dev/null   # 轮次、权限框证据留两周够用
 }
 
 run(){ # 门控通过之后按事件干活
@@ -278,9 +283,16 @@ run(){ # 门控通过之后按事件干活
         SubagentStart|subagent-start)
             [ -n "$agent_id" ] && emit_hook SubagentStart null "$(extra_subagent)" ;;
         SubagentStop|subagent-stop)
-            [ -n "$agent_id" ] && emit_hook SubagentStop null "$(extra_subagent)"
-            if [ -n "$agent_id" ]; then   # 它结束了：记下此刻文件的大小，之后读到末尾、文件没再长，才把最后一次调用写出
-                local af="$(dirname "$tpath")/$sid/subagents/agent-$agent_id.jsonl"
+            local atype af
+            IFS=$'\x1f' read -r atype af < <(printf '%s' "$payload" | "$JQ" -r '[(.agent_type // ""), (.agent_transcript_path // "")] | join("\u001f")' 2>/dev/null)
+            if [ -n "$agent_id" ] && [ -z "${atype:-}" ]; then
+                # 压缩、起标题、提示建议这类 Claude Code 内部 agent：agent_type 为空、没有 SubagentStart、也没有 transcript（2.1.266 二进制，K9）——
+                # 不当子 agent 发 subagent.end，只记一条事件头
+                emit_hook SubagentStop null '{"internal": true}'
+            elif [ -n "$agent_id" ]; then
+                emit_hook SubagentStop null "$(extra_subagent)"
+                # 它结束了：记下此刻文件的大小，之后读到末尾、文件没再长，才把最后一次调用写出。路径以 payload 给的为准（workflow 的子 agent 不在 subagents/ 这一层）
+                [ -n "${af:-}" ] || af="$(dirname "$tpath")/$sid/subagents/agent-$agent_id.jsonl"
                 [ -f "$af" ] && { wait_stable "$af"; mkdir -p "$SD" && wc -c < "$af" | tr -d ' ' > "$SD/agent-$agent_id.done"; }
             fi
             [ -f "$tpath" ] && process_session "$sid" "$tpath" ;;
@@ -311,6 +323,12 @@ run(){ # 门控通过之后按事件干活
                 idle_prompt) [ -f "$tpath" ] && process_session "$sid" "$tpath" ;;   # 空闲：把没采完的补上，不另发事件
                 *) emit_hook "$event" null '{}' ;;
             esac ;;
+        PermissionRequest)
+            mkdir -p "$SD/perms" \
+                && printf '%s' "$payload" | "$JQ" -c --arg at "$(now_iso)" \
+                    '{at: $at, tool_name: (.tool_name // null), agent_id: (.agent_id // null), prompt_id: (.prompt_id // null), permission_mode: (.permission_mode // null)}' \
+                    > "$SD/perms/$(date +%s)-$$.json" 2>/dev/null
+            emit_hook "$event" null '{}' ;;
         PermissionDenied|CwdChanged)
             emit_hook "$event" null '{}' ;;
         CatchUp)   # 不是 Claude Code 的事件：vibetrail sync 要求把登记过的仓里落后的 transcript 补一遍（与 SessionStart 的补做相同），不发任何事件
@@ -320,8 +338,8 @@ run(){ # 门控通过之后按事件干活
 }
 
 case "$event" in
-    SessionStart|session-start|UserPromptSubmit|user-prompt-submit|SessionEnd|session-end)
-        # 同步 hook：丢到脱离的后台进程里做，自己立刻退出
+    SessionStart|session-start|UserPromptSubmit|user-prompt-submit|SessionEnd|session-end|PermissionRequest)
+        # 同步 hook（与可能被同步等的 PermissionRequest）：丢到脱离的后台进程里做，自己立刻退出
         if [ "${VIBETRAIL_FOREGROUND:-0}" = "1" ]; then gate && run
         else ( gate && run ) </dev/null >/dev/null 2>&1 & disown; fi ;;
     *) gate && run ;;

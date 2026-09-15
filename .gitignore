@@ -1,1 +1,3 @@
 .DS_Store
+# 演示报告的本地输出（desktop 的文件查看器只开得了工作目录里的文件，report.sh -o 写到这里）
+experiments/collect-demo/out/

@@ -73,6 +73,27 @@ Bash 改的，不是人）；`attachment.hook_blocking_error` 332 条（宿主�
 `StopFailure`、`Notification` 的 `permission_prompt`。都先按 §3 的方式量精确率，再决定加不加 kind（OPEN-ISSUES U8）。
 G7 的 hook 事件流会记下它们的 `tool_use_id`，与本文的字符串判定对账——两边对不上就是判据漂了，这正是 G6 要的哨兵。
 
+### 2.3 映射层的二次判定：`permission_denied` 里有一部分是「按停止」（K7，2026-09-15）
+
+按停止打断正在跑的工具时，Claude Code 给没跑完的工具写的合成结果与在权限框里点拒绝**逐字一样**（正文 `The user doesn't want to proceed with this tool use…`、
+`toolUseResult` `User rejected tool use`，后面同样跟 `[Request interrupted by user for tool use]`）。本节的记录级判据分不开它们，规则 2 不改——
+提取器照旧输出 `permission_denied`。**映射层**（`tools/map-events.jq` 的 `splitStop`）按上下文再判一次，只针对这一种正文
+（`^Permission to use .* has been denied` 是权限流程写的，只会是拒绝）：
+
+1. 拒绝的时刻 PermissionRequest hook 已经挂上：调用与拒绝之间（前后各放 5 s）弹过同名工具的权限框就是拒绝，没弹过是按停止。
+   按工具名与时间对，不比参数（hook 的 `tool_input` 与 transcript 里的 `input` 不保证逐字一样）。PermissionRequest 只在真弹框时触发（2.1.266 二进制）。
+2. 子 agent 文件：`toolUseResult` 是 `User rejected tool use` 就是按停止——子 agent 里点拒绝记的是 `Error: …` 加 `userFeedback`（二进制读出，本机没有样本）。
+3. 没挂上：看这一轮人话记录的 `permissionMode`——`auto`、`bypassPermissions`、`dontAsk` 几乎不弹框，算按停止；其余仍算拒绝。
+   auto 模式在分类器拿不准时也会弹框，所以这一条是粗分，不是定论。
+4. 都没有（老版本没有 `permissionMode`）：仍算拒绝。
+
+`toolUseResult` 以 `Error:` 开头的（写了拒绝理由）不走本节，只会是拒绝。
+
+判成按停止的：不发 `permission.decision`，改在随后的 `interrupt_for_tool_use` 记录处发 `turn.end(interrupted)`（子 agent 是 `subagent.end(cancelled)`），
+`vibetrail.kind` = `interrupt_tool`，连同被打断的回复与工具调用（与 `interrupt` 同一套）。两种结论都带 `vibetrail.split_by`
+（`permission_request` / `permission_mode`）与 `vibetrail.permission_mode`，拒绝另带 `vibetrail.prompt_shown`。
+§3 的「精确率 100%」说的是「这是人的动作」；对「这是拒绝」不成立——本机 3 条 user-rejected（其中 2 条是同一条被 desktop 复制进两个会话，K8；另一条是 09-15 请用户按停止的实测）全在 auto 模式的轮里，按本节都是按停止。
+
 ## 3. 准确率实测
 
 2026-09-08，755 个会话 / 674 MB：
