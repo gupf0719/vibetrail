@@ -5,7 +5,9 @@
 #
 # 1. 在沙箱里建一个 git 仓当被观测项目，在仓里跑 vibetrail init（写沙箱的 settings.json、登记本仓）
 # 2. 按 scenario.json 回放一段会话：往沙箱的 transcript 追加记录；轮到 hook 时，用沙箱 settings.json 里 init 真实写下的那条命令去跑，
-#    stdin 给 Claude Code 同样形状的 payload（prompt_id 取当轮的 promptId）。第 1 轮中途在仓里真的提交一次，演示 commit ↔ 轮次
+#    stdin 给 Claude Code 同样形状的 payload（prompt_id 取当轮的 promptId）。第 1 轮中途在仓里真的提交一次，演示 commit ↔ 轮次。
+#    每次 Stop 之前照 Claude Code 的顺序先写一条 stop_hook_summary（它跑完 Stop hook 就写，是「模型答完」的标记，DESIGN D7）。
+#    会话结束前再加一轮：第一次 Stop 被别的 Stop hook 拦下（先写拦停反馈、再写 summary），模型补完再 Stop——这一轮只出一条 turn.end，带两次提交
 # 3. vibetrail list / show / doctor，最后列出 spool 目录与被观测仓的 git status（零写入）
 # 跑完沙箱留着，想翻原始文件就进去看；不想留就 rm -rf 它。
 set -uo pipefail
@@ -40,9 +42,51 @@ jq -c '.steps | to_entries as $s | $s[] | .key as $i | .value
              then ([$s[] | select(.key > $i) | .value.append? | select(.type == "user") | .promptId][0])
              else ([$s[] | select(.key < $i) | .value.append? | select(.type == "user") | .promptId] | last) end)})}
          else . end' "$SC" > "$D/steps.jsonl"
+now_ms(){ jq -n -r 'now | (floor | todate | sub("Z$"; "")) + "." + ((. * 1000 | floor) % 1000 | tostring | ("00" + .)[-3:]) + "Z"'; }
+append(){ # append <记录 JSON>：补上会话公共字段与此刻的时间戳，接到 transcript 末尾
+    printf '%s' "$1" | jq -c --arg sid "$SID" --arg cwd "$REPO" --arg ts "$(now_ms)" \
+        '. + {sessionId: $sid, cwd: $cwd, timestamp: $ts, version: "2.1.266", entrypoint: "cli", gitBranch: "main", isSidechain: false}' >> "$TR"
+    sleep 0.05
+}
+summary(){ # summary <拦停原因，空＝没拦>：Claude Code 跑完这次 Stop 的 hook 后写的记录
+    append "$(jq -n -c --arg e "${1:-}" '{type: "system", subtype: "stop_hook_summary", uuid: ("sum-" + (now | tostring)), hookCount: 2,
+        hookInfos: [{command: "callback"}, {command: "vibetrail-hook Stop"}], hookErrors: (if $e == "" then [] else [$e] end),
+        hookAdditionalContext: [], preventedContinuation: false, stopReason: "", hasOutput: ($e != ""), level: "suggestion"}')"
+}
+fire(){ # fire <事件> [额外 payload 字段 JSON]：用 settings 里写下的命令触发一次 hook
+    local ev=$1 extra=${2:-} cmd out rc; [ -n "$extra" ] || extra='{}'
+    cmd=$(jq -r --arg ev "$ev" '.hooks[$ev][]?.hooks[]? | select(.command | contains("vibetrail-hook")) | .command' "$VIBETRAIL_CLAUDE_SETTINGS" | head -1)
+    jq -n -c --arg sid "$SID" --arg tp "$TR" --arg cwd "$REPO" --arg ev "$ev" --argjson x "$extra" \
+        '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: $ev, permission_mode: "default"} + $x' > "$D/payload.json"
+    out=$(sh -c "$cmd" < "$D/payload.json" 2>&1); rc=$?
+    printf '  +  %-18s exit=%s stdout=%s  prompt_id=%s\n' "$ev" "$rc" "$( [ -z "$out" ] && echo 空 || echo "非空！" )" "$(jq -r '.prompt_id // "-"' "$D/payload.json")"
+}
 n=0
 while IFS= read -r step; do
     n=$((n + 1))
+    if [ "$(printf '%s' "$step" | jq -r '.hook.hook_event_name // ""')" = SessionEnd ]; then
+        # ---- 会话结束前加一轮：第一次 Stop 被别的 Stop hook 拦下，模型补完再 Stop ----
+        echo "  ── 加一轮：第一次 Stop 被别的 Stop hook 拦下（照 agentDock 的审计闸门），模型补完再 Stop ──"
+        fire UserPromptSubmit '{"prompt":"把 README 也补一句","prompt_id":"prompt-4"}'
+        append '{"type":"user","uuid":"b4-u1","parentUuid":null,"promptId":"prompt-4","message":{"role":"user","content":"把 README 也补一句"}}'
+        append '{"type":"assistant","uuid":"b4-a1","parentUuid":"b4-u1","requestId":"rb1","message":{"id":"mb1","role":"assistant","model":"claude-opus-5","stop_reason":"tool_use","content":[{"type":"tool_use","id":"tb1","name":"Bash","input":{"command":"git commit -am \"README: 补一句\""}}],"usage":{"input_tokens":40,"output_tokens":20}}}'
+        ( cd "$REPO" && echo "# demo" >> README.md && git add README.md && git commit -q -m "README: 补一句" && echo "     ↳ 仓里提交了一次：$(git log -1 --format='%h %s')" )
+        append '{"type":"user","uuid":"b4-u2","parentUuid":"b4-a1","promptId":"prompt-4","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tb1","content":"[main] README: 补一句"}]}}'
+        append '{"type":"assistant","uuid":"b4-a2","parentUuid":"b4-u2","requestId":"rb2","message":{"id":"mb2","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"补好了。"}],"usage":{"input_tokens":60,"output_tokens":8}}}'
+        # 别的 Stop hook 拦下：拦停反馈先写，summary 后写（2.1.266 的顺序），模型在同一个 promptId 下接着干
+        append '{"type":"attachment","uuid":"b4-h1","parentUuid":"b4-a2","attachment":{"type":"hook_blocking_error","hookName":"Stop","hookEvent":"Stop","blockingError":{"blockingError":"缺审计记录，先补一条再结束","command":"check-audit-stop.sh"}}}'
+        append '{"type":"user","uuid":"b4-u3","parentUuid":"b4-h1","promptId":"prompt-4","isMeta":true,"message":{"role":"user","content":"Stop hook feedback:\n缺审计记录，先补一条再结束"}}'
+        summary "缺审计记录，先补一条再结束"
+        fire Stop '{"prompt_id":"prompt-4","stop_hook_active":false}'
+        echo "     ↳ 第一次 Stop 被拦下之后：prompt-4 的 turn.end 有 $(cat "$VIBETRAIL_HOME"/spool/*/*/*.jsonl | jq -s '[.[] | select(.type == "turn.end" and .turn_id == "prompt-4")] | length') 条（应为 0）"
+        append '{"type":"assistant","uuid":"b4-a3","parentUuid":"b4-u3","requestId":"rb3","message":{"id":"mb3","role":"assistant","model":"claude-opus-5","stop_reason":"tool_use","content":[{"type":"tool_use","id":"tb2","name":"Bash","input":{"command":"git commit -am \"audit: 补记录\""}}],"usage":{"input_tokens":80,"output_tokens":20}}}'
+        ( cd "$REPO" && echo "audit ok" > AUDIT.md && git add AUDIT.md && git commit -q -m "audit: 补记录" && echo "     ↳ 仓里又提交了一次：$(git log -1 --format='%h %s')" )
+        append '{"type":"user","uuid":"b4-u4","parentUuid":"b4-a3","promptId":"prompt-4","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tb2","content":"[main] audit: 补记录"}]}}'
+        append '{"type":"assistant","uuid":"b4-a4","parentUuid":"b4-u4","requestId":"rb4","message":{"id":"mb4","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"审计记录补上了。"}],"usage":{"input_tokens":90,"output_tokens":10}}}'
+        summary ""
+        fire Stop '{"prompt_id":"prompt-4","stop_hook_active":true}'
+        echo "     ↳ 第二次 Stop 之后：prompt-4 的 turn.end 有 $(cat "$VIBETRAIL_HOME"/spool/*/*/*.jsonl | jq -s '[.[] | select(.type == "turn.end" and .turn_id == "prompt-4")] | length') 条（应为 1）"
+    fi
     if [ "$(printf '%s' "$step" | jq 'has("append")')" = true ]; then
         # 记录的时间戳换成此刻（场景里写的是 09-11 的固定时间），与 hook 事件的时间对得上
         printf '%s' "$step" | jq -c --arg cwd "$REPO" \
@@ -58,6 +102,7 @@ while IFS= read -r step; do
     fi
     cmd=$(jq -r --arg ev "$ev" '.hooks[$ev][]?.hooks[]? | select(.command | contains("vibetrail-hook")) | .command' "$VIBETRAIL_CLAUDE_SETTINGS" | head -1)
     if [ -z "$cmd" ]; then printf '  %2d %-18s （没挂 vibetrail）\n' "$n" "$ev"; continue; fi
+    [ "$ev" = Stop ] && summary ""     # Claude Code 跑完 Stop hook 后写的「模型答完」标记（场景文件是 09-11 录的，那时还没这条）
     printf '%s' "$step" | jq -c --arg sid "$SID" --arg tp "$TR" --arg cwd "$REPO" \
         '.hook | .session_id = $sid | .transcript_path = $tp | .cwd = $cwd | if .prompt_id == null then del(.prompt_id) else . end' > "$D/payload.json"
     out=$(sh -c "$cmd" < "$D/payload.json" 2>&1); rc=$?

@@ -16,9 +16,9 @@
 #   --sources-out FILE 把本次新读到的触发记录与人话记录按同样格式追加进去（下一次的 --seen-uuids 用它）
 #   --hook-turns FILE  hook 记的轮次证据（vt_hook_turns 的输出：{<turn_id>: {start, stop, gap, fail}}），关轮时拼 status / vcs / commits；
 #                      不给就当 {}（轮次事件照发，只是没有 HEAD、commit，status 多是 unknown）
-#   --no-turns         只出分歧事件，不切轮（默认切轮：主会话按 promptId 切，turn.start 补位、轮确定结束后发 turn.end）；
+#   --no-turns         只出分歧事件，不切轮（默认切轮：主会话按 promptId 切，turn.start 补位、模型答完（stop_hook_summary 前没有拦停反馈）或拒绝停下时发 turn.end）；
 #                      分歧判据的回归 test-map.sh 用它，golden 只钉分歧那部分
-#   --close-last WHY   把文件里最后一轮也关掉（WHY = session_end / resume / idle，记进 vibetrail.closed_by）；默认不关，等下一轮开始再关
+#   --close-last WHY   把文件里最后一轮也关掉（WHY = session_end / resume / idle，记进 vibetrail.closed_by）；默认不关：没有答完标记的轮等下一轮开始再关
 #   --ledger FILE  账本写到文件（默认写 stderr）：进出条数、反查方式、下次的 start / from 行、消费到的字节数
 #
 # 只读 transcript，不复制、不在它旁边写东西；产物只有 stdout 与账本。只解析到源文件最后一个换行符（源可能正在写半行）。

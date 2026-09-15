@@ -31,12 +31,14 @@
 # 轮次元数据（DESIGN §3.1、§4.1，09-15 加；与分歧同一条事件流，$turns 默认 true，只有分歧判据的回归传 false）：
 #      主会话文件按 promptId 切轮——hook 的 prompt_id 与记录的 promptId 是同一个值
 #      （09-15 本机探针实测），轮中插话不换 promptId。每轮开头发 turn.start（hook 已经发过的同 event_id 在写 spool 前被拦下，
-#      这里是 hook 没跑时的补位）；**轮确定结束了才发 turn.end**：下一轮开始、或 $close_last（会话结束 / 恢复 / 空闲）。
-#      不在 Stop 当场发：别的 Stop hook 拦停时同一轮会接着干活、再来一次 Stop（agentDock 的审计闸门就会拦，DESIGN D7），当场发会丢掉续上那段的
-#      commit 与用量。status 取证据：被打断的轮已由分歧一路发了 turn.end(interrupted)，这里不再发；拒绝后停下的轮 denied；
-#      hook 记到本轮开始后的 Stop 是 completed；只有 StopFailure 是 error；什么证据都没有是 unknown。vcs / commits 来自 $hook_turns
-#      （Stop 时 hook 按轮起 HEAD 算好的，DESIGN §3.5）；用量是本轮 assistant 记录按 message.id 去重求和（与打断同一定义）。
-#      子 agent 文件不切轮：子 agent 的起止由 SubagentStart / SubagentStop hook 发。
+#      这里是 hook 没跑时的补位）。**turn.end 在模型答完的那一刻发**（DESIGN D7，09-15 按用户意见改）：Claude Code 每次 Stop 跑完 hook 都写一条
+#      system/stop_hook_summary；别的 Stop hook 拦停时，拦停反馈（attachment hook_blocking_error、hook_additional_context，或 isMeta 的
+#      「Stop hook feedback:」人话）写在这条 summary **之前**，模型随后在同一个 promptId 下接着干。所以：读到 summary、而它和上一条模型回复之间
+#      没有拦停反馈，这一轮就结束了（closed_by = stop）；有反馈就等下一条 summary。拒绝后停下的轮在 for-tool-use 打断记录处关（denied）；
+#      被打断的轮由分歧一路发 turn.end(interrupted)。没有这些标记时退到兜底：下一轮开始、或 $close_last（会话结束 / 恢复 / 空闲）。
+#      status：summary 或 hook 记到的 Stop 是 completed；summary 里 preventedContinuation 是 hook_stopped；只有 StopFailure 是 error；
+#      什么证据都没有是 unknown。vcs / commits 来自 $hook_turns（Stop 时 hook 按轮起 HEAD 算好的，DESIGN §3.5）；
+#      用量是本轮 assistant 记录按 message.id 去重求和（与打断同一定义）。子 agent 文件不切轮：子 agent 的起止由 SubagentStart / SubagentStop hook 发。
 
 include "diverge-rules";
 
@@ -201,6 +203,50 @@ def commitsOf($end): if ($end.commits | type) == "array" and ($end.commits | len
   then [$end.commits[] | select(type == "string") | {sha: ., relation: "observed", evidence: "before_after"}] else null end;
 def mainRec($r): ($r.isSidechain != true) and ($r.agentId == null);
 
+# ---------- 轮次元数据：开轮 / 关轮 / 累计（DESIGN §3.1、§4.1） ----------
+def openTurn($s):
+  .pturn = {id: $s.promptId, line: $s.ln, last_ts: $s.ts, usage: {}, model: null,
+            interrupted: false, denied: false, git_commit: false, closed: false, end_turn: false, stop_blocked: false, summary: null}
+  | (if $s.ln > $from_line then .ledger.turns.started += 1 else . end)
+  | hookTurn($s.promptId) as $h | vcsMerge(.branch; $h.start.vcs) as $vcs
+  | emit( base($s; "turn.start"; $s.uuid; $s.ts; {id: $s.promptId, inferred: false})
+          | .provenance = {kind: "transcript", rule_version: "turn-v1", source_event_id: $s.uuid}
+          | .payload = opt("vcs"; $vcs)
+          | ._key = ($s.promptId + "|turn.start") );
+
+def closeTurn($how; $s; $eof):
+  if .pturn == null or .pturn.closed or .pturn.interrupted then .
+  else
+    .pturn as $pt | hookTurn($pt.id) as $h | hookStop($h) as $stop | hookEnd($h) as $end
+    | ($eof or .ln > $from_line) as $new
+    # 结束的依据按强弱排：stop_hook_summary（Claude Code 自己写的答完标记）> hook 记到的 Stop > 最后一条模型回复 stop_reason 是 end_turn
+    # （模型自己说完了，但 Stop hook 的判定没落盘，比如会话紧接着被关掉，09-15 本机语料里见过）
+    | (if $pt.summary != null then "stop_hook_summary" elif $stop != null then "hook_stop"
+     elif $h.fail != null then "stop_failure" elif $pt.end_turn then "end_turn" else "none" end) as $evidence
+    | (if $pt.denied then {code: "denied", category: "denial", detail: "turn stopped by a permission denial"}
+       elif $pt.summary.prevented == true then {code: "hook_stopped", category: "cancellation", detail: (($pt.summary.reason // "") | .[0:4096])}
+       elif $evidence == "stop_hook_summary" or $evidence == "hook_stop" or $evidence == "end_turn" then {code: "completed", category: "success"}
+       elif $evidence == "stop_failure" then {code: (($h.fail.error // "error") | codeify), category: "error"}
+       else {code: "unknown", category: "unknown"} end) as $status
+    | usageOf($pt.usage) as $usage | vcsMerge(.branch; $end.vcs) as $vcs | commitsOf($end) as $commits
+    | (base($s; "turn.end"; null; ($pt.summary.ts // $stop.at // $pt.last_ts); {id: $pt.id, inferred: false})
+       | .provenance = ({kind: "transcript", rule_version: "turn-v1"}
+                        + (if $pt.summary != null or $stop != null then {source_event: "Stop"} else {} end)
+                        + opt("source_event_id"; $pt.summary.uuid))
+       | .payload = ({status: $status} + opt("model"; $pt.model) + opt("usage"; $usage) + opt("vcs"; $vcs))
+       | (if $commits != null
+          then .commits = $commits
+               | .extensions += {"vibetrail.commit_method": ($end.commit_method // "rev-list"),
+                                 "vibetrail.commit_attribution": (if $pt.git_commit then "agent_tool" else "inferred" end)}
+          else . end)
+       | .extensions += ({"vibetrail.closed_by": $how, "vibetrail.end_evidence": (if $pt.denied then "denial" else $evidence end),
+                          "vibetrail.stops": ($stop.stops // 0)} + opt("vibetrail.dirty_files"; $end.vcs.dirty_files))
+       | ._key = ($pt.id + "|turn.end")) as $e
+    | (if $eof then emitAlways($e) else emit($e) end)
+    | (if $new then .ledger.turns.ended[$status.code] += 1 else . end)
+    | .pturn.closed = true
+  end;
+
 def turnStart: if .turn_line > 0 then .turn_line else $start_line end;
 def addPending($uuid; $kind):
   turnStart as $ts
@@ -294,8 +340,8 @@ def interrupted($r; $s; $h; $detail):
 def forToolUse($r; $s; $h):
   if (.denials | length) > 0
   then .ledger.absorbed_for_tool_use += 1 | addPending($s.uuid; "interrupt_for_tool_use")
-       # 这一轮是被拒绝停下的：关轮时 status 记 denied（不算打断，打断只数 turn.end(interrupted)，K5）
-       | (if .pturn != null and .pturn.id == turnOf($s).id then .pturn.denied = true else . end)
+       # 这一轮是被拒绝停下的：当场关轮，status 记 denied（不算打断，打断只数 turn.end(interrupted)，K5）
+       | (if .pturn != null and .pturn.id == turnOf($s).id then .pturn.denied = true | closeTurn("denied"; $s; false) else . end)
   else .ledger.unpaired_for_tool_use += 1 | interrupted($r; $s; $h; "unpaired interrupt_for_tool_use: " + $s.text) end;
 
 def handle($r; $s; $h):
@@ -313,42 +359,6 @@ def emitAfter($s):
          {"vibetrail.after": $p.after, "vibetrail.after_kind": $p.kind} + (if $s.slash then {"vibetrail.slash_command": true} else {} end)))
   | (if $s.human then .pending = null else . end);
 
-# ---------- 轮次元数据：开轮 / 关轮 / 累计（DESIGN §3.1、§4.1） ----------
-def openTurn($s):
-  .pturn = {id: $s.promptId, line: $s.ln, last_ts: $s.ts, usage: {}, model: null,
-            interrupted: false, denied: false, git_commit: false, closed: false}
-  | (if $s.ln > $from_line then .ledger.turns.started += 1 else . end)
-  | hookTurn($s.promptId) as $h | vcsMerge(.branch; $h.start.vcs) as $vcs
-  | emit( base($s; "turn.start"; $s.uuid; $s.ts; {id: $s.promptId, inferred: false})
-          | .provenance = {kind: "transcript", rule_version: "turn-v1", source_event_id: $s.uuid}
-          | .payload = opt("vcs"; $vcs)
-          | ._key = ($s.promptId + "|turn.start") );
-
-def closeTurn($how; $s; $eof):
-  if .pturn == null or .pturn.closed or .pturn.interrupted then .
-  else
-    .pturn as $pt | hookTurn($pt.id) as $h | hookStop($h) as $stop | hookEnd($h) as $end
-    | ($eof or .ln > $from_line) as $new
-    | (if $pt.denied then {code: "denied", category: "denial", detail: "turn stopped by a permission denial"}
-       elif $stop != null then {code: "completed", category: "success"}
-       elif $h.fail != null then {code: (($h.fail.error // "error") | codeify), category: "error"}
-       else {code: "unknown", category: "unknown"} end) as $status
-    | usageOf($pt.usage) as $usage | vcsMerge(.branch; $end.vcs) as $vcs | commitsOf($end) as $commits
-    | (base($s; "turn.end"; null; ($stop.at // $pt.last_ts); {id: $pt.id, inferred: false})
-       | .provenance = ({kind: "transcript", rule_version: "turn-v1"} + (if $stop != null then {source_event: "Stop"} else {} end))
-       | .payload = ({status: $status} + opt("model"; $pt.model) + opt("usage"; $usage) + opt("vcs"; $vcs))
-       | (if $commits != null
-          then .commits = $commits
-               | .extensions += {"vibetrail.commit_method": ($end.commit_method // "rev-list"),
-                                 "vibetrail.commit_attribution": (if $pt.git_commit then "agent_tool" else "inferred" end)}
-          else . end)
-       | .extensions += ({"vibetrail.closed_by": $how, "vibetrail.stops": ($stop.stops // 0)} + opt("vibetrail.dirty_files"; $end.vcs.dirty_files))
-       | ._key = ($pt.id + "|turn.end")) as $e
-    | (if $eof then emitAlways($e) else emit($e) end)
-    | (if $new then .ledger.turns.ended[$status.code] += 1 else . end)
-    | .pturn.closed = true
-  end;
-
 def turnBoundary($r; $s):   # 主会话里 promptId 换了：上一轮关、这一轮开
   if $turns and mainRec($r) and $r.type == "user" and ($r.promptId | type) == "string" and $r.promptId != (.pturn.id // null)
   then closeTurn("next_turn"; $s; false) | openTurn($s)
@@ -356,9 +366,28 @@ def turnBoundary($r; $s):   # 主会话里 promptId 换了：上一轮关、这�
 
 # agent 自己用 Bash 跑了 git commit：本轮观察到的 commit 归因标 agent_tool，否则 inferred（人可能在别的终端提交，DESIGN §3.5）
 def gitCommitCmd: type == "string" and test("(^|[;&|(\\s])git(\\s+-[Cc]\\s+\\S+|\\s+--no-pager)*\\s+commit(\\s|$)");
+# 别的 Stop hook 拦停的痕迹：写在这次 Stop 的 stop_hook_summary 之前（2.1.266 二进制核过顺序），模型随后在同一轮接着干
+def stopFeedback($r; $s):
+  ($r.type == "attachment" and ($r.attachment | type) == "object"
+     and (($r.attachment.type // "") | test("^hook_(blocking_error|additional_context)$"))
+     and (($r.attachment.hookEvent // "") | test("^(Stop|SubagentStop)$")))
+  or ($r.type == "user" and ($s.text | test("^(Stop|SubagentStop) hook feedback:")));
+
+# 模型答完的标记：Claude Code 跑完这次 Stop 的 hook 写的 stop_hook_summary。前面没有拦停痕迹就当场关轮
+def turnStopMarker($r; $s):
+  if .pturn != null and (.pturn.closed | not) and mainRec($r) and $r.type == "system" and $r.subtype == "stop_hook_summary"
+  then if (.pturn.stop_blocked // false) then .pturn.stop_blocked = false
+       else .pturn.summary = {uuid: $s.uuid, ts: $s.ts, prevented: ($r.preventedContinuation == true), reason: ($r.stopReason // "")}
+            | closeTurn("stop"; $s; false) end
+  else . end;
+
 def turnAccumulate($r; $s):
   if .pturn == null or (mainRec($r) | not) then .
   else .pturn.last_ts = ($s.ts // .pturn.last_ts)
+    | (if $s.type == "assistant" and ($s.synthetic | not)
+       then .pturn.stop_blocked = false | .pturn.end_turn = (($r.message | if type == "object" then .stop_reason else null end) == "end_turn")
+       else . end)
+    | (if stopFeedback($r; $s) then .pturn.stop_blocked = true else . end)
     | (if $s.type == "assistant" and $s.usage != null and ($s.synthetic | not)
        then ($s.mid // $s.rid // $s.uuid) as $uk
             | (if ((.pturn.usage[$uk].output_tokens // -1) > ($s.usage.output_tokens // 0)) then . else .pturn.usage[$uk] = $s.usage end)
@@ -391,6 +420,7 @@ def step($r):
               | (if ((.turn_usage[$uk].output_tokens // -1) > ($s.usage.output_tokens // 0)) then . else .turn_usage[$uk] = $s.usage end)
               | .turn_model = ($s.model // .turn_model) else . end)
       | turnAccumulate($r; $s)
+      | turnStopMarker($r; $s)
       | (if $ln > $from_line and $keyrec then .ledger.sources += [[$s.uuid, $ln]] else . end)
       | (if ($r.toolUseResult | type) == "string" and ($r.toolUseResult | startswith("User rejected tool use"))
          then .ledger.sentinel.marker += 1

@@ -166,15 +166,16 @@ vt_commits(){ # vt_commits <目录> <轮起 HEAD> <轮起时间 epoch> → 一�
     # 本轮的 commit = 现在的 HEAD 与本轮 reflog 里「新建提交」那几类操作留下的 sha，减去轮起 HEAD 能到的。
     # 起是止的祖先时就是 rev-list 起..止；rebase / reset / 切分支后又提交时，reflog 那一路把新提交补回来，切到已有分支不会被算进来。
     # 人在别的终端提交也会被算进当轮——区分靠映射层看 transcript 里有没有 agent 的 git commit 调用（commit_attribution）
-    local d=$1 start=$2 since=$3 end tips list method=rev-list
+    local d=$1 start=$2 since=$3 end tips list base method=rev-list
     [ -n "$start" ] || { echo null; return 0; }
     end=$(GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse -q --verify HEAD 2>/dev/null) || { echo null; return 0; }
     tips=$(GIT_OPTIONAL_LOCKS=0 git -C "$d" reflog --date=unix --format='%gd%x09%H%x09%gs' HEAD 2>/dev/null | awk -F'\t' -v since="${since:-0}" '
         { t = $1; sub(/^.*@\{/, "", t); sub(/\}$/, "", t); if (t + 0 < since + 0) exit
           if ($3 ~ /^(commit|cherry-pick|revert|merge|rebase|pull|am)/) print $2 }' | sort -u)
-    if [ -n "$tips" ] && [ -n "$(printf '%s\n' "$tips" | grep -vxF "$end")" ]; then method=reflog; fi
     # shellcheck disable=SC2086
     list=$(GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-list --reverse -n 256 "$end" $tips "^$start" 2>/dev/null) || { echo null; return 0; }
+    base=$(GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-list --reverse -n 256 "$end" "^$start" 2>/dev/null)
+    [ "$list" = "$base" ] || method=reflog      # reflog 真补出了 rev-list 起..止 之外的提交（rebase、切分支后提交）才标 reflog
     printf '%s\n' "$list" | "${JQ:-jq}" -R -s -c --arg m "$method" '{commits: (split("\n") | map(select(test("^[0-9a-f]{40,64}$")))), method: $m}'
 }
 

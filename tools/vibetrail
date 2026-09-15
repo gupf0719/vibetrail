@@ -95,20 +95,23 @@ hook_command(){ # 条目里的命令：绝对路径、单引号包住（路径�
     printf "/bin/bash '%s' %s" "$(printf '%s' "$p" | sed "s/'/'\\\\''/g")" "$1"
 }
 
-entries_json(){ # entries_json <事件…> → [{event, group}]：每个事件一个 matcher 组，timeout 显式给（§3.4）
-    local ev out="" t a m
+entries_json(){ # entries_json <事件…> → [{event, group}]：每个事件一个 matcher 组（Notification 两组），timeout 显式给（§3.4）
+    local ev out="" t a m ms
     for ev in "$@"; do
-        a=false; m=""
+        a=false; ms="-"
         case "$ev" in
             SessionStart|UserPromptSubmit) t=10;;           # 同步：hook 自己立刻退出、活在后台做
             SessionEnd) t=5;;
-            Stop|SubagentStop) t=120; a=true;;             # 异步：不阻塞、不计 timeout（首次整读大会话约 12 s）
-            Notification) t=30; a=true; m=permission_prompt;;
+            Stop|SubagentStop) t=120; a=true;;             # 异步：不阻塞、不计 timeout（Stop 要等 stop_hook_summary，首次整读大会话约 12 s）
+            Notification) t=30; a=true; ms="permission_prompt idle_prompt";;   # 权限弹窗记事件头；空闲时补一次解析
             *) t=30; a=true;;
         esac
-        out="$out$("$JQ" -n -c --arg ev "$ev" --arg cmd "$(hook_command "$ev")" --argjson t "$t" --argjson a "$a" --arg m "$m" \
-            '{event: $ev, group: ((if $m != "" then {matcher: $m} else {} end)
-                                 + {hooks: [{type: "command", command: $cmd, timeout: $t} + (if $a then {async: true} else {} end)]})}')"$'\n'
+        for m in $ms; do
+            [ "$m" = "-" ] && m=""
+            out="$out$("$JQ" -n -c --arg ev "$ev" --arg cmd "$(hook_command "$ev")" --argjson t "$t" --argjson a "$a" --arg m "$m" \
+                '{event: $ev, group: ((if $m != "" then {matcher: $m} else {} end)
+                                     + {hooks: [{type: "command", command: $cmd, timeout: $t} + (if $a then {async: true} else {} end)]})}')"$'\n'
+        done
     done
     printf '%s' "$out" | "$JQ" -s -c '.'
 }

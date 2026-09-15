@@ -5,12 +5,15 @@
 #                       同会话 resume、别的会话空闲超过 turn_idle_close（默认 1 小时）时把最后一轮也关掉
 #   UserPromptSubmit    发 turn.start（turn_id = prompt_id、model、HEAD / 分支 / 脏否），记轮起快照；上一轮没等到 Stop 的补一份「止」快照。
 #                       不读 transcript（U11）
-#   Stop                记轮止快照与本轮 commit（轮起 HEAD..现在 + reflog，DESIGN §3.5）→ 等 transcript 写稳 → 从本轮开头解析主文件与
-#                       subagents/ 下全部文件：分歧事件 + 已经确定结束的轮的 turn.end（配 async: true）
+#   Stop                记轮止快照与本轮 commit（轮起 HEAD..现在 + reflog，DESIGN §3.5）→ 等 Claude Code 写下这次 Stop 的 stop_hook_summary
+#                       （别的同步 Stop hook 都跑完才写，最多 stop_summary_wait 秒）→ 从本轮开头解析主文件与 subagents/ 下全部文件：
+#                       分歧事件 + 本轮的 turn.end（summary 前没有拦停反馈就是答完了，DESIGN D7）（配 async: true）
 #   SubagentStart/Stop  发 subagent.start / subagent.end（实例 = agent_id，父实例与派生调用取 meta.json）；Stop 时再扫一遍子 agent 文件
 #   SessionEnd          发 session.end（reason）→ 解析并关掉最后一轮
 #   PostToolUseFailure / PermissionDenied / StopFailure / Notification / InstructionsLoaded / CwdChanged
-#                       只记事件头，发 ext.claude.<事件名>（不带正文，D5）；StopFailure 另记进本轮，关轮时 status 取 error
+#                       只记事件头，发 ext.claude.<事件名>（不带正文，D5）；StopFailure 另记进本轮，关轮时 status 取 error。
+#                       PostToolUseFailure 的 is_interrupt 为 true＝人在工具运行中打断（打断没有自己的 hook，Stop 也不来）：等打断记录落盘后
+#                       当场解析，turn.end(interrupted) 不必等下一轮。Notification 的 idle_prompt（CLI 交互界面空闲时发，desktop 大概率不发）也解析一次
 #
 # SessionStart / UserPromptSubmit / SessionEnd 是同步 hook：读完 stdin 就把活丢到脱离的后台进程里，自己立刻退出——
 # 不让人等，也不受 SessionEnd 1.5 s 的预算限制（后台进程在 -p 与 desktop 关会话时活不活没实测，丢了由下一次 SessionStart 补做兜底）。
@@ -199,6 +202,31 @@ process_session(){ # process_session <sid> <主 transcript> [close_last]
     vt_unlock "$sd"
 }
 
+tail_types(){ # tail_types <transcript>：末尾几十条完整记录的 "type:subtype"，一行一条（半行、超长行被截断的都丢掉）
+    tail -c 262144 "$1" 2>/dev/null | tail -n 40 | "$JQ" -R -r 'fromjson? | select(type == "object") | (.type // "") + ":" + (.subtype // "")' 2>/dev/null
+}
+
+wait_turn_end(){ # Stop 之后等「模型答完」的标记：最后一条 assistant 之后出现 stop_hook_summary（别的同步 Stop hook 都跑完才写）
+    # 找到就返回 0；等满 stop_summary_wait 秒（默认 20，异步 hook 不卡人）还没有就返回 1，解析照做，这一轮留给兜底去关
+    [ "${VIBETRAIL_STABLE_WAIT:-1}" = "0" ] && return 0
+    local max i; max=$(vt_conf stop_summary_wait 20); i=0
+    while [ "$i" -lt $((max * 5)) ]; do
+        tail_types "$1" | awk -F: '$1 == "assistant" { a = NR } $2 == "stop_hook_summary" { s = NR } END { exit !(s > a) }' && return 0
+        sleep 0.2; i=$((i + 1))
+    done
+    return 1
+}
+
+wait_interrupt_record(){ # 工具运行中被打断：等 transcript 里出现打断记录（它在 PostToolUseFailure 之后才写），最多 5 s
+    [ "${VIBETRAIL_STABLE_WAIT:-1}" = "0" ] && return 0
+    local i=0
+    while [ "$i" -lt 25 ]; do
+        tail -c 65536 "$1" 2>/dev/null | tail -n 10 | grep -q '\[Request interrupted by user' && return 0
+        sleep 0.2; i=$((i + 1))
+    done
+    return 1
+}
+
 wait_stable(){ # 照 Pilot：文件大小连续两次不变才读，最多 1.5 s（Stop 是 async，不卡人）
     [ "${VIBETRAIL_STABLE_WAIT:-1}" = "0" ] && return 0
     local prev=-1 same=0 i s
@@ -209,8 +237,9 @@ wait_stable(){ # 照 Pilot：文件大小连续两次不变才读，最多 1.5 s
     done
 }
 
-catch_up(){ # 本仓每个 worktree 对应的 Claude 项目目录里，落后的 transcript 各补一次
-    local wt dir t s close idle now mt
+catch_up(){ # 本仓与所有登记过的仓，每个 worktree 对应的 Claude 项目目录里，落后的 transcript 各补一次
+    # 扫所有登记过的仓而不只本仓：人不再回那个仓时，它最后一轮没关的也能在下一次开任意会话时关掉（用户 09-15：隔很久才问会缺最后一轮）
+    local wt dir t s close idle now mt repo
     idle=$(vt_conf turn_idle_close 3600); now=$(date +%s)
     while IFS= read -r wt; do
         dir="$CLAUDE_PROJECTS/$(vt_slug "$wt")"
@@ -226,7 +255,9 @@ catch_up(){ # 本仓每个 worktree 对应的 Claude 项目目录里，落后的
             fi
             process_session "$s" "$t" "$close"
         done
-    done < <(git -C "$workspace" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
+    done < <({ printf '%s\n' "$workspace"; cat "$VT_HOME/projects"/* 2>/dev/null; } | awk 'NF && !seen[$0]++' | while IFS= read -r repo; do
+                 [ -d "$repo" ] && git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p'
+             done | awk '!seen[$0]++')
     [ -n "$main" ] || { [ -f "$tpath" ] && process_session "$sid" "$tpath" "$([ "$source" = resume ] && echo resume)"; }   # scope=user 且不在 git 仓
     find "$VT_HOME/state" -path '*/turns/*.json' -mtime +14 -delete 2>/dev/null   # 轮次证据留两周够关轮用
 }
@@ -245,7 +276,7 @@ run(){ # 门控通过之后按事件干活
             turn_start ;;
         Stop|stop)
             turn_stop
-            [ -f "$tpath" ] && { wait_stable "$tpath"; process_session "$sid" "$tpath"; } ;;
+            [ -f "$tpath" ] && { wait_turn_end "$tpath" || wait_stable "$tpath"; process_session "$sid" "$tpath"; } ;;
         SubagentStart|subagent-start)
             [ -n "$agent_id" ] && emit_hook SubagentStart null "$(extra_subagent)" ;;
         SubagentStop|subagent-stop)
@@ -268,7 +299,17 @@ run(){ # 门控通过之后按事件干活
             fi
             emit_hook InstructionsLoaded null "$("$JQ" -n -c --arg s "$sha" --arg b "$bytes" \
                 '(if $s != "" then {sha256: $s} else {} end) + (if $b != "" then {bytes: ($b | tonumber)} else {} end)')" ;;
-        PostToolUseFailure|PermissionDenied|Notification|CwdChanged)
+        PostToolUseFailure)
+            emit_hook "$event" null '{}'
+            if [ "$(printf '%s' "$payload" | "$JQ" -r '.is_interrupt // false' 2>/dev/null)" = "true" ] && [ -f "$tpath" ] && [ -z "$agent_id" ]; then
+                wait_interrupt_record "$tpath"; process_session "$sid" "$tpath"
+            fi ;;
+        Notification)
+            case "$(printf '%s' "$payload" | "$JQ" -r '.notification_type // ""' 2>/dev/null)" in
+                idle_prompt) [ -f "$tpath" ] && process_session "$sid" "$tpath" ;;   # 空闲：把没采完的补上，不另发事件
+                *) emit_hook "$event" null '{}' ;;
+            esac ;;
+        PermissionDenied|CwdChanged)
             emit_hook "$event" null '{}' ;;
         *) ;;
     esac
