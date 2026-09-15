@@ -11,7 +11,7 @@
 >
 > **实跑样例**（2026-09-11）：同一段示例会话实际过一遍 teamai（`224c0c4`，断网），本机落了什么、会推出去什么，见
 > [teamai-cli-collection-sample.md](teamai-cli-collection-sample.md)。上面「没有实机数据可对照」从这天起不再成立；
-> 样例 §5.1 列了与本文对不上的 10 处，尚未改进本文。
+> 样例 §5.1 列的 10 处出入已于 2026-09-14 并入 §7；正文各节未逐句改，冲突处以 §7 为准。
 
 本文只回答一个问题：**它采了什么、落在哪、什么出本机。** 摩擦判据的精度问题不在这里重复，
 见 [teamai-cli.md §4.1](teamai-cli.md) 与 [对比文档 §3](teamai-cli-vs-vibetrail.md)。
@@ -311,3 +311,25 @@ transcript 原文**」。代码事实：
   `usage.jsonl`「no conversation content」，并把 web 看板列为 NOT in Scope；后来加的 dashboard
   `events.jsonl` 带了 prompt 文本，用户指南的隐私声明没有随之更新。同一个坑，
   teamai-cli.md §4.1 那条过时注释已经踩过一次。
+
+## 7. 实跑样例对本文的修正（2026-09-11 实跑于 `224c0c4`，2026-09-14 并入）
+
+实跑证实、没有出入的：§1 的挂载与分发（4 类事件、6 条 hook、PreToolUse 与 SessionEnd 不挂、fail-open）、§2.1 各字段与判据、§2.3、§2.8 的 prompt 前 60 字、
+§3.1 的 stats 字段与 `toolError` 不上报、§3.2、§3.3 的请求体字段、§4 全部、§5 第 1 / 3 / 4 / 5 条。对不上或漏写的十处
+（出处与原样见 [实跑样例 §5.1](teamai-cli-collection-sample.md)）：
+
+1. **§1 `update`「后台查 npm registry，只发包名」写轻了**：它起一个 `npm` 子进程，npm 在 `~/.npm/_logs/` 留日志、里面有项目路径；已是最新版时缓存不生效，
+   **每次 Stop 都查**；查到新版且策略是默认的 `auto` 时，后台子进程直接 `npm install -g teamai-cli` 再跑 `teamai hooks inject`——从 hook 里自动升级。
+2. **§2「采集类数据全部在 `~/.teamai/` 顶层」**只对采集数据成立。hook 运行还往外写三处：`~/.npm/_logs/`；每次 hook 在**项目父目录**建、删一个大小写探针文件
+   `.TEAMAI-CASE-PROBE-<pid>-<ms>`；init 过的项目里，SessionStart 的后台 pull 往**业务项目**部署 `.claude/skills/team-wiki-codebase/`（12 个文件、148 KB，untracked）。
+3. **§2.3 `sessions/<sid>.json` 不是实时值**：工具数 < 15 且距上次评估不到 5 分钟时 Stop 走 fast-path 直接返回，文件停在第一次 Stop 的值；实跑里第 2 轮的打断与拒绝都没进去。
+4. **§2.8 debug.log 漏项**：除 prompt 前 60 字外还记业务仓 origin 的 **remote URL 原样**（remote 不是 github.com / git.woa.com 时）、项目 realpath、contribute 的摩擦计数、
+   `npm view` 失败的完整命令行、init 过程。
+5. **§3.1「随 pull 自动直推」的时机**：本会话在**自己的** SessionStart 上就先按 0 值计进 `sessions`，真实计数要到**下一次**在该项目里开会话才推，下一段会话又先被按 0 值记一次；
+   一次 pull 一个 commit，git 历史里因此有逐次增量、全局 git 邮箱、每次开会话的时刻。
+6. **§3.1 作用域过滤会漏**：经符号链接进入项目的会话被整段漏报——过滤用事件里原样的 cwd 做字符串前缀比较，projectRoot 却是 realpath。
+7. **§3.1 init 注册成员**：团队仓为空时，init 还生成并直推 `teamai.yaml`（团队名、仓地址、provider 等）和 5 个 `.gitkeep`。
+8. **§3.3「每个 hook 事件 POST 一次 report 加一次 sync」**：report 失败时 sync 不再发，日志却记成 `sync FAILED`；另有 `GET /api/projects/mine`（SessionStart 与第一次
+   UserPromptSubmit 各一次）和 `GET /api/local-agent/get-config`；每次 report 前执行一次 `claude --version`；用环境变量配置时 `started_at` 是每次调用的当前时间。
+9. **没写出的前提：project scope 的 hook 装在 HOME 级 `~/.claude/settings.json`**（`types.ts:1497-1503`）。「没 init 过的目录照样进 events.jsonl」在现实里天天发生，就是因为这一条。
+10. **行号**：§1 引的 `hook-handlers.ts:474,480,487` 在 `224c0c4` 上是 `473,479,486`；本文说该文件两版之间没动，`6ae0619` 无从核对，不知道哪边错。

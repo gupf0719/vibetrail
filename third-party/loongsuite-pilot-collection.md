@@ -11,7 +11,7 @@
 >
 > **实跑样例**（2026-09-11）：一段编出来的示例会话实际过一遍 Pilot（断网），本机落了什么、配了远端会发出去什么，见
 > [loongsuite-pilot-collection-sample.md](loongsuite-pilot-collection-sample.md)。上面「没有实机数据可对照」从这天起不再成立；
-> 样例 §5 列了与本文对不上的 3 处和本文没写到的 6 条，尚未改进本文。
+> 样例 §5 列的 3 处出入与 6 条补充已于 2026-09-14 并入 §8；正文各节未逐句改，冲突处以 §8 为准。
 
 本文只回答一个问题：**它采了什么、落在哪、什么出本机。** 与本项目和 teamai 的三方对比见
 [teamai-cli-vs-vibetrail.md](teamai-cli-vs-vibetrail.md)，此处不重复。
@@ -177,7 +177,7 @@ processor 是**同步**处理，且**不落原始 hook payload**，直接产出�
 <dirname(父 transcript)>/<父 sessionId>/subagents/agent-<id>.jsonl
 ```
 
-正是本项目 [DESIGN.md](../DESIGN.md):27 记录、[teamai-cli-vs-vibetrail.md](teamai-cli-vs-vibetrail.md) §3.2
+正是本项目早有记录（现 [DESIGN.md §2](../DESIGN.md) 两路表）、[teamai-cli-vs-vibetrail.md](teamai-cli-vs-vibetrail.md) §3.2
 实测过的那 728 个文件所在的布局。`buildSubagentRecords` 以 **offset 0 每次全量重解析**（`:641`），
 子事件全部改写为父级 `trace_id` / `turn_id`，并打三个标记（`:669-685`）：
 
@@ -232,7 +232,7 @@ command: `${exports.join('; ')};\n${toolInput.command}`
 
 - `system_instructions` —— 从**出站请求 body** 的 `system` 字段解析，滤掉首个计费头标记块。
   **transcript 里没有这个东西**，只有拦流量才拿得到。（2026-09-11 补：Claude Code 2.1.258 起不成立，transcript 自带
-  `prompt_snapshot`，含 system prompt 与全部工具定义，见 [DESIGN §2.6](../DESIGN.md)；Pilot 的解析不读它。拦截器仍多拿到
+  `prompt_snapshot`，含 system prompt 与全部工具定义，见 [DESIGN §6.3](../DESIGN.md)；Pilot 的解析不读它。拦截器仍多拿到
   逐次请求的原样、desktop 追加的部分和子 agent 的 prompt。）
 - `response_id` —— 首个 SSE `message_start` 的 `message.id`，与 hook 侧 1:1 join。
 - `ttft_ns` —— 首个 `content_block_delta` 到达时刻。
@@ -600,7 +600,7 @@ code.stats_overview    组织时间窗聚合：接口 …/ai-code/stats/overview
 - **`sls-failed-logs` 的做法值得直接抄**：失败诊断只留元数据、明确写「不可用于重放」。本项目将来若有上报失败
   路径，默认应当是这个形态，而不是 teamai 那种把整个 context 写盘。
 - **保留策略要按目录枚举，不能按类别映射。** §2.4 那个洞的成因是 `CATEGORY_DIR_MAP` 只认几个子目录名、
-  又跳过 `logs/` 根下的文件，于是 Claude Code 等写在根下的、含完整对话正文的文件永不删除——而所有配置项看上去都配好了。本项目 trace 目录若将来加清理，
+  又跳过 `logs/` 根下的文件，于是 Claude Code 等写在根下的、含完整对话正文的文件永不删除——而所有配置项看上去都配好了。本项目的 spool（`~/.vibetrail/spool/`；2026-09-14 前是仓内 trace 目录）若将来加清理，
   应当默认覆盖全部子目录，新增目录不进清单就报错，而不是静默漏过。
 - **采集范围要有回归钉子，Pilot 守住了一半。** Pilot 装了 `SubagentStop` 而 teamai 没有；Pilot 还有测试钉住提取层——
   `tests/unit/hooks/claude-code/hook-processor.test.mjs` 的「claude-code 一级子 Agent 上报」一组用例（`:725` 起）断言
@@ -630,6 +630,7 @@ code.stats_overview    组织时间窗聚合：接口 …/ai-code/stats/overview
 | 11 | 第三轮：§6「两边都没有测试守住采集范围」 | **错**：Pilot 有提取层测试（`hook-processor.test.mjs:725` 起），Codex 还有部署层测试钉住 `SubagentStop`；Claude Code 缺的只是部署层 | §6 |
 | 12 | 同轮：「正文零截断」「采的是完整对话内容」，隐含每条记录都进了事件 | **不全，而且漏的正好是本项目关心的**：解析器按 promptId 分组，轮末的中断记录大多不进事件。拿它的解析器离线跑本机语料，265 条中断记录只进了 5 条（之后同一轮里再没有模型回复的 240 条、只跟了被跳过的合成回复的 20 条都没进）；拒绝工具调用的 45 条进了 41 条 | §0 / §1.2b |
 | 13 | 第四轮（按用户要求改用 50 MB 以下的数据，逐类测完整性）：第 12 条只查了中断和拒绝两类 | 扩到全部记录类型后又找到两种漏法：整轮没有真实回复就连 prompt 一起丢（主会话 1,599 条 prompt 丢 154 条），同一回复里多个文本 / thinking 块只留最长的；第 12 条里拒绝记录「45 条进了 41 条」差的 4 条是那份 111 MB 的文件撞上读取上限，50 MB 以下的语料里工具结果一条不差 | §0 / §1.2b |
+| 14 | 2026-09-14 复核（C02FM，`~/program/go/src/loongsuite-pilot` @ `d4ab8b6d`，与本文快照相同；只读源码按 file:line 抽查，不跑）：`agents.d/claude-code.json:9-28`、`transcript-parser.mjs`（`:26` 上限、`:137-185` offset、`:264-268` promptId、`:365-460` 增量、`:498-510` 首条 prompt、`:530` 跳过无模型调用的轮、`:570-605` 去重）、`claude-code-hook-processor.mjs:820-824,1189-1193`、`src/internal/statistic.ts` 全文、`config-loader.ts:274,318-322,510,560-563`、`plugin-migration.ts:2,85-88`、`http-flusher.ts:28,38,50,77`、`input-manager.ts:333-391`、`source-context.ts:85-92` | **全部对上，无推翻**；§8 并入的三处出入与六条补充同时得到源码印证 | §8 |
 
 另有十来处行号与小项顺手改了：`:869` 实为 `:867-868`、`state.mjs:143` 实为 `:141`、拦截器注释 `:23-24` / `:25-26`、
 `statistic.ts` POST `:35-38`、`isSidechain` 实际出现在哪三个处理器、`REDACTED_FIELDS` 是 17 项含两个 id、
@@ -654,3 +655,32 @@ code.stats_overview    组织时间窗聚合：接口 …/ai-code/stats/overview
 三个 agent 分头逐行核对三份 Pilot 文档的行号、数字与行为断言，改进正文前我逐条回查了源码。
 复核本身也出过一处错：它一度认定「卸载清单漏了 Grok」，实际安装器另有一段单独清理 Grok
 （`installer-opensource.sh:2347-2403`），没有写进正文。
+
+## 8. 实跑样例对本文的修正（2026-09-11 实跑于 `d4ab8b6d`，2026-09-14 并入）
+
+对不上的三处（出处与原样见 [实跑样例 §5](loongsuite-pilot-collection-sample.md)）：
+
+1. **§3.2 HTTP 出站的报文形状与行号**。`http-flusher.ts:77` 是 `sendRaw()`（给指标类原始记录用）；会话事件走 `flush()`，body 是 `{ "entries": [...] }`
+   （`:50`，实跑截获确认），每条是 `serialiseLogEntry(entry)` 的全字符串 map；这条路径**没传** `dropAgentScopedFields`（`:28,38`），所以 HTTP 比
+   JSONL、SLS 多带 `agent.<ns>.*` 字段（本例每条多一个 `agent.claude-code.cwd`）。
+2. **§5.3「`gen_ai.system_instructions` 在本机 JSONL 里键还在」**只对 hook 侧那份 `logs/claude-code/…jsonl` 成立（值 `[{"type":"text"}]`）；daemon 写的
+   `logs/output/…jsonl` 与出站一样整键缺失——内容策略在 `InputManager` 里、JSONL flusher 之前就执行（`src/core/input-manager.ts:380-382`）。
+   「本机与出站口径不同」的结论不变，主语要改成 hook 侧那份。
+3. **§0「token 五项 + 四项成本」**：Claude Code 链路没有任何成本字段，hook 不写、daemon 只在记录里已有时才透传（`entry-builder.ts:113-125`）；
+   成本只出现在别的 agent（如 Cursor）的链路上。
+
+本文没写到、实跑补出来的六条：
+
+1. **https remote 里的凭据会进 `git.domain`**：`normalizeDomain()` 取 `://` 到第一个 `/` 之间的整段（`src/normalization/source-context.ts:85-92`），
+   `https://oauth2:<token>@gitlab…` 形式的令牌原样进每条事件，本机输出与出站都有、OTLP 固定透传，mask 也不扫 `git.*`。§5.4 只说「仓库身份随每条事件出本机」。
+2. **OTLP 发送失败时整批 span 连内容写盘** `logs/otlp-failed/`（`otlp-trace-flusher.ts:1786-1809`，保留 7 天）——与 §2.3 / §6 称赞的
+   `sls-failed-logs` 只存元数据正相反，本文没区分。
+3. **内容在输出里成倍出现**：hook 侧每次模型输出、工具结果都会在下一次 `llm.request` 的输入增量里再出现一次；daemon 又给每条 prompt 派生一条
+   `agent.input`（`agent-input-dual-write.ts:18-43`）。本例 prompt 3 份、Edit 文本与 Bash 命令 3 份、假密钥 2 份。§1.2 只说「全文」。
+4. **拦截器开着时 system prompt 按次重复**：每次 LLM 调用的 `llm.request` 都带一份完整 `gen_ai.system_instructions`（本例 6 次调用 6 份）。§1.5 只写了拦截文件与合并。
+5. **被拒的那一轮在输出里没有结束标记**：`tool.result.status` 由 `error` 归一成 `failure`（`entry-builder.ts:492-497`），turn 结束标记只认 stop 类
+   finish_reason（`turn-boundary-processor.ts:104-106`），被拒轮只有 `tool_call`，于是没有 `gen_ai.turn.end`；OTLP 那边它要等下一个 turn 到来才被冲出。
+6. **§2.4 标「未确认」的主会话 `state/claude-code/sessions/*.json`**：没有任何清理——`src/` 里没有引用该目录的代码，保留服务实跑也不碰它。
+
+另：`jsonl.enabled` 默认 `true`，与配没配远端无关（`config-loader.ts:1148`，`orchestrator.ts:755-759`）；只有所有 flusher 都关掉时才另起一个兜底 JSONL
+（`orchestrator.ts:783-792`）。本文 §3 写的「JSONL 是唯一默认开的输出」与代码一致。

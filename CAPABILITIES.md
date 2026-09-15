@@ -1,195 +1,90 @@
-# vibetrail 功能与实现原理
+# vibetrail 功能与状态
 
-> 与另两份文档的分工：[DESIGN.md](DESIGN.md) 记**为什么这么做**（问题定义、决策、否决理由），
-> [spec/trace-v1.md](spec/trace-v1.md) 是**数据格式的规范**，本文记**有哪些功能、怎么实现的、
-> 还缺什么**。
+> 分工：[DESIGN.md](DESIGN.md) 记**为什么与怎么做**；本文记**有什么、什么状态、沿用部分怎么实现的**；
+> [spec/diverge-v1.md](spec/diverge-v1.md) 是判据规范；未完成项只在 [OPEN-ISSUES.md](OPEN-ISSUES.md)，拆解在 [TODO.md](TODO.md)。
+> 2026-09-14 重整：上一版的接入 / 提交 / 投影 / 读取五段流程随 D4 退役，本文按「沿用 / 待做 / 退役 / 另一条线」四栏重排。
 
 ## 0. 一句话
 
-把 Claude Code 已经在写的会话流水，提炼成能随代码走的工程留痕，用来回答两个问题：
-**这个 commit 是怎么来的**，以及**出问题时人和 agent 在哪一步对不上**。
+用 Claude Code 的 hook，把每个会话的两路数据自动传上云——**全量**（原始 transcript 逐字节副本 + hook 事件 + git 状态）和**人机分歧**
+（打断、拒绝的索引）——用来回答**这个 commit 是怎么来的**，以及**出问题时人和 agent 在哪一步对不上**。
 
 ## 1. 功能清单
 
-| 阶段 | 功能 | 状态 | 实现 |
-|---|---|---|---|
-| ① 接入 | 接入 | ✅ **已实现** | `tools/vibetrail-install`（幂等；装 hook、vendor 运行时、建 trace 目录）|
-| ① 接入 | 留痕自检 | ✅ **已实现** | `tools/vibetrail-doctor` |
-| ② 开发 | hook 机制探针 | ✅ **已实现** | `experiments/hook-probe.sh` |
-| ③ 提交 | commit ↔ session 接链 | ✅ **已实现** | `tools/prepare-commit-msg`（12 场景回归 + 5 组变异验证）|
-| ③ 提交 | hook 回归测试 | ✅ **已实现** | `tools/test-hook.sh` |
-| ④ 投影 | 人机分歧提取 | ✅ **已实现** | `tools/extract-diverge.jq` |
-| ④ 投影 | 分歧判据回归测试 | ✅ **已实现** | `tools/fixtures.jsonl` + `tools/test-extract.sh` |
-| ④ 投影 | session 流水投影 | ✅ **已实现** | `tools/vibetrail-sync` |
-| ④ 投影 | 审计过程留痕 | ✅ **已实现** | `tools/vibetrail-audit`（record / show / stats / check）|
-| ④ 投影 | 审计回归测试 | ✅ **已实现** | `tools/test-audit.sh` |
-| ⑤ 读取 | 查询 / 复盘 | ✅ **已实现** | `tools/vibetrail`（show / log / session / diverge）|
-| — | 行级归属 | ❌ **已否决** | 见 [DESIGN.md §2.5](DESIGN.md) |
+### 沿用
 
-## 2. 实现原理
-
-### 2.0 全流程
-
-先看骨架。Claude Code 自己把全量流水写在本机；hook 在每次 `git commit` 时把会话 id 写进
-commit message；`vibetrail-sync` 与 `vibetrail-audit` 把值得跨会话保留的部分投影进仓；
-`vibetrail show` 按会话 id 与 patch-id 把三处接回去。前提是每个 clone 跑一次
-`vibetrail-install`（装 hook、vendor 运行时、建 trace 目录），再用 `vibetrail-doctor` 自检。
-
-```mermaid
-%%{init: {"flowchart": {"wrappingWidth": 240}}}%%
-flowchart LR
-    CC["Claude Code 会话<br/>人指挥、打断、拒绝工具调用"]
-    AU["审计 agent<br/>审完一个 commit"]
-    subgraph L["本机"]
-        TR[("transcript<br/>Claude Code 的全量流水<br/>不入仓")]
-    end
-    subgraph R["仓内，随代码走"]
-        CM[("commit message<br/>Claude-Session trailer")]
-        TS[("trace/sessions/<br/>会话摘要 + 人机分歧")]
-        TA[("trace/audits/<br/>findings 与判定")]
-    end
-    CC -->|"自己写"| TR
-    CC -->|"git commit<br/>hook 注入会话 id"| CM
-    TR -->|"vibetrail-sync"| TS
-    AU -->|"vibetrail-audit record"| TA
-    CM --> Q["vibetrail show"]
-    TR --> Q
-    TA --> Q
-    TS -.-> Q
-    Q --> OUT["这个 commit 是怎么来的<br/>人和 agent 在哪一步对不上"]
-```
-
-三处落点里只有 transcript 不入仓；仓内两处只存指针与摘要（D2）。虚线是还没接上的一段：
-查询端尚未读 sessions 文件。逐步展开的详图（hook 的三道守卫、五类分歧、闸门怎么接）
-见 [FLOW.md](FLOW.md)。
-
-### 2.1 采集：不自建，复用 Claude Code 的流水
-
-**不写采集层**。Claude Code 本来就把每轮对话、思考全文、每次 Edit 的 diff、
-每条命令的 stdout/stderr、子 agent 的独立 transcript 写进
-`~/.claude/projects/<cwd-slug>/<sessionId>.jsonl`。
-
-代价是它**不入仓、体量数百 MB、换机器即失**。所以我们做的是**投影**而非采集：
-把其中跨会话仍有价值的部分固化成 KB 级的索引，正文留在原地靠 uuid 指针跳回。
-
-### 2.2 人机分歧提取（已实现）
-
-`tools/extract-diverge.jq` 从 transcript 提取四类事件，每条带 `human` 布尔区分
-「人的决定」与「机器/基础设施行为」——混计会让「人拒了多少次」被分类器和链路故障污染。
-
-| kind | human | 一句话 |
+| 功能 | 状态 | 实现 |
 |---|---|---|
-| `interrupt` | ✅ | 人打断了 agent |
-| `permission_denied` | ✅ | 人拒绝了一次工具调用 |
-| `classifier_blocked` | ❌ | auto mode 分类器拒的 |
-| `permission_infra_fail` | ❌ | 权限链路自身失败 |
+| 人机分歧判据 | ✅ 已实现，755 会话实测精确率 100% | `tools/extract-diverge.jq`，规范 [spec/diverge-v1.md](spec/diverge-v1.md) |
+| 判据回归 | ✅ | `tools/fixtures.jsonl` + `tools/test-extract.sh`（26 条正负例，比对整条输出并查 jq 报错） |
+| hook 机制探针 | ✅ | `experiments/hook-probe.sh`（DESIGN §6.1 的实证来源） |
+| 采集回放样本 | ✅ | `experiments/collect-demo/scenario.json`：同一段示例会话，Pilot / teamai 实跑样例就是用它截的；G7 的回归输入 |
 
-判据的精确定义**只在 [spec §3.1](spec/trace-v1.md) 维护一份**，这里不复述，避免两份漂移
-（曾经漂过：这里的版本漏了字符串正文与 `with this tool use`）。
+### 待做（G7，拆解见 TODO）
 
-**核心原理是「只读字段，不 grep 原文」**。会话自身会讨论这些标记（本项目的调研会话就是），
-grep 原文会把「讨论」当成「发生」。实测对照：以本项目调研会话为靶，裸 grep 命中 19 条、
-本规则命中 2 条，人工核对真实中断正是 2 次——**精确率 100% vs 10.5%**。
+| 功能 | 状态 | 形态 |
+|---|---|---|
+| `vibetrail init` / `uninstall` | ❌ | 机器级装一次：`~/.vibetrail/bin`、HOME settings 条目（带 marker）、scope 配置、登记；DESIGN §5 |
+| hook 分发入口 `vibetrail-hook <事件>` | ❌ | 读 stdin、按 scope 门控、事件头写 `events.jsonl`；DESIGN §3.1 |
+| 全量增量副本 | ❌ | byte offset、截到最后一个换行、子 agent 按目录扫、原子写；DESIGN §3.3 |
+| 分歧提取挂 hook | ❌ | 现有 jq 在 UserPromptSubmit / Stop / SessionEnd / SessionStart 补做时跑，写 `diverge.jsonl` |
+| commit ↔ session 推导 | ❌ | 每轮起止 HEAD + `rev-list`；DESIGN §3.5 |
+| `vibetrail push [--list \| --show]` | ❌ | 端点没配不发；配了分块 + gzip + 幂等 + ack 即删；DESIGN §4 |
+| doctor 扩展 | 🔁 | 现有 `tools/vibetrail-doctor` 查的是退役的 git hook 与仓内 vendor，要改成 DESIGN §5 的自检项 |
+| 查询端 | 🔁 | 现有 `tools/vibetrail`（show / log / session / diverge）读仓内 `sessions/` 与 `Claude-Session` trailer，要改读 spool / 云端，按 commit 查改走推导映射 |
+| 完整性钉子 | ❌ | 字节相等、每类记录条数进出相等、未知类型 / 事件名告警（G10、G6） |
 
-全语料实测（**2026-09-09 重测**，756 个 transcript）：`interrupt` 248（人主动打断）、`interrupt_for_tool_use` 35（伴随拒绝）、
-`permission_denied` 92（主会话 39 + 子 agent 53）、`permission_infra_fail` 6、
-`classifier_blocked` 1。
+### 退役（2026-09-14，D4；代码在 G7 落地时删）
 
-⚠️ 09-08 测得 277 / 90，差异**全部来自语料增长**（我们工作时它一直在写）。
-**引用需带测量日期。**判据细节与踩过的坑见
-[spec §3.3](spec/trace-v1.md)。
+| 功能 | 原实现 | 为什么退 |
+|---|---|---|
+| 每个 clone 接入 | `tools/vibetrail-install`：装 git hook、vendor 运行时到 `.claude/vibetrail/`、写 `.gitattributes`、建 `.claude/trace/` | 被观测仓零写入；机器级装一次 |
+| commit ↔ session 的 `Claude-Session` trailer | `tools/prepare-commit-msg` + `tools/test-hook.sh`（12 场景回归 + 5 组变异） | 不装 git hook；改从全量副本推。同一个 hook 还写审计线的 `Vibetrail-Id`，见下 |
+| 会话流水投影进仓 | `tools/vibetrail-sync`（按 worktree 清单认领会话、整份重生成） | 两路数据不进 git；它的归属判据（`git worktree list` + realpath）沿用到 hook 的门控 |
+| 仓内 vendor 运行时与 MANIFEST | `vibetrail-install` 的一部分 | 运行时只在 `~/.vibetrail/bin/` 一份 |
 
-### 2.3 commit ↔ session 接链（机制已实测）
+### 另一条线：审计记录（不属 G7）
 
-`.githooks/prepare-commit-msg` 读**环境变量** `CLAUDE_CODE_SESSION_ID`
-（实测逐字等于 transcript 文件名），注入 `Claude-Session:` trailer。
+| 功能 | 状态 | 实现 |
+|---|---|---|
+| 审计过程留痕 | ✅ | `tools/vibetrail-audit`（record / show / stats / check），写 `<repo>/.claude/trace/audits/<vibetrailId>.jsonl`，格式 [spec/trace-v1.md](spec/trace-v1.md) |
+| 审计回归 | ✅ | `tools/test-audit.sh` |
+| 闸门故障注入套件 | ✅ | `tools/test-faults.sh`：每条注入一个故障，断言闸门 / 自检必须 fail-closed（vendored 运行时缺失、丢 +x、缺 jq、`merge=union`、doctor 假绿等）。它依赖 `vibetrail-install` 的 vendor 与 MANIFEST，所以这两样随审计线一起等 U6，不随 G7 退役 |
+| Stop 闸门 | ✅ | `tools/fixtures/check-audit-stop.sh`（agentDock 的三个 Stop hook 之一）：缺记录 block，空锚放行 |
+| 锚 | ✅ | `Vibetrail-Id` trailer，由 `tools/prepare-commit-msg` 写——**这条线仍依赖 git hook、仍落在被观测仓里**，去向暂不定（OPEN-ISSUES U6） |
+| 行级归属 | ❌ 已否决 | DESIGN §7 |
 
-选环境变量而非状态文件，因为它是**进程级**的：多 worktree 并发各有各的值，
-人工提交时变量根本不存在所以不会被误记成 agent 的。实测矩阵见 [spec §2.0](spec/trace-v1.md)：
-最初五条（agent 提交带 / 人工不带 / amend 幂等 / worktree 生效 / 并发不串）加三轮审计补的六条
-（agent rebase、cherry-pick 人工 commit 不沾 / 非编辑器路径 merge 可解析 / 已有 `Co-Authored-By`
-等 trailer 保留 / 空消息仍被拒 / 编辑器路径不注入）全过。最初的 4 行版在补测的每一处都静默出错，
-最重的一处：agent 一次 `git rebase main` 会把分支上所有人工 commit 记成 agent 的。
+## 2. 沿用部分的实现原理
 
-**trailer 活过历史重写**：rebase ✅ cherry-pick ✅ ff-only ✅ no-ff merge ✅；squash ❌——
-`rebase -i` squash 只留最后一个被 squash 的 commit 的 trailer，`merge --squash` 原会话丢失、
-记成执行者（agentDock 1760 个 commit 里 0 次 squash，不受影响）。
+### 2.1 人机分歧提取
 
-### 2.4b session 流水投影（`vibetrail-sync`）
+从 transcript 提取 5 类事件，每条带 `human` 布尔区分「人的决定」与「机器 / 基础设施行为」。判据的精确定义**只在
+[spec/diverge-v1.md §2](spec/diverge-v1.md) 维护一份**，这里不复述，避免两份漂移（曾经漂过：这里的版本漏了字符串正文与 `with this tool use`）。
 
-**形态选择：事后投影，不是实时写。** session 文件是 transcript 的**纯投影**、随时可重算；
-按 D2，trace 的作用是扛住 transcript 丢失与换机器，所以要求只是「在 transcript 消失之前
-写下来」，不是「commit 那一刻必须同步」。这排除了在 pre-commit 里写+暂存那类方案
-（每个 commit 都带 trace 改动，churn 大）。
+**核心原理是「只读字段，不 grep 原文」**。会话自身会讨论这些标记（本项目的调研会话就是），grep 原文会把「讨论」当成「发生」。
+实测对照：以本项目调研会话为靶，裸 grep 命中 19 条、本规则命中 2 条，人工核对真实中断正是 2 次——精确率 100% vs 10.5%。
 
-三方对照：**SpecStory 也是事后 `sync`**（印证这个选择）；claude-story 用 `fs.watch`
-常驻守护进程（要养一个进程，不取）。
+全语料实测（2026-09-09，756 个 transcript）：`interrupt` 248、`interrupt_for_tool_use` 35、`permission_denied` 92（主会话 39 + 子 agent 53）、
+`permission_infra_fail` 6、`classifier_blocked` 1。09-08 测得 277 / 90，差异全部来自语料增长——**引用需带测量日期**。
 
-**归属判据比 SpecStory 更宽**：它把 cwd 编码成 Claude 项目目录名做 1:1 反查，因此只看
-当前 cwd 那一个目录，**在 worktree 里 sync 不到主仓的会话**。本仓大量用 worktree，
-所以改成按 `git worktree list` 聚合全部 worktree 根。两侧路径都过 `realpath`——
-这条是照它的 `EvalSymlinks` 补的，不做的话符号链接会让前缀匹配**静默失配**。
+### 2.2 回归保护
 
-实测（agentDock）：26 个会话 / 419 条记录 / **220K**，对照 transcript 406MB，
-约 1800 倍压缩，符合 D2 的 KB 级要求。
+`tools/test-extract.sh` 跑 26 条正负例，比对的是**整条输出**（含 `human` 与全部字段名），不只比 kind——否则 `human` 翻转、字段名漂移都抓不到
+（实测变异全绿）。判据依赖英文消息串、Claude Code 改文案即静默失效，**这个测试是唯一的哨兵**。
 
-### 2.4c 审计过程留痕（`vibetrail-audit`）
+它检查两件事：判定结果是否符合预期，**以及 jq 是否报错**。后者是补上去的——jq 在某条规则上抛错时，该记录之后的规则不再求值、之前的命中照常输出，
+然后继续下一条。只比对输出抓不到「末尾规则抛错」这类 bug（实测假绿）；退出码也靠不住，jq 的退出码只反映最后一条输入是否出错。
 
-**本项目唯一没有先例可抄的部分。** 业内工具审的都是**代码**——git-ai 记行级归属、
-SpecStory 存对话、Memento 把 transcript 挂进 git notes，**没有一个记「审计本身」**。
+⚠️ 一条方法论教训：第一次用 `grep -c 'userModified'` 数 SpecStory 的保真度，得到「9 处命中」——假阳，命中的是自己命令里打过的字面量。
+换成「真做一次 Edit 再抽整段看」才得到真答案。断言选在不承重的维度上，等于没测。
 
-它替代 0 字节 marker：旧做法只记「审过了」，不记「审了什么、报了几个、几真几假」，
-于是命中率这类数字只能人肉从对话里数，而对话会被压缩掉。现在 `stats` 直接算：
+### 2.3 采集回放样本
 
-```
-{"审计次数":1, "finding 总数":4, "按判定":{"confirmed":3,"false-positive":1}, "命中率":"75%"}
-```
-
-**锚用 patch-id 不用 sha**——sha 在 rebase 后就变（实测本仓 294 个旧 marker 已有 4 个失效）。
-计算式与 [spec §4](spec/trace-v1.md) 逐字一致，回归里有一条专门钉这个。
-
-**SARIF 只取词汇不取封装**：SARIF 是 findings 的事实标准，但它为「带代码位置的工具输出」
-设计，最小信封每个结果十几行样板，且没有「N 个 agent 各带视角」与「二次交叉验证」的概念。
-我们保留紧凑 JSONL，finding 可带 SARIF 形状的 `location`，severity 记录到 SARIF `level`
-的映射（HIGH→error / MED→warning / LOW→note），将来要导出是机械转换。
-
-### 2.5 接入与自检
-
-**`tools/vibetrail-install`** 装 hook、写 `.gitattributes`、建 `.claude/trace/`，幂等可反复跑。
-
-关键决定是**装进有效 hooks 目录**（`git rev-parse --git-path hooks`）而**不是**
-`.githooks/` + 改 `core.hooksPath`：
-
-- `core.hooksPath` 可能已被别人占用——实测 agentDock 的 worktree 工具就在主仓 config
-  和**每个** `config.worktree` 里写死绝对路径。我们再设会被覆盖，**且失败是静默的**：
-  worktree 里 hook 不触发、trailer 为空、不报错。
-- 有效目录在主仓与全部 worktree 之间共享，**装一次全覆盖**（实测）。
-
-代价：`.git/hooks` 不入仓，所以**每个 clone 都要跑一次**。git 出于安全不允许仓库
-自动装 hook，这一步无法省——业内（husky）的解法是**搭车在人本来就会跑的步骤上**
-（它挂 `npm install`）。Go 项目没有等价物，agentDock 可搭 `Makefile`。见中心表 G3。
-
-**`tools/vibetrail-doctor`** 回答「这个仓的留痕现在是不是真的在工作」：hook 装没装、
-与仓内版本是否一致、`core.hooksPath` 被谁占用、最近 N 个 commit 有几个带归属。
-存在的理由是**所有失效形态都是静默的**——漏装、被别的 hook 顶掉、上游改字段名，
-都不报错，只是从此不再留痕。
-
-### 2.4 回归保护
-
-`tools/test-extract.sh` 跑 26 条正负例，比对的是**整条输出**（含 `human` 与全部字段名），
-不只比 kind——否则 `human` 翻转、`t`/`at`/`branch` 字段名漂移都抓不到（实测变异全绿）。
-判据依赖英文消息串、Claude Code 改文案即静默失效，**这个测试是唯一的哨兵**。
-
-它检查两件事：判定结果是否符合预期，**以及 jq 是否报错**。后者是补上去的——
-jq 在某条规则上抛错时，该记录**之后的规则**不再求值、之前的命中照常输出，然后继续下一条。
-所以只比对输出抓不到「末尾规则抛错」这类 bug：曾经的「去掉 `toolUseResult` 类型守卫」
-就是这样——输出一条不差、只有 stderr 刷屏，比对恒绿（实测假绿）。退出码也靠不住：
-jq 的退出码只反映**最后一条**输入是否出错。
+`experiments/collect-demo/scenario.json` 是一段编出来的示例会话的回放脚本，25 步：三轮对话、一次 Edit、一次被拒的 Bash、一次输出里带假密钥的 Bash、
+一次打断；没有子 agent。Pilot 与 teamai 的实跑样例
+（[third-party/](third-party/)）就是拿它喂出来的，同一份输入三家对比。G7 的回归要在它上面补：SessionStart 补做、打断后无 Stop、后台子 agent
+晚于父 Stop、一轮多 commit、端点未配置 / 配置后断网。
 
 ## 3. 还缺什么
 
-**见 [OPEN-ISSUES.md §C 中心表](OPEN-ISSUES.md)**，那里是唯一的未完成项清单，
-按类型（功能缺口 / 已知缺陷 / 待定决策 / 未量）与优先级排列，带关闭记录。
-
-本节此前重复描述过其中若干项，已删——三份文档各记一份同样的开放状态，
-是「必须与 X 保持一致」那类必然会漂的拷贝。**新增未完成项请只写进中心表。**
+**见 [OPEN-ISSUES.md §C 中心表](OPEN-ISSUES.md)**，那里是唯一的未完成项清单。新增未完成项只写进中心表。

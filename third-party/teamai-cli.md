@@ -185,8 +185,8 @@ applyPhase2Adjustments()   + 知识缺口加成（recall 一次没命中 → 20�
 
 `scanTranscriptStop(hookData.transcript_path)` 扫的是 hook 递过来的**单个** transcript 文件。
 
-Claude Code 的落盘布局是**两层**——**这一点本项目 [DESIGN.md](../DESIGN.md) 第 27 行
-早已记录**（`<sessionId>/subagents/agent-*.jsonl` 独立完整 transcript + `.meta.json`），
+Claude Code 的落盘布局是**两层**——**这一点本项目早已记录**（原 DESIGN §1 表第 27 行，现在在 [DESIGN.md §2](../DESIGN.md) 的两路表：
+`<sessionId>/subagents/agent-*.jsonl` 独立完整 transcript + `.meta.json`），
 不是本次新发现；本次新增的是**量级**与下面那条字段层的观察：
 
 ```
@@ -289,8 +289,9 @@ workspaceRoot  = git rev-parse --show-toplevel（当前 checkout）
 资源必须落 `workspaceRoot` 的原因：所有 AI 工具都是从启动目录往上扫到**当前**仓根来
 发现项目资源的，没有一个会跟到主 checkout 去。
 
-⚠️ **这条设计与本项目的 D2 决策方向相反**，是两边最根本的架构分歧；self 模式
-让知识随代码走，与我们部分重合，但会话/摩擦数据两种模式下都在代码提交历史之外。见对比文档 §4。
+⚠️ ~~**这条设计与本项目的 D2 决策方向相反**，是两边最根本的架构分歧~~——**2026-09-14 起不再相反**：本项目 D4 同样做到
+被观测仓零写入、机器数据在 HOME、数据去云端（[DESIGN D4](../DESIGN.md)）。self 模式让知识随代码走，会话/摩擦数据两种模式下
+都在代码提交历史之外——后者现在与我们一致。见对比文档 §4 的 2026-09-14 注。
 
 ### 4.4 hook 策略：只用 harness 生命周期 hook，不碰 git hook
 
