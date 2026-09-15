@@ -1,16 +1,18 @@
 # vibetrail 设计：用 hook 把 Claude Code 会话的两路数据传上云
 
-> **状态**（2026-09-14）：需求与设计定稿，未开工。已实现且沿用的只有人机分歧判据（[spec/diverge-v1.md](spec/diverge-v1.md)）。
+> **状态**（2026-09-15）：需求与设计定稿，未开工。已实现且沿用的只有人机分歧判据（[spec/diverge-v1.md](spec/diverge-v1.md)）。
 > 上一版设计（留痕数据投影进被观测仓、git hook 写 `Claude-Session` trailer）已于 2026-09-14 退役，见 §7 D4；仍在用的审计记录线见 §8。
+> 2026-09-15 D5：不传 transcript 原文件，正文只随人机分歧事件走，云端定为 paas-coding-hook 事件协议 1.0，索引保留 30 天够用。
 >
 > 文档分工：本文记**为什么与怎么做**；[CAPABILITIES.md](CAPABILITIES.md) 记**有什么、什么状态**；
 > [OPEN-ISSUES.md](OPEN-ISSUES.md) 是**唯一的未完成项清单**；[TODO.md](TODO.md) 记拆解；[third-party/](third-party/) 是三方对照的原始材料。
 
 ## 0. 一句话
 
-**机器级装一次**，之后每个 Claude Code 会话由 hook 自动采两路数据——**全量**（原始 transcript 逐字节副本，加 transcript 没有的 hook 事件与
-git 状态）和**人机分歧**（打断、拒绝的索引）——写进本机 outbox，经 HTTP push 到云端，ack 即删。被观测仓里**零写入**：不进 git、不写它的
-settings、不装 git hook、不放运行时。
+**机器级装一次**，之后每个 Claude Code 会话由 hook 自动采两路数据——**人机分歧**（打断、拒绝，带能判责的最小正文）和**轮次元数据**
+（会话 / 轮次 / 子 agent 的起止、每轮起止的 HEAD 与 commit、状态、token 用量，不带正文）——映射成 paas-coding-hook 事件协议 1.0 的事件，
+写进本机 outbox，经 HTTP push 到云端，ack 即删。**不传 transcript 原文件**，非分歧的消息与工具正文、thinking 都不传（§7 D5）。
+被观测仓里**零写入**：不进 git、不写它的 settings、不装 git hook、不放运行时。
 
 用户原话，按时间：
 
@@ -19,6 +21,8 @@ settings、不装 git hook、不放运行时。
 - 09-14：「我从来没说要放git，我会用hook把他用http的方式传云端」「暂时先不考虑脱敏」「什么时候说实时了，hook触发的时候采集一下，有就传」
 - 09-14：「项目级和用户级都要，可配置的，参考teamai，不存git了，不要clone一次装一次，未来会push云端，暂时先缓存本地文件让我看输出内容，保留push动作。然后和teamai一样，装一次就行」
 - 09-14：「我们应该也不把hook写进仓，之前的做法不需要」「现在我们的目标就是通过hook把数据传上去，尽量本地不要存太多东西」「如果不是常驻进程，用不到go吧」
+- 09-14：「它没说transcript正文要进表吧？你在哪看到的」
+- 09-15：「不用传全量的transcript文本，有必要吗」「正文的话，人机分歧先看看能不能带正文吧，其他的先不考虑，不然数据量有点大。如果后面有必要再补充」「数据30天没问题，超过一个月复盘意义不大」「读取不是我们读，我们只负责采，读取分析由其他服务完成」「turn.end 推荐 code，其实是自定义的，不是枚举的，interrupted我们可以直接加」
 
 ## 1. 要解决的问题
 
@@ -30,25 +34,28 @@ Claude Code 已经把每轮对话、thinking 全文、每次 Edit 的 diff、每
 2. **几百 MB 没有索引。** 本机 40 个主会话 700 MB，单个 106 MB。复盘要找「人在哪一步不同意机器」，得先有索引。
 3. **commit 与会话没有关联。** `git blame` 只到行，到不了意图。
 
-复盘要回答两问：**这个 commit 是怎么来的**；**出问题时人和 agent 在哪一步对不上**。答案都在 transcript 里，所以要做的是把它可靠地采出来、
-送到能查的地方，而不是自建一层采集。
+复盘要回答两问：**这个 commit 是怎么来的**；**出问题时人和 agent 在哪一步对不上**。答案都在 transcript 里，所以要做的是把答这两问要的那部分
+（分歧及其上下文、每轮的 commit 关系）可靠地采出来、送到能查的地方，而不是自建一层采集；读取与分析由别的服务做（用户 09-15）。
 
-## 2. 采什么：两路
+## 2. 采什么：分歧带正文，其余只有元数据
 
-| 路 | 采什么 | 形态 |
-|---|---|---|
-| **全量** | ① 原始 transcript 的增量副本：主会话 `<sid>.jsonl` + `<sid>/subagents/*.jsonl` + `*.meta.json`；② hook 事件流，只存 transcript 里**没有**的字段（事件名、时间、`tool_use_id`、错误类型、reason、`agent_id`）；③ git 状态：每轮起止的 HEAD、分支、worktree 根、脏文件数；④ `InstructionsLoaded` 当场存下的 CLAUDE.md / rules 正文与 sha | 字节流 + 事件 |
-| **人机分歧** | [spec/diverge-v1.md](spec/diverge-v1.md) 的 5 类 kind，每条带 turn uuid 指针 | 事件，KB 级（实测约 1,800 倍于 transcript 的压缩比） |
+| 路 | 采什么 | 正文 | 形态 |
+|---|---|---|---|
+| **人机分歧** | [spec/diverge-v1.md](spec/diverge-v1.md) 的 5 类 kind，映射成协议事件（§4.1） | **带**能判责的最小上下文：被拒调用的工具输入（命令 / 编辑内容）与拒绝原文；被打断的那条模型回复与打断后人的下一句 | 事件，每条 KB 级 |
+| **轮次元数据** | session / turn / subagent 的起止事件；每轮起止的 HEAD、分支、脏否与 `rev-list` 出的 commit（§3.5）；轮次状态、model、token 用量；`InstructionsLoaded` / `CwdChanged` / `StopFailure` 等 hook 事件头（事件名、时间、`tool_use_id`、错误类型、reason、`agent_id`） | **不带**：非分歧轮次的消息、工具输入输出、thinking、system prompt、CLAUDE.md 正文都不传 | 事件，每轮几条、百字节级 |
 
-两路按会话 id 关联——transcript 文件名与 hook 的 `session_id` 是同一个值。两路**解耦**：分歧一路不依赖全量一路开着；全量一路将来可因隐私
-关掉，分歧一路照常。原样副本上了云之后，「在云上从全量扫出分歧」也可行；本机提取仍是主路（无云也能用、已实现、两路解耦），云上重扫作对账。
+**不传 transcript 原文件**（§7 D5）。两路按会话 id 关联——transcript 文件名与 hook 的 `session_id` 是同一个值——走同一条通道。分歧一路的提取仍是
+diverge-v1 那份 jq，转成事件是它之后的一步。「后面有必要再补充」的口子留着：协议的 message.* / tool.* 与 ext.* 事件都在，要补正文时只是多映射几类记录，
+采集端不用换形态。
 
-### 2.1 「全」的定义：副本 ⊇ 源，不是 Pilot 的「全」
+### 2.1 「采全」的定义：人类侧一条不漏，靠条数对账
 
-Pilot 的「全」是把 transcript 规范化成事件之后的全。实测模型与工具一侧全、人类一侧漏：打断 265 条只进 5 条，每轮第一条人类输入
+上一版把「采全」定义成 transcript 逐字节复制上云，为的是躲 Pilot 的坑；2026-09-15 用户否掉（数据量大，两问用不上），见 §7 D5。
+现在「全」只对分歧成立：**人类侧每一条打断、拒绝都进事件**，钉子是每类 transcript 记录进多少条、出多少条事件（A2、A11），不是字节相等。
+Pilot 的坑照样要防：它把 transcript 规范化成事件，模型与工具一侧全、人类一侧漏——打断 265 条只进 5 条，每轮第一条人类输入
 1,599 条丢 154 条（[Pilot 采集清单 §1.2b](third-party/loongsuite-pilot-collection.md)）。根因是它按 promptId 分轮、只读 `user` / `assistant`
-两种记录，而原始 transcript 里的记录类型远不止这两种。本机清单（2026-09-14，40 个主会话 / 676 个子 agent 文件 / 700 MB，
-Claude Code 2.1.142–2.1.266，入口全是 claude-desktop）：
+两种记录，而原始 transcript 里的记录类型远不止这两种。解析器要按记录逐条走、不按轮分组。本机清单（2026-09-14，40 个主会话 / 676 个子 agent 文件 / 700 MB，
+Claude Code 2.1.142–2.1.266，入口全是 claude-desktop），标出人类侧记录在哪：
 
 | 顶层 `type` | 条数 | 里面是什么 |
 |---|---:|---|
@@ -70,21 +77,21 @@ Claude Code 2.1.142–2.1.266，入口全是 claude-desktop）：
 34 / 34 / 1（权限模式）；`instructions` 17 / `nested_memory` 7（加载的 CLAUDE.md）；`skill_listing` 102 / `mcp_instructions_delta` 105 /
 `environment` 82 / `session_context` 24（拼 system prompt 用）。其余是提醒类：`total_tokens_reminder` 8,333、`task_reminder` 2,397……
 
-所以「采全」只有一个可操作的定义：**原始文件逐字节复制**。完整性只需一条断言（字节相等）。规范化成事件（像 Pilot 那样）是下游投影，
-不在采集这一步做——采集时做归一化，就是把 Pilot 的漏采路径重走一遍。
+分歧相关的人类侧记录只在 `user`（打断标记、`is_error` 的拒绝正文）与 `queue-operation`（插话）里；其余类型是元数据或旁证，D5 后不传。
+规范化成事件的风险（Pilot 重走一遍）靠两条挡：判据只认字段不 grep 原文（diverge-v1 §4），条数进出对账（A2）。
 
-### 2.2 对照 Pilot 要补的
+### 2.2 对照 Pilot：哪些进事件、哪些不进
 
-| 要补的 | 原始副本里有没有 | 还要做什么 |
+| Pilot 漏的 / 我们要的 | transcript 里在哪 | D5 后怎么处理 |
 |---|---|---|
-| 打断记录（265 → 5） | 有：`user` 记录的 text 块 | 无 |
-| 每轮第一条人类输入（1,599 → 1,445） | 有 | 无 |
-| 被拒与执行失败分不开 | 有：拒绝正文在 `is_error` 块里，判据在 diverge-v1 | hook 侧另有类型化的 `PostToolUseFailure`（不含权限拒绝）与 `PermissionDenied`（只在 auto mode），见 §3.2 |
-| Edit 的 `structuredPatch` / `originalFile`，Bash 的 `stdout` / `stderr` / `interrupted` | 有：`toolUseResult` | 无 |
-| `uuid` / `promptId` / `requestId` | 有 | 无 |
-| system prompt 与工具定义 | ≥ 2.1.258 有（`prompt_snapshot`）；子 agent 没有；老版本没有 | 记版本；子 agent 与老版本接受缺失 |
-| CLAUDE.md 正文 | transcript 只有 `instructions` / `nested_memory` 附件，是否含全文未核 | `InstructionsLoaded` hook 当场存正文与 sha |
-| **git 状态**（HEAD、工作树） | **没有** | hook 侧富化：SessionStart / UserPromptSubmit / Stop 各记一次 HEAD、分支、worktree 根、`git status --porcelain` 的行数。逐次工具调用的工作树是 G11 的事 |
+| 打断记录（265 → 5） | `user` 记录的 text 块 | 进 `turn.end`（code `interrupted`）；子 agent 文件里的进 `subagent.end`（`cancelled`）；带被打断的回复与打断后的人话 |
+| 每轮第一条人类输入（1,599 → 1,445） | `user` 记录 | 轮次本身进 `turn.start` / `turn.end`（元数据）；正文只在被打断的轮次带 |
+| 被拒与执行失败分不开 | 拒绝正文在 `is_error` 块里，判据在 diverge-v1 | 人拒 / 分类器拦 / 链路故障进 `permission.decision`（decided_by 区分），执行失败才是 `tool.end(failed)`；hook 侧另有类型化的 `PostToolUseFailure`（不含权限拒绝）与 `PermissionDenied`（只在 auto mode），见 §3.2 |
+| 被拒调用的输入（命令 / 编辑内容） | 前一条 assistant 记录的 `tool_use` 块，按 `tool_use_id` 反查 | 进被拒调用的 `tool.request.input`，同时得到 `tool_name`（G5 前置） |
+| Edit 的 `structuredPatch` / `originalFile`，Bash 的 `stdout` / `stderr` | `toolUseResult` | **不传**（非分歧正文） |
+| `uuid` / `promptId` / `requestId` | 有 | `event_id` 从记录 uuid 派生，`turn_id` = promptId；打断记录常没有 promptId，按位置推、provenance 标 inferred |
+| system prompt、CLAUDE.md 正文 | ≥ 2.1.258 有 `prompt_snapshot`；`InstructionsLoaded` hook 给路径 | **不传**；`InstructionsLoaded` 只记路径与 sha 的事件头。「有必要再补充」 |
+| **git 状态**（HEAD、工作树） | **没有** | hook 侧富化：UserPromptSubmit / Stop 各记一次 HEAD、分支、脏否，进 `turn.start` / `turn.end` 的 vcs；worktree 根与脏文件数放 extensions。逐次工具调用的工作树是 G11 的事 |
 
 ## 3. 怎么采：只用 hook
 
@@ -95,16 +102,16 @@ Pilot 的拦截器路线（[对比 §6.3](third-party/teamai-cli-vs-vibetrail.md
 
 | 事件 | 动作 | 同步 / 异步 |
 |---|---|---|
-| `SessionStart` | 门控（按 scope，§5）→ 记 `source`、`model`、git 状态 → **补做**：本仓（按 `git worktree list` 归属）所有 offset 落后于文件大小的 transcript，各补一次副本、分歧提取与 push。agent 崩溃、被杀、`-p` 模式下 Stop / SessionEnd 都不来，全靠这一步 | 门控与记录同步；补做丢后台 |
-| `UserPromptSubmit` | 记 `prompt_id` 与 git 状态（轮开始）；顺手做一次增量副本 + 分歧提取（不 push）——打断只能在这里或下面两处补读 | 30 s 上限；stdout 会进模型上下文，**必须为空** |
-| `Stop` | 增量副本 + 分歧提取 + git 状态（轮结束）+ **push 一批**（本轮新增的，连同之前没传成的；端点未配置时这一步只记账不发） | `async: true`：不阻塞、不计 timeout |
-| `SubagentStart` / `SubagentStop` | 记 `agent_id`、`agent_type`、`agent_transcript_path`；Stop 时再扫一遍 `subagents/` 目录——后台子 agent 在父 Stop 之后才结束 | 异步 |
-| `PostToolUseFailure` / `PermissionDenied` / `StopFailure` / `Notification`（`permission_prompt`） | 只记事件头：`tool_use_id`、`error` / `reason` / `notification_type`、时间。类型化信号，见 §3.2 | 同步，毫秒级 |
-| `InstructionsLoaded` | 存 `file_path`、`load_reason`、正文与 sha | 官方说明它本身异步跑 |
+| `SessionStart` | 门控（按 scope，§5）→ 发 `session.start`（`source`、capabilities）、记 git 状态 → **补做**：本仓（按 `git worktree list` 归属）所有 offset 落后于文件大小的 transcript，各补一次解析（分歧 + 轮次元数据）与 push。agent 崩溃、被杀、`-p` 模式下 Stop / SessionEnd 都不来，全靠这一步 | 门控与记录同步；补做丢后台 |
+| `UserPromptSubmit` | 发 `turn.start`（`prompt_id` 作 turn_id、model、git 状态）；顺手解析一次新增记录（不 push）——打断只能在这里或下面两处补读 | 30 s 上限；stdout 会进模型上下文，**必须为空** |
+| `Stop` | 解析新增记录 + 发 `turn.end`（status、usage、git 状态、`rev-list` 出的 commits）+ **push 一批**（本轮新增的，连同之前没传成的；端点未配置时这一步只记账不发） | `async: true`：不阻塞、不计 timeout |
+| `SubagentStart` / `SubagentStop` | 发 `subagent.start` / `subagent.end`（`agent_id` 作实例 id、`agent_type`、父实例 `main`、派生它的 `parent_call_id`）；Stop 时再扫一遍 `subagents/` 目录——后台子 agent 在父 Stop 之后才结束 | 异步 |
+| `PostToolUseFailure` / `PermissionDenied` / `StopFailure` / `Notification`（`permission_prompt`） | 只记事件头，发 `ext.claude.<事件名>`：`tool_use_id`、`error` / `reason` / `notification_type`、时间。类型化信号，见 §3.2 | 同步，毫秒级 |
+| `InstructionsLoaded` | 记 `file_path`、`load_reason`、正文 sha；正文不传（D5，有必要再补） | 官方说明它本身异步跑 |
 | `CwdChanged` | 记 `old_cwd` / `new_cwd`（G11 接手检测的同一挂载点） | 同步 |
-| `SessionEnd` | 只记 `reason`；预算 1.5 s（`CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` 可抬），来不及的交给下一次 SessionStart 补做 | 同步 |
+| `SessionEnd` | 发 `session.end`（`reason`、status）；预算 1.5 s（`CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` 可抬），来不及的交给下一次 SessionStart 补做 | 同步 |
 
-不挂 `PreToolUse` / `PostToolUse`：每次工具调用多跑一个进程，而它们给的 `tool_input` / `tool_response` transcript 里全有。
+不挂 `PreToolUse` / `PostToolUse`：每次工具调用多跑一个进程，而它们给的 `tool_input` / `tool_response` transcript 里全有，且 D5 后除被拒调用的输入外都不传。
 hook payload 里的 `tool_input` / `tool_response` 也不另存一份——transcript 全有。Pilot 的输出里每份内容出现 3 次（`tool.call`、`llm.response`、
 下一次 `llm.request` 的输入增量各一份），就是同一内容多处存的下场。
 
@@ -120,9 +127,9 @@ hook payload 里的 `tool_input` / `tool_response` 也不另存一份——trans
 机器一侧倒有了类型化来源：`PermissionDenied`（≈ `classifier_blocked`）、`PostToolUseFailure`（工具失败，不是分歧）、`StopFailure`（API 错，
 带 `error` 类型）。hook 事件流记下它们的 `tool_use_id`，就能和 transcript 里的字符串判定对账——两边对不上就是判据漂了，这正是 G6 要的哨兵。
 
-### 3.3 增量副本与本机 outbox
+### 3.3 增量解析与本机 outbox
 
-- 每个 transcript 文件一个 byte offset，存 `~/.vibetrail/state/<sid>.json`；每次只复制到源文件**最后一个换行符**为止（源可能正在写半行）。
+- 每个 transcript 文件一个 byte offset，存 `~/.vibetrail/state/<sid>.json`；每次只解析到源文件**最后一个换行符**为止（源可能正在写半行）。不复制文件。
 - 源文件长度 < offset 时从 0 重读（重写守卫）。transcript 目前是 append-only，但 `file-history-snapshot` 带 `isSnapshotUpdate` 字段，不能假设永远是。
 - 首次全读、无单次上限。Pilot 首次只读最后一轮、单次超过 50 MB 只读尾部，那份 111 MB 的会话前段整个丢掉，4 条拒绝没了。
 - 子 agent 文件按 `<sid>/subagents/` 目录扫，不只信 hook 递来的那一个路径——teamai 栽在这里，58% 的人拒在子 agent 文件里
@@ -131,8 +138,9 @@ hook payload 里的 `tool_input` / `tool_response` 也不另存一份——trans
   （teamai 上报失败把整份 context 连 prompt 摘要写盘，别学）。
 - **本机不是存档，spool 是过手的 outbox**：push 在产出数据的同一个 hook 里发（Stop 异步；SessionStart 补做也发），服务端 ack 即删；本机常驻只有
   `state/`（offset、push 水位，KB 级）与还没 ack 的块。端点未配置的现阶段它才是「全部」，文件可读、不压缩，就是用户要先看的「输出内容」。
-- 倾向的布局：`~/.vibetrail/spool/<项目键>/<sid>/` 下 `transcript/…`（逐字节副本，路径照源）、`events.jsonl`（hook 事件流 + git 富化）、
-  `diverge.jsonl`（分歧）、`manifest.json`（每个文件的 offset、sha、版本、push 水位）。格式定稿后另立 spec。
+- 布局：`~/.vibetrail/spool/<项目键>/<sid>/` 下 `events.jsonl`（协议形状的事件，分歧与轮次元数据都在，每行一条、按 `event_id` 幂等）与
+  `manifest.json`（每个 transcript 文件的 offset、Claude Code 版本、push 水位）。不再有副本目录；分歧提取器的原始输出是中间产物，A3 拿它对账。
+  批次按协议打（≤ 100 条 / 16 MiB），不另立 spool spec，事件形状以协议 schema 为准（[原件进仓](third-party/collection-batch-1.0.schema.json)作回归输入）。
 
 ### 3.4 hook 纪律
 
@@ -147,7 +155,8 @@ desktop 启动的 hook 拿到什么 PATH 未测，jq 的绝对路径由 init 写
 UserPromptSubmit 记轮起 HEAD，Stop 记轮止 HEAD，并记 `git rev-list <起>..<止>`（一轮多 commit 也全在）；起不是止的祖先时（rebase / reset）
 改记这段时间内 reflog 新增的 sha；Bash 的 `git commit` stdout 里的短 sha 作旁证。人在别的终端提交会被算进当轮，靠 committer 与 transcript 里
 有没有对应的 Bash 调用区分，标 `inferred`。失去的只有一样：`git log` 里不用工具就能看到会话 id。这条推导替代了上一版的
-`Claude-Session` trailer（§7 D4）；它记的仍是「哪个会话执行了提交」，「每一行出自哪个会话」是 G11 的事。
+`Claude-Session` trailer（§7 D4）；它记的仍是「哪个会话执行了提交」，「每一行出自哪个会话」是 G11 的事。落到协议里是 `turn.start` / `turn.end` 的
+`vcs` 快照与 `turn.end.commits[]`（完整 sha、`relation=observed`、evidence `before_after`；Bash stdout 里的旁证走 `tool_result`）。
 
 ### 3.6 流程
 
@@ -158,32 +167,47 @@ flowchart LR
     subgraph M["本机，vibetrail init 装一次"]
         TR[("~/.claude/projects/…/&lt;sid&gt;.jsonl<br/>transcript，真相源")]
         ST["~/.claude/settings.json<br/>hook 条目，只在 HOME"]
-        RT["~/.vibetrail/bin/vibetrail-hook<br/>门控（scope）→ 增量副本 · 分歧提取 · 事件头 · git 状态"]
-        SP[("~/.vibetrail/spool/&lt;项目&gt;/&lt;sid&gt;/<br/>outbox：副本 · events · diverge · manifest<br/>ack 即删")]
+        RT["~/.vibetrail/bin/vibetrail-hook<br/>门控（scope）→ 增量解析 · 分歧 → 事件 · 轮次元数据 · git 状态"]
+        SP[("~/.vibetrail/spool/&lt;项目&gt;/&lt;sid&gt;/<br/>outbox：events · manifest<br/>ack 即删")]
     end
-    CL[("云端")]
+    CL[("云端：paas-coding-hook collector")]
     CC -->|"自己写"| TR
     CC -->|"SessionStart · UserPromptSubmit · Stop · …"| ST --> RT
     TR --> RT --> SP
-    SP -->|"push：分块 · gzip · 幂等键 · ack"| CL
+    SP -->|"push：≤100 事件 / 批 · event_id 幂等 · ack"| CL
     CL -.->|"ack → 删本机块"| SP
 ```
 
 被观测仓不在图里：它里面什么都不写。
 
-## 4. 去哪：本机 outbox → HTTP push 云端
+## 4. 去哪：本机 outbox → HTTP push 到 paas-coding-hook collector
 
-| | 全量 | 分歧 |
+| | 事件（分歧 + 轮次元数据，同一条通道） |
+|---|---|
+| 去向 | **云端已定**（§7 D5）：paas-coding-hook 事件协议 1.0 的 collector，`POST /api/v1/collection/batches`（[协议意见](third-party/paas-coding-hook-protocol-feedback.md)）。现阶段端点还没有：spool 里的事件就是将来 push 的内容，先让人看；push 动作第一版就在，端点未配置时不发只记账。**不进 git**；读取与分析不归本项目 |
+| push 怎么传 | 端点与 token 在 `~/.vibetrail/config` 里配，没配就不发（spool 完整保留，`vibetrail push --list` 看待发清单）。配了：按协议打批，≤ 100 条 / 16 MiB，单条 ≤ 1 MiB，超限不截断、整条拒收，要计数告警；`event_id` = UUIDv5(会话 id, 记录 uuid, 事件种类)，重发幂等；服务端返回 accepted + duplicate 后推进 push 水位并删本机块；失败留 spool，下次 hook 顺手重发；失败日志只留元数据。索引在 MySQL 事务提交后才返回，正文 Span 尽力投递，接受偶发丢正文（分歧的事实在索引里）。请求暂不支持压缩（已提意见）。仍未定：端点地址、token 怎么发与续期（U4） |
+| 保留 | 端点未配置前 spool 积着（上限与超限策略 U5，倾向只警告不丢）。配置后 **ack 即删**，不留 N 天。云端索引保留 30 天，**够用**（用户 09-15：「超过一个月复盘意义不大」）。仍要在会话自己的 Stop / SessionEnd 里落 spool，SessionStart 补做只是兜底——transcript 清理可能先于 hook 把源删掉 |
+| 体积 | 每会话 KB 级：分歧事件带被拒命令与被打断的回复，单条通常远小于 1 MiB；元数据每轮几条、百字节级。上一版 700 MB 字节流的分块与压缩问题随 D5 消失 |
+| 隐私 | 出本机的正文只剩：被拒调用的工具输入与拒绝原文、被打断的模型回复、打断后人的下一句。可能含命令里的密钥与代码片段。**暂不脱敏**（用户 09-14，K6），先原样传。云端「记录默认对公司已登录用户可见」（协议与 collector 文档），是目前唯一的闸而且是开的，已提意见 |
+
+### 4.1 映射到协议 1.0
+
+| 我们的 | 协议事件 | 关键字段 |
 |---|---|---|
-| 去向 | **云端**，hook 经 HTTP push。现阶段云端还没有：spool 里的文件就是将来 push 的内容，先让人看；push 动作第一版就在，端点未配置时不发只记账。**不进 git** | 同左，同一条通道 |
-| push 怎么传 | 端点在 `~/.vibetrail/config` 里配，没配就不发（spool 完整保留，`vibetrail push --list` 看待发清单）。配了：分块增量，按 byte offset 传新增部分，单会话 106 MB 不能一次 POST；传输层 gzip，spool 文件本身不压缩；幂等键 = 会话 id + 文件 + offset，重发不重复；服务端 ack 之后才推进 push 水位并删本机块；失败留 spool，下次 hook 顺手重发；失败日志只留元数据。端点、鉴权、schema、谁能看**暂不定**（U4） | 事件级，每条带 sid + turn uuid；其余同左 |
-| 保留 | 端点未配置前 spool 只能积着，这是「先让我看输出内容」的代价（本机全量 700 MB 量级；上限与超限策略 U5，倾向只警告不丢——采全优先于少存）。配置后 **ack 即删**，不留 N 天。仍要在会话自己的 Stop / SessionEnd 里落 spool，SessionStart 补做只是兜底——transcript 清理可能先于 hook 把源删掉 | 同左 |
-| 体积 | 本机 40 个主会话 700 MB（主 376 + 子 308），最大单文件 106 MB，分布 <1 MB 11 / 1–10 MB 21 / 10–50 MB 7 / >50 MB 1。上传量同量级，分块与压缩是必需项不是优化 | KB 级 |
-| 隐私 | 含 stdout 里的密钥、代码、thinking、绝对路径、`bridge-session` 的账号与组织 uuid、hostname。**暂不脱敏**（用户 09-14），先原样传。K6 留着，将来做时套在出本机那一层（三层准入：白名单 / 按 key 名拒 / 长度上限），本机缓冲永远原样；`bridge-session` 一类身份记录先单列，将来第一批处理。在那之前，云端「谁能看」是唯一的闸 | 同左 |
+| `interrupt` | `turn.end`，status code `interrupted` / category `cancellation` | `turn_id` 必填：打断记录常没有 promptId，按位置推、provenance 标 inferred。正文：被打断的那条 `message.assistant` 与打断后的 `message.user`（delivery `direct`）随同发 |
+| `interrupt_for_tool_use` + 配对的 `permission_denied`（计一次） | `permission.decision`，decision `deny`，decided_by `user` | `tool_name` 必填：`The user doesn't want to proceed` 形态里没有工具名，用 `is_error` 块的 `tool_use_id` 反查 `tool_use` 块的 `name`（G5 前置）。正文：同一次反查取 `input`，发一条 `tool.request`；拒绝原文放 `reason` |
+| `classifier_blocked` | 同上，decided_by `policy` | 同上 |
+| `permission_infra_fail` | 同上，decision `error`，decided_by `system` | 同上 |
+| 子 agent 文件里的打断 | `subagent.end`，status `cancelled` | 父会话那条是 `turn.end`，两个事实，不去重（K1 关闭）；统计打断只数 `turn.end` |
+| 轮次 | `turn.start`（model、vcs）/ `turn.end`（status、usage、vcs、commits[]） | UserPromptSubmit / Stop 各一条；Stop 不来（打断、崩溃）时 `turn.end` 由 transcript 或 SessionStart 补做给出，status `interrupted` / `unknown` |
+| 会话、子 agent | `session.start`（source、capabilities）/ `session.end`（reason、status）/ `subagent.start`（agent_type、父实例、`parent_call_id`）/ `subagent.end` | hook payload 直接给 |
+| hook 事件头 | `ext.claude.<事件名>`，provenance `hook` + `source_event` | `InstructionsLoaded` 只带路径与 sha |
 
-云端候选：paas-coding-hook 的事件协议 1.0（[意见](third-party/paas-coding-hook-protocol-feedback.md)）。它是事件模型、九种 type、单条 1 MiB 上限——
-分歧一路能直接映射到 tool.end / turn.end 的 status（要加 `denied`）；全量一路「原样字节流」放不进去，要么另开通道、要么规范化成事件。
-这与「全量存原样还是存事件」（U3）是同一个决定。
+Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-batch-1.0.schema.json)）：枚举类字段全是小写 `code` 型；`permission.decision` 必填
+`permission_id` / `tool_name` / `decision` / `decided_by`；`provenance.kind=transcript` 必带 `rule_version`；`files[].evidence=tool_argument` 只能是
+`target` / `read`，说「改了」要 `tool_result` 或 `before_after`；路径必须在工作区根内、不能 `..`（跨仓改动 K2 没有表达法）；`commits` 只能挂 `turn.end`、
+非空、完整 sha；`ext.*` 必带 `provenance.source_event`；thinking 不能当 assistant 文本。`client.name` 是 const `paas-coding-hook`（已提意见）。
+`workspace_id` 取主 checkout（`git worktree list` 第一条），与 G8 的分区键一致，worktree 路径放 extensions。
 
 ## 5. 安装与范围
 
@@ -255,14 +279,29 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
 - **LoongSuite Pilot**：hook + 拦截器 + 常驻，事件模型漏人类侧（打断 265 → 5）、每份内容出现 3 次、首次只读最后一轮。可借的是 spool 原子写、
   升级清自家旧条目、装卸对称、`--purge` 才删数据、不依赖用户运行时。[loongsuite-pilot.md](third-party/loongsuite-pilot.md)、
   [采集清单](third-party/loongsuite-pilot-collection.md)、[实跑样例](third-party/loongsuite-pilot-collection-sample.md)。
-- **paas-coding-hook 事件协议 1.0**：云端候选，缺 `denied` 状态、子 agent 挂父会话的字段、状态来路与规则版本、agent 版本、类型化事件的容器。
-  [意见](third-party/paas-coding-hook-protocol-feedback.md)。
+- **paas-coding-hook 事件协议 1.0**：云端已定（D5）。第二版采纳了第一轮全部意见（拒绝进 `permission.decision`、子 agent 挂父会话、`provenance` + `rule_version`、
+  `agent.version`、`ext.*`）；第二轮意见（gzip、失败 event_id、SDK 上限、可见性、跨仓路径、`client.name`）见 [意见](third-party/paas-coding-hook-protocol-feedback.md)。映射见 §4.1。
 - **同一段示例会话过一遍 Pilot 与 teamai 各记下了什么**：[teamai 实跑](third-party/teamai-cli-collection-sample.md)、
   [Pilot 实跑](third-party/loongsuite-pilot-collection-sample.md)、[Pilot 原始输出](third-party/loongsuite-pilot-collection-output.md)。
 
 ## 7. 决策记录
 
-### D4 — 两路数据不进 git：本机 outbox，hook 经 HTTP push 云端；hook 与 git hook 都不写进仓（2026-09-14，现行）
+### D5 — 不传 transcript 原文件；正文只随人机分歧事件走；云端定为 paas-coding-hook 协议 1.0；保留 30 天够用（2026-09-15，现行）
+
+用户原话见 §0。定了什么：
+
+- **全量一路改为轮次元数据。** 09-14 写进 §2 的「原始 transcript 逐字节副本上云」撤销：用户当天已质疑「它没说 transcript 正文要进表吧」，09-15 明确
+  「不用传全量的 transcript 文本」。理由是数据量，两问也用不上。
+- **正文只在分歧事件上带**：被拒调用的输入与拒绝原文、被打断的回复与打断后的人话。其余（非分歧消息、工具输入输出、thinking、system prompt、CLAUDE.md）
+  不传，「如果后面有必要再补充」——协议的 message.* / tool.* 事件留着这个口子。
+- **云端就是 paas-coding-hook 的 collector**，采集端映射成协议事件（§4.1）。`turn.end` 的 status.code 是自定义值，`interrupted` 直接用，不等服务端。
+  U3 关闭，U4 只剩端点与 token。
+- **索引保留 30 天够用**：「超过一个月复盘意义不大」。U10 关闭。
+- **读取与分析不归本项目**：「读取不是我们读，我们只负责采」。查询端只留 push 前的本地预览（G9 再缩）。
+
+代价写明：G11 §6 第 3 步「回原始 transcript 还原现场」只在本机 30 天内有来源；分歧之外的对话正文不在云端。
+
+### D4 — 两路数据不进 git：本机 outbox，hook 经 HTTP push 云端；hook 与 git hook 都不写进仓（2026-09-14，现行；采什么与去哪 09-15 由 D5 修正）
 
 用户原话见 §0。定了什么：
 
@@ -284,7 +323,7 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
 当时的理由：随代码走、team 可见、换机器不丢，只有入 git 满足；正文不进仓（单会话 106 MB、项目 406 MB 撑爆仓库；stdout 可能含密钥）。
 否掉的选项：本地 SQLite（不随仓走）、sidecar 仓（要自己同步、关联靠时间戳）、上报外部服务（等于发布）。
 被取代的原因：用户要的是采全并传上云，KB 级摘要答不了「模型当时看到了什么」；仓内投影反而成了几百 MB 数据的一个多余去处。
-D2 的一条判断仍成立：正文与指针分开，分歧记录只存 turn uuid 指针，正文在全量副本里。
+D2 的「正文与指针分开」在 D5 后反转：分歧事件自带能判责的最小正文，turn uuid 指针只用来与本机 transcript 对账。
 
 ### D3 — 存量 637 个 0 字节审计 marker：不迁移（2026-09-08）
 
@@ -318,7 +357,7 @@ D2 的一条判断仍成立：正文与指针分开，分歧记录只存 turn uu
 | # | 验收 | 怎么验 |
 |---|---|---|
 | A1 | **机器级装一次**，之后新开的会话自动采，每个 clone 不再有任何手动步骤 | 新机器跑一次 `vibetrail init`；之后在任何登记过的仓开会话都采（scope=user 时本机所有目录）；doctor 全绿 |
-| A2 | 全量一路**采全**：副本 ⊇ 源 | 会话结束后（或下一次 SessionStart 补做后），副本与源 transcript（主会话 + 子 agent + `.meta.json`）逐字节一致，截至源的最后一个完整行 |
+| A2 | **分歧不漏、轮次成对**：每类记录进出条数相等 | 同一份 transcript 上，diverge-v1 的每条命中都有对应事件（`permission.decision` / `turn.end` interrupted / `subagent.end` cancelled）；每个 UserPromptSubmit 有 `turn.start`，每个 Stop 或打断有 `turn.end`；子 agent 文件按目录扫全，条数进出相等 |
 | A3 | 分歧一路自动 | 打断 / 拒绝在下一次 hook 触发后被提取进 spool；结果与 `extract-diverge.jq` 直接跑在同一份 transcript 上逐字一致 |
 | A4 | 只采登记过的项目（G8） | scope=project：未登记的目录里开会话，本机不落任何东西。scope=user：本机所有目录都采 |
 | A5 | 不影响宿主 | 所有 hook `exit 0`、stdout 为空、显式 timeout；回放 scenario.json 时 transcript 的 `stop_hook_summary` 里 `hookErrors` 为空 |
@@ -326,11 +365,11 @@ D2 的一条判断仍成立：正文与指针分开，分歧记录只存 turn uu
 | A7 | 装卸对称 | uninstall 后 `~/.claude/settings.json` 里的条目、`~/.vibetrail/bin` 与 state 还原；`--purge` 才删 spool |
 | A8 | **仓里零写入** | 装完、采完、卸完，被观测仓的工作树与 `.git/` 都不多任何文件（`git status` 与 `.git/hooks` 前后一致） |
 | A9 | **本机可看、但不留存** | 端点未配置：spool 里的文件人能直接打开读，且就是 push 会发的内容，`vibetrail push --list` 列出每一份与大小。配置后：ack 即删，spool 里只剩没传成的 |
-| A10 | push 不重不漏 | 端点未配置：不发、不删。配置后：云端收到的字节与 spool 一致；断网期间的数据在网络恢复后由后续 hook 补传，重发不产生重复 |
-| A11 | 完整性钉子 | 全量 = 字节数与每类记录条数进出相等；分歧 = fixtures 全绿；hook = scenario.json 回放；未知记录类型 / 事件名告警 |
+| A10 | push 不重不漏 | 端点未配置：不发、不删。配置后：每批 accepted + duplicate 等于发出的条数，每条事件先过协议 schema；断网期间的数据在网络恢复后由后续 hook 补传，重发不产生重复（`event_id` 幂等） |
+| A11 | 完整性钉子 | 元数据 = 每类记录条数进出相等；分歧 = fixtures 全绿且映射后每条过 schema；hook = scenario.json 回放；未知记录类型 / 事件名告警；超过 1 MiB 被拒的事件计数 |
 
 ## 10. 未定项
 
-只记在 [OPEN-ISSUES.md](OPEN-ISSUES.md)：U1 默认 scope · U2 登记方式 · U3 全量格式 · U4 云端服务 / 端点 / schema / 谁能看 · U5 spool 上限 ·
-U6 审计线去向 · U7 自建还是改造 Pilot · U8 类型化信号成不成 kind · U9 Codex / Cursor · U10 云端保留期与压缩格式；另有 K6 脱敏（暂缓）、
-G8 / G9 / G6 / G10 / G11。
+只记在 [OPEN-ISSUES.md](OPEN-ISSUES.md)：U1 默认 scope · U2 登记方式 · U4 端点 / token / 谁能看 · U5 spool 上限 ·
+U6 审计线去向 · U7 自建还是改造 Pilot · U8 类型化信号成不成 kind · U9 Codex / Cursor；另有 K6 脱敏（暂缓）、G5（升为前置）、
+G8 / G9 / G6 / G10 / G11。U3 / U10 / K1 已由 D5 关闭。

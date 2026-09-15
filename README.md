@@ -1,7 +1,8 @@
 # vibetrail
 
-用 Claude Code 的 hook，把每个会话的两路数据自动传上云：**全量**（原始 transcript 逐字节副本，加 transcript 没有的 hook 事件与 git 状态）
-和**人机分歧**（打断、拒绝的索引）。机器级装一次，被观测仓里零写入。
+用 Claude Code 的 hook，把每个会话的两路数据自动传上云：**人机分歧**（打断、拒绝，带能判责的最小正文）和**轮次元数据**
+（会话 / 轮次 / 子 agent 起止、每轮起止的 HEAD 与 commit、状态，不带正文），映射成 paas-coding-hook 事件协议 1.0。不传 transcript 原文件。
+机器级装一次，被观测仓里零写入。
 
 目标一句话：拿到任何一个 commit，能追回「它是怎么来的」；出了问题，能定位**人和 agent 在哪一步对不上**。
 
@@ -22,15 +23,15 @@ vibetrail init（每台机器一次）
 
 每个会话
   SessionStart / UserPromptSubmit / Stop / … ──▶ vibetrail-hook
-     门控（只采登记过的项目）→ transcript 增量副本 + 分歧提取 + 事件头 + git 状态
-     ──▶ ~/.vibetrail/spool/<项目>/<sid>/   ──push（HTTP，分块、gzip、幂等）──▶ 云端，ack 即删
+     门控（只采登记过的项目）→ 增量解析 transcript → 分歧事件（带正文）+ 轮次元数据 + git 状态
+     ──▶ ~/.vibetrail/spool/<项目>/<sid>/events.jsonl   ──push（HTTP 批次，event_id 幂等）──▶ paas-coding-hook collector，ack 即删
 ```
 
 被观测仓里不写 settings、不装 git hook、不放运行时、不进 git。现阶段云端还没有，spool 里的文件就是将来 push 的内容。
 
 ## 状态
 
-2026-09-14 需求与设计定稿，未开工。已有并沿用的是人机分歧判据（755 会话实测精确率 100%，裸 grep 只有 10.5%）。
+2026-09-14 需求与设计定稿、09-15 定不传 transcript 原文件并选定云端协议（DESIGN D5），未开工。已有并沿用的是人机分歧判据（755 会话实测精确率 100%，裸 grep 只有 10.5%）。
 上一版设计（留痕投影进被观测仓、git hook 写 trailer）已退役，理由与替代见 [DESIGN.md §7](DESIGN.md)。
 
 已实测确立的地基（`experiments/` 可复现）：Claude Code 的 hook 在 **desktop app 下正常触发且热加载**，stdin 直接给出 `transcript_path`；

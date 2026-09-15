@@ -1,3 +1,8 @@
+# 对 paas-coding-hook 事件协议的意见
+
+> 第一轮（2026-09-14，针对 1.0 初版）是 §1–§3，第二版协议全部采纳，落实方式见 §4。第二轮（2026-09-15，针对 1.0 第二版：协议、collector 实现说明、Span 归档规范、schema）在 §5。
+> 我们这边随之定的映射在 [DESIGN.md §4.1](../DESIGN.md)；schema 原件存 [collection-batch-1.0.schema.json](collection-batch-1.0.schema.json)。
+
 ## 1. 人机分歧需要的字段
 
 ### 1.1 tool.end、turn.end 的 status
@@ -43,3 +48,27 @@
 | session.start `source`、session.end `reason` | 分会话边界 |
 | turn.start / turn.end `head_sha`、`branch` | 把提交归到轮次 |
 | message.user `origin`：human / queued / tool_result / system | 区分人的输入与注入内容 |
+
+## 4. 第一轮的落实（第二版协议，2026-09-15 核）
+
+| 第一轮提的 | 第二版怎么落的 |
+|---|---|
+| 1.1 status 加 `denied` / `denied_by` | 拒绝改成独立事件 `permission.decision`（`decision` deny / error，`decided_by` user / policy / system），status 加 `category` 一层含 `denial`；明写执行前被拒只发 decision、不伪造 `tool.end`；工具中断时 `tool.end(cancelled)` 与 `turn.end(cancelled)` 各发一条 |
+| 1.2 子 agent 挂父会话 | 公共字段 `agent_instance_id` / `parent_agent_instance_id` / `parent_session_id` / `parent_call_id`；派活说明标 `author_type=agent`、`delivery=injected` |
+| 1.3 `status_source` / `rule_version` | `provenance.kind`（hook / api / transcript / filesystem / inferred / synthetic）+ `rule_version`，transcript 与 inferred 必带 |
+| 1.4 `agent_version` | `agent.version` 每条事件可带 |
+| 2 事件类型封闭 | `ext.<ns>.<name>` 扩展事件 + `raw` 保留原始事件 |
+| 3 其他字段 | `session.start.source`、`session.end.reason`、`turn.start/end.vcs`（branch / head_sha / dirty）、`turn.end.commits[]`、message 的 `author_type` + `delivery` 都有了 |
+
+## 5. 第二轮意见（2026-09-15）
+
+对象：collection-event-protocol.md 第二版、collector-implementation.md、coding-span-spec.md、collection-batch-1.0.schema.json。映射本身没有拦路的问题，以下按轻重排。
+
+1. **请求支持 `Content-Encoding: gzip`。** 现在 415 拒。
+2. **响应列出 SDK 上报失败的 `event_id`。** 现在只有 `sdk_failed_count`，客户端不知道该补哪些，只能整批重发。
+3. **公布 Monitor SDK 的单条正文上限。** Span 规范说低于事件长度时记失败，客户端要按它控制单条大小。
+4. **可见性。** 「记录默认对公司已登录用户可见」；分歧事件带被拒的命令与被打断的回复，含代码片段、可能含密钥，采集端暂不脱敏。需要按 user / project 控制访问，或明确开放前要经脱敏。
+5. **文件关系跨工作区。** `files[].path` 必须在 `workspace_id` 的根内、不能 `..`，会话改别的仓的文件没有表达法。建议 file 项可选 `workspace_id`。
+6. **`client.name` 是 const `paas-coding-hook`。** 放开成推荐值：vibetrail 是独立客户端，冒名会把两边的 `rule_version` 混在一起。小项。
+
+不再提的：`turn.end` 的 `interrupted`（code 是自定义值，直接用）；保留期（30 天够用）；读取接口（读取分析不归采集端）。

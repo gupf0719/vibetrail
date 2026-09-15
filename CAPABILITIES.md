@@ -6,8 +6,8 @@
 
 ## 0. 一句话
 
-用 Claude Code 的 hook，把每个会话的两路数据自动传上云——**全量**（原始 transcript 逐字节副本 + hook 事件 + git 状态）和**人机分歧**
-（打断、拒绝的索引）——用来回答**这个 commit 是怎么来的**，以及**出问题时人和 agent 在哪一步对不上**。
+用 Claude Code 的 hook，把每个会话的两路数据自动传上云——**人机分歧**（打断、拒绝，带最小正文）和**轮次元数据**（会话 / 轮次 / 子 agent 起止、
+每轮起止的 HEAD 与 commit、状态，不带正文）——映射成 paas-coding-hook 事件协议 1.0，不传 transcript 原文件（DESIGN D5）。用来回答**这个 commit 是怎么来的**，以及**出问题时人和 agent 在哪一步对不上**。
 
 ## 1. 功能清单
 
@@ -25,21 +25,21 @@
 | 功能 | 状态 | 形态 |
 |---|---|---|
 | `vibetrail init` / `uninstall` | ❌ | 机器级装一次：`~/.vibetrail/bin`、HOME settings 条目（带 marker）、scope 配置、登记；DESIGN §5 |
-| hook 分发入口 `vibetrail-hook <事件>` | ❌ | 读 stdin、按 scope 门控、事件头写 `events.jsonl`；DESIGN §3.1 |
-| 全量增量副本 | ❌ | byte offset、截到最后一个换行、子 agent 按目录扫、原子写；DESIGN §3.3 |
-| 分歧提取挂 hook | ❌ | 现有 jq 在 UserPromptSubmit / Stop / SessionEnd / SessionStart 补做时跑，写 `diverge.jsonl` |
+| hook 分发入口 `vibetrail-hook <事件>` | ❌ | 读 stdin、按 scope 门控、发 session / turn / subagent 起止事件与 `ext.claude.*` 事件头，写 `events.jsonl`；DESIGN §3.1、§4.1 |
+| 增量解析 | ❌ | 每个 transcript 文件一个 byte offset、截到最后一个换行、子 agent 按目录扫、原子写；不复制文件；DESIGN §3.3 |
+| 分歧提取挂 hook + 协议映射 | ❌ | 现有 jq 在 UserPromptSubmit / Stop / SessionEnd / SessionStart 补做时跑；命中映射成 `permission.decision` / `turn.end(interrupted)` / `subagent.end(cancelled)`，`tool_name` / `input` 按 `tool_use_id` 反查（G5）；DESIGN §4.1 |
 | commit ↔ session 推导 | ❌ | 每轮起止 HEAD + `rev-list`；DESIGN §3.5 |
-| `vibetrail push [--list \| --show]` | ❌ | 端点没配不发；配了分块 + gzip + 幂等 + ack 即删；DESIGN §4 |
+| `vibetrail push [--list \| --show]` | ❌ | 端点没配不发；配了按协议打批、每条过 schema、`event_id` 幂等、ack 即删；DESIGN §4 |
 | doctor 扩展 | 🔁 | 现有 `tools/vibetrail-doctor` 查的是退役的 git hook 与仓内 vendor，要改成 DESIGN §5 的自检项 |
-| 查询端 | 🔁 | 现有 `tools/vibetrail`（show / log / session / diverge）读仓内 `sessions/` 与 `Claude-Session` trailer，要改读 spool / 云端，按 commit 查改走推导映射 |
-| 完整性钉子 | ❌ | 字节相等、每类记录条数进出相等、未知类型 / 事件名告警（G10、G6） |
+| 本地预览 | 🔁 | 现有 `tools/vibetrail`（show / log / session / diverge）读仓内 `sessions/` 与 `Claude-Session` trailer，两者都退役；只留 push 前预览（`push --list / --show`），读取与分析不归本项目（D5） |
+| 完整性钉子 | ❌ | 每类记录条数进出相等、映射后事件全部过 schema、超 1 MiB 被拒计数、未知类型 / 事件名告警（G10、G6） |
 
 ### 退役（2026-09-14，D4；代码在 G7 落地时删）
 
 | 功能 | 原实现 | 为什么退 |
 |---|---|---|
 | 每个 clone 接入 | `tools/vibetrail-install`：装 git hook、vendor 运行时到 `.claude/vibetrail/`、写 `.gitattributes`、建 `.claude/trace/` | 被观测仓零写入；机器级装一次 |
-| commit ↔ session 的 `Claude-Session` trailer | `tools/prepare-commit-msg` + `tools/test-hook.sh`（12 场景回归 + 5 组变异） | 不装 git hook；改从全量副本推。同一个 hook 还写审计线的 `Vibetrail-Id`，见下 |
+| commit ↔ session 的 `Claude-Session` trailer | `tools/prepare-commit-msg` + `tools/test-hook.sh`（12 场景回归 + 5 组变异） | 不装 git hook；改从每轮起止 HEAD 推（DESIGN §3.5）。同一个 hook 还写审计线的 `Vibetrail-Id`，见下 |
 | 会话流水投影进仓 | `tools/vibetrail-sync`（按 worktree 清单认领会话、整份重生成） | 两路数据不进 git；它的归属判据（`git worktree list` + realpath）沿用到 hook 的门控 |
 | 仓内 vendor 运行时与 MANIFEST | `vibetrail-install` 的一部分 | 运行时只在 `~/.vibetrail/bin/` 一份 |
 

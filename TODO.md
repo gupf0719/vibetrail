@@ -4,26 +4,26 @@
 > 每条的一句话与状态只记在那里；本文记其中**已经有方案、还没开工**的需求的细节——
 > 需求原话、方案、验证、限制、拆解。做完一条就删掉它的小节，并在中心表关闭对应 ID。
 
-## G7 hook 采两路数据：全量 + 人机分歧（当前先做）
+## G7 hook 采两路数据：人机分歧（带正文）+ 轮次元数据（当前先做）
 
-需求与设计 2026-09-14 定稿，全文在 [DESIGN.md](DESIGN.md)（用户原话 §0、采什么 §2、怎么采 §3、去哪 §4、安装 §5、验收 §9）；
-未定项只在 [OPEN-ISSUES.md](OPEN-ISSUES.md) U1–U10。本节只留拆解，做完一条勾一条；全部做完删掉本节并在中心表关 G7。
+需求与设计 2026-09-14 定稿、09-15 D5 修正采什么与去哪，全文在 [DESIGN.md](DESIGN.md)（用户原话 §0、采什么 §2、怎么采 §3、去哪与映射 §4、安装 §5、验收 §9）；
+未定项只在 [OPEN-ISSUES.md](OPEN-ISSUES.md) U1、U2、U4–U9。本节只留拆解，做完一条勾一条；全部做完删掉本节并在中心表关 G7。
 
 ### 拆解
 
-- [ ] 定 U1 默认 scope 与 U3 全量格式（U4 云端服务可以最晚定：端点没配之前 push 不发）。
+- [ ] 定 U1 默认 scope（U4 只剩端点与 token，可以最晚定：端点没配之前 push 不发）。服务端 schema 已进仓：`third-party/collection-batch-1.0.schema.json`。
 - [ ] 机器级安装：`vibetrail init [--scope user|project]`——`~/.vibetrail/bin` + HOME settings 条目（带 marker）+ `config`（含 jq 绝对路径）+ 登记；
   `vibetrail uninstall`；doctor 改成 DESIGN §5 的自检项。被观测仓里零写入（A8）。
-- [ ] hook 分发入口 `vibetrail-hook <事件>`：读 stdin、按 scope 门控、事件头写 `events.jsonl`、git 状态（DESIGN §3.1）；纪律照 §3.4。
-- [ ] 分歧一路：`extract-diverge.jq` 挂到 UserPromptSubmit / Stop / SessionEnd / SessionStart 补做，带 offset 增量，写 `diverge.jsonl`；`vibetrail-sync` 退役。
-- [ ] 全量一路：增量副本（DESIGN §3.3）+ `InstructionsLoaded` 正文；先做 Claude Code。
+- [ ] hook 分发入口 `vibetrail-hook <事件>`：读 stdin、按 scope 门控、发 session / turn / subagent 起止事件与 `ext.claude.*` 事件头、git 状态，写 `events.jsonl`（DESIGN §3.1、§4.1）；纪律照 §3.4。
+- [ ] 分歧一路：`extract-diverge.jq` 挂到 UserPromptSubmit / Stop / SessionEnd / SessionStart 补做，带 offset 增量；命中映射成 `permission.decision` / `turn.end(interrupted)` / `subagent.end(cancelled)`，`tool_name` 与 `input` 按 `tool_use_id` 反查（G5 前置），带上被打断的回复与打断后的人话；`vibetrail-sync` 退役。
+- [ ] 轮次元数据一路：每轮 `turn.start` / `turn.end`（status、usage、vcs）、`InstructionsLoaded` 只记路径与 sha；不传 transcript 原文件、不传非分歧正文（D5）；先做 Claude Code。
 - [ ] commit ↔ session 推导：每轮起止 HEAD + `rev-list`（DESIGN §3.5）；`vibetrail show` 按 commit 查改走它。
-- [ ] push：`vibetrail push [--list | --show]`，端点从 `~/.vibetrail/config` 读、没配不发；配了走分块 + 传输层 gzip + 幂等 + ack 推进水位并删本机块 + 失败重发；
-  Stop 异步顺手调；测试对手先用一个只记录请求的桩端点（Pilot / teamai 实跑样例就是这么截的）。
-- [ ] 完整性钉子：字节相等、每类记录条数进出相等、未知记录类型 / 事件名告警（A11；G10、G6）。
+- [ ] push：`vibetrail push [--list | --show]`，端点与 token 从 `~/.vibetrail/config` 读、没配不发；配了按协议打批（≤ 100 条 / 16 MiB）、每条先过 schema、`event_id` 幂等、accepted + duplicate 推进水位并删本机块、失败重发；
+  Stop 异步顺手调；测试对手先用一个只记录请求并按 schema 校验的桩端点（Pilot / teamai 实跑样例就是这么截的）。
+- [ ] 完整性钉子：每类记录条数进出相等、映射后事件全部过 schema、超 1 MiB 被拒计数、未知记录类型 / 事件名告警（A11；G10、G6）。
 - [ ] 回归：两路各有带断言的测试，输入用 [experiments/collect-demo/scenario.json](experiments/collect-demo/scenario.json) 回放，补上 SessionStart 补做、
   打断后无 Stop、后台子 agent 晚于父 Stop、一轮多 commit、端点未配置 / 配置后断网五个场景。
-- [ ] 查询端改读 spool / 云端；删退役脚本（CAPABILITIES §1 退役表）；spool 格式定稿后立 spec；OPEN-ISSUES 关 G7。
+- [ ] 查询端只留 push 前本地预览（G9，读取不归本项目）；删退役脚本（CAPABILITIES §1 退役表）；OPEN-ISSUES 关 G7。
 
 ## G11 多个会话改、一个会话提交：追回每一行出自哪个会话
 
@@ -408,7 +408,7 @@ f.txt      L3   rest     最后见于 B:B1 → 仍在末端
    对这些行跑 blame，找到引入它们的 commit（学术上叫 SZZ 算法）。
 2. **查归属。** 4.1：引入 commit 对应的会话（G7 从每轮起止 HEAD 推出，DESIGN §3.5）就是会话，「接手前已有」的行按下表另查；要到调用，翻这个会话的
    transcript。做了 4.2 的话：`Vibetrail-Id` → 归属记录 → 会话 + tool_use_id，放置者与内容来源不同时两个都要看。
-3. **还原现场。** 回**原始 transcript**（不用 Pilot 事件，理由见 §3 末；留存已由 G7 解决——逐字节副本上云，DESIGN §2），沿 `parentUuid` 往上找到触发这次
+3. **还原现场。** 回**原始 transcript**（不用 Pilot 事件，理由见 §3 末；**留存未解决**：2026-09-15 D5 定不传 transcript 原文件，只有本机 30 天内可回，DESIGN §7 D5），沿 `parentUuid` 往上找到触发这次
    工具调用的人类消息。证据包：人的指令、模型的 thinking、工具调用本身、同会话前后的分歧事件（判据已有）、
    当时的 system prompt 与加载的 CLAUDE.md（2.1.258 起 transcript 自带快照，见 [DESIGN §6.3](DESIGN.md)）、
    这个 commit 的审计记录（`vibetrail-audit`）。
@@ -564,8 +564,8 @@ f.txt      L3   rest     最后见于 B:B1 → 仍在末端
   （第六轮错 4），只能用共享命名空间；pre 那次快照要拍完工具才开始跑，每次工具调用都多出这段耗时（§7）；`Vibetrail-Id`
   要装我们的 `prepare-commit-msg`，没装的仓只能锚 commit sha 一类，rebase 后会变；只对工具调用前后有同步 hook 的
   agent 成立，靠事后读日志接入的拍不到调用前后的快照。
-- **~~对话证据怎么留~~——已定（2026-09-14，D4）**：G7 把原始 transcript 逐字节副本连 `subagents/` 一起传上云，SessionStart 补做兜底、
-  赶在清理之前；§6 第 3 步回的就是这份副本。以下为原记。用户 2026-09-11：「为什么要会话还在，不是会全采上传么，或者我们干脆把transcript也定期保存一份呢」。
+- **对话证据怎么留——09-14 曾定为逐字节副本上云（D4），2026-09-15 D5 撤销**：不传 transcript 原文件，正文只随分歧事件走；§6 第 3 步在本机 30 天内可回原始 transcript，
+  之外没有来源。要补正文时走协议的 message.* / tool.* 事件（DESIGN §2「有必要再补充」的口子），本条重新打开、暂不定。以下为原记。用户 2026-09-11：「为什么要会话还在，不是会全采上传么，或者我们干脆把transcript也定期保存一份呢」。
   §6 第 3 步回原始 transcript，它只在开发者本机。C02FM 上 Claude Code 2.1.260 的设置说明（2026-09-11 查）：transcript
   按 `cleanupPeriodDays` 清理、默认 30 天；desktop 与 Cowork 创建或最后写入的不在其内，另由
   `desktopSessionCleanupPeriodDays` 管，默认 0、不设上限。两条路：Pilot 全采上传，前提是先补上 §3 末的漏采——
