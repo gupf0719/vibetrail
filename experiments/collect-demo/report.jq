@@ -27,10 +27,23 @@ def call_s: (.payload.tool_name // "?") + " " + ((.payload.input | if type == "o
 # 同一轮有多条 turn.end（被别的 Stop hook 拦下后又 Stop 一次）取 vibetrail.stops 最大的那条（DESIGN D7）
 def latest_end: max_by(.extensions["vibetrail.stops"] // 0);
 def is_trigger: .type == "permission.decision" or ((.type == "turn.end" or .type == "subagent.end") and .provenance.rule_version == "diverge-v1");
+# 「依据 · 何时关」一列：两者相同就只写一次；分歧一路发的打断 turn.end 没有这两个字段
+def end_col: if . == null then "–" else
+  (.extensions["vibetrail.end_evidence"]) as $ev | (.extensions["vibetrail.closed_by"]) as $cb
+  | if $ev == null and $cb == null then (if .payload.status.code == "interrupted" or .payload.status.code == "cancelled" then "打断记录" else "–" end)
+    else ($ev | evidence_label) as $a | ($cb | closed_label) as $b | if $a == $b or $b == "–" then $a else $a + " · " + $b end end end;
 
 map(select(type == "object")) as $ev
 | ($ev | group_by(.session_id) | map({sid: .[0].session_id, project: .[0].project_id, events: ., first: (map(.occurred_at) | min)}) | sort_by(.first)) as $sessions
 | ($ev | map(select(is_trigger))) as $triggers
+# desktop 在别的 worktree 续接会话时，会把原会话的历史整段复制进新的会话文件（记录 uuid 不变、会话 id 换了），同一段历史按每个会话各报一遍（OPEN-ISSUES K8）。
+# 报告里：分歧按来源记录 uuid 只列一次、注明还出现在哪些会话；每轮表标出哪些轮与更早的会话重复
+| ($sessions | map({sid, first}) ) as $order
+| ($triggers | group_by(.provenance.source_event_id // .event_id) | map(sort_by(.occurred_at, .session_id) | {t: .[0], also: ([.[1:][] | .session_id] | unique)})) as $tgroups
+| ($sessions | reduce .[] as $s ({seen: {}, dup: {}};
+     ([$s.events[] | select(.type == "turn.start" or .type == "turn.end") | .turn_id] | unique) as $ids
+     | .dup[$s.sid] = ([$ids[] as $i | select(.seen[$i] != null) | .seen[$i]] | {n: length, from: (unique)})
+     | reduce $ids[] as $i (.; if .seen[$i] == null then .seen[$i] = $s.sid else . end)) | .dup) as $dups
 | ($ev | map(select(.type == "turn.end")) | group_by([.session_id, .turn_id]) | map(latest_end) | map(select((.commits // []) | length > 0))) as $commit_turns
 | [
   "# vibetrail 采集报告",
@@ -40,7 +53,7 @@ map(select(type == "object")) as $ev
   "| 会话 | 项目 | 开始 | 轮数 | 人机分歧 | commit |",
   "|---|---|---|---|---|---|",
   ($sessions[] | . as $s
-    | "| `\($s.sid | short)` | \($s.project | cell) | \($s.first | lt("%m-%d %H:%M")) | \([$s.events[] | select(.type == "turn.start" or .type == "turn.end") | .turn_id] | unique | length) | \([$triggers[] | select(.session_id == $s.sid)] | length) | \([$commit_turns[] | select(.session_id == $s.sid) | .commits[]] | length) |"),
+    | "| `\($s.sid | short)` | \($s.project | cell) | \($s.first | lt("%m-%d %H:%M")) | \([$s.events[] | select(.type == "turn.start" or .type == "turn.end") | .turn_id] | unique | length) | \([$tgroups[] | select(.t.session_id == $s.sid)] | length)\(if ([$tgroups[] | select(.t.session_id != $s.sid and (.also | index($s.sid)))] | length) > 0 then "（另有 " + ([$tgroups[] | select(.t.session_id != $s.sid and (.also | index($s.sid)))] | length | tostring) + " 条复制来的）" else "" end) | \([$commit_turns[] | select(.session_id == $s.sid) | .commits[]] | length) |"),
   "",
   "## 一、每一轮的元数据",
   "",
@@ -55,11 +68,12 @@ map(select(type == "object")) as $ev
     | ($s.events | map(select(.agent.version != null)) | .[0].agent // {}) as $agent
     | "### 会话 `\($s.sid | short)` · \($s.project | cell) · Claude Code \($agent.version // "?")\(if $agent.surface then "（" + $agent.surface + "）" else "" end)",
       "",
+      (if ($dups[$s.sid].n // 0) > 0 then "> 其中 \($dups[$s.sid].n) 轮与更早的会话 \([$dups[$s.sid].from[] | "`" + short + "`"] | join("、")) 相同：desktop 续接会话时复制过来的历史（OPEN-ISSUES K8）。", "" else empty end),
       "| # | 轮 | 开始 | 结束 | 用时 | 状态 | 依据 · 何时关 | 模型 | tokens 入 / 缓存 / 出 | HEAD 起 → 止 | 分歧 | commit |",
       "|---|---|---|---|---|---|---|---|---|---|---|---|",
       ($turns | to_entries[] | .key as $i | .value as $t
         | ($t.e.payload.usage // {}) as $u
-        | "| \($i + 1) | `\($t.id | short)` | \($t.s.occurred_at | lt("%H:%M:%S")) | \($t.e.occurred_at | lt("%H:%M:%S")) | \(dur($t.s.occurred_at; $t.e.occurred_at)) | \(if $t.e then ($t.e.payload.status.code | status_label) else "进行中" end) | \(if $t.e then (($t.e.extensions["vibetrail.end_evidence"] | evidence_label) + " · " + ($t.e.extensions["vibetrail.closed_by"] | closed_label)) else "–" end) | \($t.e.payload.model // $t.s.payload.model // "–") | \($u.input_tokens | k) / \($u.cached_input_tokens | k) / \($u.output_tokens | k) | \($t.s.payload.vcs | vcs_s) → \($t.e.payload.vcs | vcs_s) | \([$triggers[] | select(.session_id == $s.sid and .turn_id == $t.id)] | length) | \(($t.e.commits // []) | length) |"),
+        | "| \($i + 1) | `\($t.id | short)` | \($t.s.occurred_at | lt("%H:%M:%S")) | \($t.e.occurred_at | lt("%H:%M:%S")) | \(dur($t.s.occurred_at; $t.e.occurred_at)) | \(if $t.e then ($t.e.payload.status.code | status_label) else "进行中" end) | \($t.e | end_col) | \($t.e.payload.model // $t.s.payload.model // "–") | \($u.input_tokens | k) / \($u.cached_input_tokens | k) / \($u.output_tokens | k) | \($t.s.payload.vcs | vcs_s) → \($t.e.payload.vcs | vcs_s) | \([$triggers[] | select(.session_id == $s.sid and .turn_id == $t.id)] | length) | \(($t.e.commits // []) | length) |"),
       "",
       ( [$s.events[] | select(.type == "session.start" or .type == "session.end" or .type == "subagent.start" or .type == "subagent.end" or (.type | startswith("ext.")))
          | select((.type == "subagent.end" and .provenance.rule_version == "diverge-v1") | not)] as $others
@@ -83,12 +97,12 @@ map(select(type == "object")) as $ev
   (if ($triggers | length) == 0 then "这段时间内没有人机分歧。", "" else
     "| # | 时间 | 会话 · 轮 | 类型 | 谁决定 | 对哪次调用 | 原文 | 被打断的回复 | 之后人说 |",
     "|---|---|---|---|---|---|---|---|---|",
-    ($triggers | sort_by(.occurred_at) | to_entries[] | .key as $i | .value as $t
+    ($tgroups | sort_by(.t.occurred_at) | to_entries[] | .key as $i | .value.t as $t | .value.also as $also
       | ($t.provenance.source_event_id // "") as $tid
       | ([$ev[] | select(.session_id == $t.session_id and .type == "tool.request" and .extensions["vibetrail.trigger"] == $tid)]) as $calls
       | ([$ev[] | select(.session_id == $t.session_id and .type == "message.assistant" and .extensions["vibetrail.trigger"] == $tid)][0]) as $reply
       | ([$ev[] | select(.session_id == $t.session_id and .type == "message.user" and ((.extensions["vibetrail.after"] // []) | index($tid)))] | sort_by(.occurred_at)) as $after
-      | "| \($i + 1) | \($t.occurred_at | lt("%m-%d %H:%M:%S")) | `\($t.session_id | short)` · `\($t.turn_id | short)` | \($t.extensions["vibetrail.kind"] | kind_label)\(if $t.type == "subagent.end" then "（子 agent）" else "" end) | \($t.payload.decided_by // (if $t.extensions["vibetrail.human"] then "user" else "–" end)) | \(if ($calls | length) > 0 then ([$calls[] | call_s] | join("<br>")) elif $t.payload.tool_name then ($t.payload.tool_name | cell) else "–" end) | \(($t.payload.reason // $t.payload.status.detail // "") | clip(80) | cell) | \(($reply.payload.text // "") | clip(80) | cell) | \(if ($after | length) > 0 then ([$after[] | (.payload.text | clip(80) | cell)] | join("<br>")) else "–" end) |"),
+      | "| \($i + 1) | \($t.occurred_at | lt("%m-%d %H:%M:%S")) | `\($t.session_id | short)` · `\($t.turn_id | short)`\(if ($also | length) > 0 then "<br>也在 " + ([$also[] | "`" + short + "`"] | join("、")) else "" end) | \($t.extensions["vibetrail.kind"] | kind_label)\(if $t.type == "subagent.end" then "（子 agent）" else "" end) | \($t.payload.decided_by // (if $t.extensions["vibetrail.human"] then "user" else "–" end)) | \(if ($calls | length) > 0 then ([$calls[] | call_s] | join("<br>")) elif $t.payload.tool_name then ($t.payload.tool_name | cell) else "–" end) | \(($t.payload.reason // $t.payload.status.detail // "") | clip(80) | cell) | \(($reply.payload.text // "") | clip(80) | cell) | \(if ($after | length) > 0 then ([$after[] | (.payload.text | clip(80) | cell)] | join("<br>")) else "–" end) |"),
     "" end),
   "## 三、commit ↔ 会话",
   "",
