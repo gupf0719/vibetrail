@@ -349,13 +349,14 @@ EOF_CANDS
         case "$k" in ''|*[!0-9]*) say "  ⚠ 不认识的编号：$k"; continue;; esac
         p=$(printf '%s\n' "$cands" | sed -n "${k}p" | cut -f3)
         [ -n "$p" ] || { say "  ⚠ 没有第 $k 个"; continue; }
+        # 每个编号都说清楚做了什么（用户 09-16 输 -2 只看到「去掉 0 个」，不知道是因为那个仓本来就没登记）
         if [ $neg = 1 ]; then
-            vt_registered "$p" || continue
-            vt_unregister "$p" && removed=$((removed + 1))
-            [ "$(pending_chunks "$p")" -gt 0 ] && say "  $p 已采、还没发出去的 $(pending_chunks "$p") 块还在 spool；不想发：vibetrail projects remove $p --drop"
+            if ! vt_registered "$p"; then say "  · 第 $k 个本来就没登记，不用去掉：${p}"; continue; fi
+            vt_unregister "$p" && removed=$((removed + 1)) && say "  ✓ 去掉 ${p}：以后不再采"
+            [ "$(pending_chunks "$p")" -gt 0 ] && say "    它已采、还没发出去的 $(pending_chunks "$p") 块还在 spool，将来 push 时照样发；不想发：vibetrail projects remove $p --drop"
         else
-            vt_registered "$p" && continue
-            vt_register "$p" && added=$((added + 1))
+            if vt_registered "$p"; then say "  · 第 $k 个已经登记过：${p}"; continue; fi
+            vt_register "$p" && added=$((added + 1)) && say "  ✓ 登记 ${p}"
         fi
     done
     say "  新登记 $added 个，去掉 $removed 个"

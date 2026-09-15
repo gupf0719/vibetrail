@@ -367,7 +367,7 @@ PK2=$(vt_project_key "$REPO2")
 hook SessionStart "$(payload SessionStart '{"source":"startup"}')"
 check "第二个仓没登记：补采不碰它" '[ ! -e "$VT_HOME/spool/$PK2" ]'
 check "projects pick：候选里有第二个仓（删掉的 worktree 并到主仓），选 a 全部登记" \
-    'out=$(printf "a\n" | bash "$SELF/vibetrail" projects pick 2>&1); printf "%s" "$out" | grep -q "$REPO2" && [ "$(printf "%s" "$out" | grep -c "$REPO2")" = 1 ] && vt_registered "$REPO2"'
+    'out=$(printf "a\n" | bash "$SELF/vibetrail" projects pick 2>&1); [ "$(printf "%s\n" "$out" | grep -E "^ *[0-9]+\. " | grep -c "$REPO2")" = 1 ] && vt_registered "$REPO2"'
 hook SessionStart "$(payload SessionStart '{"source":"startup"}')"
 check "在第一个仓里开会话、补采到第二个仓的会话：记在第二个仓的 spool 目录，project_id / workspace_id 是第二个仓的" \
     '[ "$(cat "$VT_HOME/spool/$PK2/$SIDA"/*.jsonl 2>/dev/null | jq -s -c "[length > 0, (map(.project_id) | unique), (map(.workspace_id) | unique)]")" = "[true,[\"github.com/acme/second\"],[\"$REPO2\"]]" ] && [ ! -e "$VT_HOME/spool/$PKEY/$SIDA" ]'
@@ -378,6 +378,8 @@ check "init（不在终端里跑，不问）：最后列出登记表，两个仓
 n2=$(printf '\n' | bash "$SELF/vibetrail" projects pick 2>/dev/null | grep -F "$REPO2" | sed -n 's/^ *\([0-9][0-9]*\)\..*/\1/p' | head -1)
 check "projects pick 编号前加 - 去掉：第二个仓不再登记，它已采的数据留在 spool" \
     'printf -- "-%s\n" "$n2" | bash "$SELF/vibetrail" projects pick >/dev/null 2>&1; ! vt_registered "$REPO2" && [ -d "$VT_HOME/spool/$PK2" ]'
+check "pick 里去掉一个本来就没登记的：明说「本来就没登记」，不是只给一句去掉 0 个" \
+    'out=$(printf -- "-%s\n" "$n2" | bash "$SELF/vibetrail" projects pick 2>&1); printf "%s" "$out" | grep -q "第 $n2 个本来就没登记"'
 vt_register "$REPO2"
 check "projects remove --drop：不再登记，它已采、还没发出去的数据挪出 spool（到 removed/，不删）" \
     'bash "$SELF/vibetrail" projects remove "$REPO2" --drop >/dev/null 2>&1; ! vt_registered "$REPO2" && [ ! -e "$VT_HOME/spool/$PK2" ] && ls -d "$VT_HOME/removed/$PK2"-* >/dev/null 2>&1'
