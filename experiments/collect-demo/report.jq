@@ -23,7 +23,7 @@ def evidence_label: {hook_stop: "Stop hook", stop_hook_summary: "答完标记", 
 def closed_label: {stop: "Stop 时", summary: "答完标记", next_turn: "下一轮开始", session_end: "会话结束", resume: "会话恢复", idle: "空闲补做", denied: "拒绝处"}[. // ""] // "–";
 def kind_label: {permission_denied: "人拒绝", classifier_blocked: "分类器拦截", permission_infra_fail: "权限链路故障", interrupt: "人打断", interrupt_for_tool_use: "人打断（拒绝时）", interrupt_tool: "按停止打断工具"}[.] // .;
 # 「人拒绝」与「按停止打断工具」是怎么分出来的（DESIGN D9）
-def split_label: {permission_request: "看权限框", permission_mode: "按模式粗分", subagent_rejected: "子 agent 规则"}[.] // null;
+def split_label: if type == "string" then ({permission_request: "看权限框", permission_mode: "按模式粗分", subagent_rejected: "子 agent 规则"}[.] // null) else null end;
 def vcs_s: if type == "object" then "\(.head_sha | sha7)\(if .dirty == true then "*" else "" end)" else "–" end;
 def call_s: (.payload.tool_name // "?") + " " + ((.payload.input | if type == "object" then (.command // .file_path // .pattern // .url // tojson) else tojson end) | clip(90) | code);
 # 同一轮有多条 turn.end（被别的 Stop hook 拦下后又 Stop 一次）取 vibetrail.stops 最大的那条（DESIGN D7）

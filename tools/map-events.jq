@@ -377,7 +377,11 @@ def interrupted($r; $s; $h; $detail):
   | (if $reply != null and ($reply.text | length) > 0
      then emit(message($s; $t; $reply; "message.assistant"; "agent"; {"vibetrail.trigger": $s.uuid, "vibetrail.kind": $kind}))
      else . end)
-  | (if $reply != null
+  # 按停止打断工具（K7）：只发真正被打断、拿到 User rejected tool use 的那几次调用——同一条回复里别的调用可能早就跑完了
+  | (if (($h.stop_calls // []) | length) > 0
+     then reduce ($h.stop_calls[] | strings) as $cid (.; .tools[$cid] as $tu
+            | if $tu != null then emit(toolRequest($s; $t; $cid; $tu; {"vibetrail.trigger": $s.uuid, "vibetrail.kind": $kind})) else . end)
+     elif $reply != null
      then reduce $reply.tools[] as $tl (.; (if $tl.id != null then .tools[$tl.id] else null end) as $tu
             | if $tu != null then emit(toolRequest($s; $t; $tl.id; $tu; {"vibetrail.trigger": $s.uuid, "vibetrail.kind": $kind})) else . end)
      else . end)
@@ -396,7 +400,7 @@ def interrupted($r; $s; $h; $detail):
                   | .extensions += {"vibetrail.commit_method": ($hend.commit_method // "rev-list"),
                                     "vibetrail.commit_attribution": (if $gc then "agent_tool" else "inferred" end)}
              else . end)
-          | .raw = {event_name: ("diverge." + $h.kind), data: ($h | del(.as_kind, .split_by, .permission_mode))}
+          | .raw = {event_name: ("diverge." + $h.kind), data: ($h | del(.as_kind, .split_by, .permission_mode, .stop_calls))}
           | .extensions += ({"vibetrail.kind": $kind, "vibetrail.human": true} + opt("vibetrail.interrupted_uuid"; $reply.uuid)
                             + opt("vibetrail.split_by"; $h.split_by) + opt("vibetrail.permission_mode"; $h.permission_mode))
           | ._key = ($s.uuid + "|" + .type) )
@@ -411,7 +415,8 @@ def forToolUse($r; $s; $h):
        # 这一轮是被拒绝停下的：当场关轮，status 记 denied（不算打断，打断只数 turn.end(interrupted)，K5）
        | (if .pturn != null and .pturn.id == turnOf($s).id then .pturn.denied = true | closeTurn("denied"; $s; false) else . end)
   elif (.stops | length) > 0 then   # 前面的 user-rejected 判成了按停止（K7）：这一条就是那次打断，按打断发
-    .stops[0] as $sp | interrupted($r; $s; $h + {as_kind: "interrupt_tool", split_by: $sp.by, permission_mode: $sp.mode}; $s.text)
+    .stops[0] as $sp | [.stops[].call_id | strings] as $calls
+    | interrupted($r; $s; $h + {as_kind: "interrupt_tool", split_by: $sp.by, permission_mode: $sp.mode, stop_calls: $calls}; $s.text)
   else .ledger.unpaired_for_tool_use += 1 | interrupted($r; $s; $h; "unpaired interrupt_for_tool_use: " + $s.text) end;
 
 def handle($r; $s; $h):

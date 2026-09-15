@@ -324,6 +324,17 @@ check "origin 是 task-notification 的不算人话（不当拒绝之后的下�
 check "轮里插了一句话：turn.end 记 vibetrail.queued_prompts = 1（只计数、不带正文）" \
     '[ "$(k15 "map(select(.type == \"turn.end\" and .turn_id == \"P3\")) | .[0].extensions[\"vibetrail.queued_prompts\"]")" = "1" ] && ! k15 "." | grep -q "顺便看下日志"'
 
+R6=$T/k15-par.jsonl
+{ rec n1 "" P1 user '"读一下再跑"' '{"permissionMode":"auto","origin":{"kind":"human"}}' | jq -c '.parentUuid = null'
+  rec n2 n1 P1 assistant '[]' '{"message":{"id":"nm1","model":"claude-opus-5","role":"assistant","content":[{"type":"tool_use","id":"nt1","name":"Read","input":{"file_path":"a"}}]}}'
+  rec n3 n2 P1 assistant '[]' '{"message":{"id":"nm1","model":"claude-opus-5","role":"assistant","content":[{"type":"tool_use","id":"nt2","name":"Bash","input":{"command":"sleep 60"}}]}}'
+  rec n4 n2 P1 user '[{"type":"tool_result","tool_use_id":"nt1","content":"a"}]'
+  rec n5 n3 P1 user "$(jq -n -c --arg t "$REJ" '[{type: "tool_result", tool_use_id: "nt2", is_error: true, content: $t}]')" '{"toolUseResult":"User rejected tool use"}'
+  rec n6 n5 P1 user '[{"type":"text","text":"[Request interrupted by user for tool use]"}]'
+} > "$R6"
+check "按停止打断时只发真正被打断的那次调用：同一条回复里已经跑完的 Read 不算" \
+    '[ "$(map_r "$R6" --ledger /dev/null | jq -s -c "[.[] | select(.type == \"tool.request\") | .payload.call_id]")" = "[\"nt2\"]" ]'
+
 echo
 [ "$skipped_schema" -gt 0 ] && echo "  ⚠ 本机 python3 没有 jsonschema，协议 schema 校验跳过 $skipped_schema 处（pip install jsonschema 后重跑）"
 if [ $fail -eq 0 ]; then echo "  ✅ $pass/$pass 通过"; else echo "  ❌ $fail 失败 / $pass 通过"; exit 1; fi
