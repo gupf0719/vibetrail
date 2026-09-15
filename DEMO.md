@@ -23,7 +23,7 @@ bash tools/vibetrail init
 | 写到哪 | 是什么 |
 |---|---|
 | `~/.claude/settings.json` | 加 12 个 hook 条目（命令里带 `vibetrail-hook`），别的设置原样保留 |
-| `~/.vibetrail/backup/` | 改 settings 之前的备份 |
+| `~/.vibetrail/backup/` | settings 的备份：`settings.json.before-vibetrail` 是第一次装之前的原样（只存一次、永不覆盖；原来没有 settings 就没有它），另外每次改动前存一份带时间的（留最近 10 份）。重跑 `init` 没有变化时不写也不备份 |
 | `~/.vibetrail/bin/` | 运行时 |
 | `~/.vibetrail/config` | scope（默认 project，只采登记过的仓）、jq 路径等 |
 | `~/.vibetrail/projects/` | 登记的仓 |

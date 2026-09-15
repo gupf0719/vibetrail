@@ -118,7 +118,7 @@ check "split-reply: 同一条回复里的两个工具调用都发 tool.request�
 e=$T/replay.events
 check "replay: 回放副本整条跳过，原来的事实各报一次" 'length == 9 and ([.[] | .event_id] | length == (unique | length)) and ([.[] | select(.type == "turn.end")] | map(.provenance.source_event_id) == ["r-i1", "r-i9"])' "$e"
 check "replay: 副本里的旧人话不会被当成打断后的下一句；回放后人打的第一句挂在原来的打断上" '[.[] | select(.type == "message.user") | [.payload.text, .extensions["vibetrail.after"]]] == [["先别跑测试，直接看代码", ["r-d1","r-f1"]], ["接着昨天的继续", ["r-i1"]], ["够了", ["r-i9"]]]' "$e"
-check "replay: 账本记 5 条副本（触发与人话记录；assistant 副本照常过），交给下一次的清单是它们的 uuid + 行号" '.[0]' <(jq -c '.replayed == 5 and (.sources | map(.[0]) | index("r-i1") != null) and ([.sources[] | select(.[0] == "r-u1")] == [["r-u1", 1]])' "$T/replay.ledger")
+check "replay: 账本记 7 条副本（所有记录都查，assistant 副本也跳过——trace 与轮次用得到它们），交给下一次的清单是全部 11 条记录的 uuid + 行号" '.[0]' <(jq -c '.replayed == 7 and (.sources | length) == 11 and (.sources | map(.[0]) | index("r-i1") != null) and ([.sources[] | select(.[0] == "r-u1")] == [["r-u1", 1]])' "$T/replay.ledger")
 e=$T/agent-b2.events
 check "nest: 被子 agent 派出的子 agent，父实例是派它的 b1，不是 main" 'length == 2 and all(.[]; .agent_instance_id == "b2" and .parent_agent_instance_id == "b1" and .parent_call_id == "toolu_spawn_b2" and .session_id == "fx-nest") and .[1].payload.agent_type == "Explore"' "$e"
 check "nest: 一级子 agent 的父实例仍是 main" '.[0]' <(jq -c '.parent_instance == "main"' "$T/agent-b1.ledger")

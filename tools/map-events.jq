@@ -18,13 +18,15 @@
 # 状态都有上界：tool_use 索引 500 条、记录链 400 条——分歧引用的永远是最近几条记录。
 # 铁律见 diverge-rules.jq 头部；本文件同样只读字段，任何多态字段先判 type。
 # 回放副本（09-15 语料 43 个主会话里 4 个有）：Claude Code 会把旧记录原样再追加进同一个文件，uuid、时间戳不变，
-#      只把 promptId 改成回放时那一轮的。副本不上报（用户 09-15）。只认会产生事件的两种记录——触发记录（分歧）与
-#      人话记录（打字、斜杠命令）——的副本，整条跳过，不触发、不结束等待：
+#      只把 promptId 改成回放时那一轮的（常常是还没出现人话的下一轮）；压缩上下文时也会把早先一条并行工具的结果这样再写一遍（09-15 本机）。
+#      副本不上报（用户 09-15）。所有带 uuid 的记录都查，副本整条跳过——不触发、不结束等待、不开轮、不算用量、不出 trace：
 #        · 本次读取里同一 uuid 已经出现过；
 #        · uuid 在 $seen_uuids 里、但行号对不上（前几次记下的 [uuid, 行号]）。行号对得上的是从 checkpoint 起的正常重读。
-#      其余记录（assistant、工具结果……）的副本照常过：它们不产生事件，登记它们会让首次整读慢一倍（106 MB 11 s → 22 s）。
+#      以前只查触发记录与人话记录（其余不产生事件）；09-15 加了轮次与 trace，assistant、工具结果的副本会凭空开出一轮、重复算用量、
+#      把正在累计的调用提前结束，改成全查（teamai、Pilot 两份核对都这么建议）。代价：首次整读 65 MB 4.9 s → 7.1 s、本机最大的 9 MB 0.61 → 0.65 s；
+#      增量读时 $seen_uuids 1.5 万条多 0.06 s。
 #      不用「时间戳倒退」判：真实触发记录 405 条从不倒退，但真实 user 记录有 63 条倒退超过一分钟（09-15 语料），会误伤。
-#      Pilot / teamai 都不处理：Pilot 只在一条消息内按工具调用 id 去重，teamai 只按消息 id 给 token 去重。
+#      Pilot / teamai 都不按 uuid 去重（09-15 两份核对）：Pilot 只给同一次读到调用的结果发 tool.result，teamai 的打断 / 拒绝 / 出错 / 人话计数会重复算。
 # ⚠️ jq 的函数参数在调用处的输入上求值：`$r | slim(.ln)` 里的 .ln 是 $r.ln（null），不是状态的行号。
 #    状态里的值一律先 `as $x` 绑定再往下传（这里曾让所有记录的行号都是 null，断链兜底从未生效）。
 #
@@ -44,8 +46,8 @@
 #      用量是本轮 assistant 记录按 message.id 去重求和（与打断同一定义）。子 agent 文件不切轮：子 agent 的起止由 SubagentStart / SubagentStop hook 发。
 #
 # trace（rule_version call-v1；09-15 用户要，照 Pilot 的粒度、不带正文，DESIGN D8）：每次模型调用一条 message.assistant（content_state = omitted，extensions.vibetrail.call
-#      带 response_id、request_id、stop_reason、这次调用的 token、请求开始时间、调了哪些工具、有没有 thinking），在这次调用结束时发——下一条 user 记录
-#      或另一个 message.id 出现，或者带 $close_last 读到文件末尾；每个工具结果一条 tool.end（工具名、call_id、success / error / cancelled、耗时）。
+#      带 response_id、request_id、stop_reason、这次调用的 token、请求开始时间、调了哪些工具、有没有 thinking），在这次调用结束时发——另一个 message.id
+#      出现（工具结果可能夹在同一次调用中间，不算结束），或者带 $close_last 读到文件末尾；每个工具结果一条 tool.end（工具名、call_id、success / error / cancelled、耗时）。
 #      执行前就被拒的调用只有 permission.decision，不伪造 tool.end（协议）；按停止打断正在跑的工具写成与拒绝一样的记录，也归到这里（K7）。
 #      Pilot 每次调用各有请求 / 响应两条、工具各有调用 / 结果两条，且带全文；我们一次调用一条、只有元数据。
 
@@ -109,7 +111,7 @@ def slim($ln): (isSlashCommand) as $slash | {
 # ---------- 状态 ----------
 def init: {
   ln: ($start_line - 1), turn: null, turn_line: 0,
-  run_uuids: {},          # 本次读取见过的触发记录与人话记录 uuid（同一次读取内的副本）
+  run_uuids: {},          # 本次读取见过的记录 uuid（同一次读取内的副本）
   prior: (($seen_uuids[0] // []) | map({(.[0]): .[1]}) | add // {}),   # 前几次记下的 uuid → 行号（跨次的副本）
   tools: {}, tool_order: [],
   chain: {}, chain_order: [],
@@ -119,7 +121,8 @@ def init: {
   pending: null,          # {after: [uuid…], kind, since}：等「人的下一句」；since＝第一个触发所在轮的开头行
   pturn: null,            # 按 promptId 切的当前轮（轮次元数据一路）：{id, line, last_ts, usage, model, interrupted, denied, git_commit, closed}
   call: null,             # trace：正在累计的这次模型调用（同一 message.id 的几条记录）
-  last_user_ts: null,     # trace：最近一条 user 记录的时间＝下一次模型调用的请求开始（照 Pilot 的 fillRequestStartTimes，也只取更晚的）
+  prev_end_ts: null,      # trace：下一次模型调用的请求开始＝最近一条 user 记录与上一次模型调用结尾里晚的那个（Pilot 只看工具结果，
+                          #   连着几次调用之间没有工具结果时——如连续撞 max_tokens——会一直停在最早那条上，耗时越算越长）
   last_ts: null, version: null, entrypoint: null, branch: null,
   ledger: {in: {}, in_total: {}, out: {}, events: {}, absorbed_for_tool_use: 0, unpaired_for_tool_use: 0,
            lookup: {index: 0, regex: 0, missing: 0}, dedup: 0, records: 0, skipped_no_uuid: 0, skipped_non_object: 0,
@@ -128,7 +131,7 @@ def init: {
            sentinel: {marker: 0, marker_without_hit: 0},
            replayed: 0,       # 跳过的回放副本条数
            turns: {started: 0, ended: {}},   # 轮次元数据一路：本次新开的轮、按 status.code 数的关轮
-           sources: []},      # 本次新读到的触发记录与人话记录的 [uuid, 行号]——交给下一次当 $seen_uuids
+           sources: []},      # 本次新读到的记录的 [uuid, 行号]——交给下一次当 $seen_uuids
   out: []
 };
 
@@ -413,6 +416,11 @@ def turnAccumulate($r; $s):
        then .pturn.git_commit = true else . end)
   end;
 
+# 下次的起读行：本轮开头；还有没等到人话的分歧时，退到那个分歧所在轮的开头；还没关的 promptId 轮从它开头读（关轮时用量才完整）
+def baseCheckpoint: turnStart as $ts
+  | (if .pending != null then ([.pending.since, $ts] | min) else $ts end) as $c
+  | if .pturn != null then ([$c, .pturn.line] | min) else $c end;
+
 # ---------- trace：每次模型调用、每次工具调用各一条，不带正文 ----------
 def epochms: if type != "string" then null else
   (capture("^(?<b>[^.Z]+)(?<f>\\.[0-9]+)?Z$")? // null) as $m
@@ -433,16 +441,17 @@ def flushCall($eof):
        | .payload = ({author_type: "agent"} + opt("model"; $c.model))
        | .provenance = {kind: "transcript", rule_version: "call-v1", source_event_id: $c.last_uuid}
        | .extensions += {"vibetrail.call": ({kind: "llm", stop_reason: $c.stop_reason, tool_calls: $c.tools, thinking: $c.thinking}
-                          + opt("response_id"; $c.mid) + opt("request_id"; $c.rid) + opt("started_at"; $c.started_at) + opt("usage"; usageOne($c.usage)))}
+                          + opt("response_id"; $c.mid) + opt("request_id"; $c.rid) + opt("usage"; usageOne($c.usage))
+                          + opt("started_at"; if $c.started_at != null and $c.last_ts != null and $c.started_at > $c.last_ts then $c.last_ts else $c.started_at end))}   # 开始不晚于结束（照 Pilot 的 normalizeRequestStart）
        | ._key = ($c.key + "|llm.call")) as $e
     | (if $eof then emitAlways($e) else emit($e) end)
-    | .call = null end;
+    | .prev_end_ts = ([.prev_end_ts, $c.last_ts] | max) | .call = null end;
 
 def toolEnds($r; $s):
   reduce ($r | msg.content | if type == "array" then .[] else empty end | objects | select(.type == "tool_result")) as $b (.;
     ($b.tool_use_id // null) as $cid
-    # 这次没读到调用的结果不发：结果与调用同在一轮，增量解析从当前轮开头读起，正常的都读得到；读不到的是重写的旧记录
-    # （压缩时 Claude Code 把早先一条并行工具的结果按原 uuid、换上新 promptId 再写一遍，09-15 本机），它的 tool.end 早发过了
+    # 这次没读到调用的结果不发（叫不出工具名）：结果与调用同在一轮，增量解析从当前轮开头读起，正常的都读得到。
+    # 重写的旧结果已经按 uuid 整条跳过，这里是再兜一层（seen 清单丢了也不发出 unknown）；Pilot 也只给同一次读到调用的结果发 tool.result
     | if $cid == null or .tools[$cid] == null then . else
         .tools[$cid] as $tu
         | ($b.content | errText) as $txt
@@ -460,14 +469,15 @@ def toolEnds($r; $s):
                   | ._key = ($cid + "|tool.end") ) end end);
 
 def traceStep($r; $s):
-  (if $s.type == "user" then flushCall(false) | toolEnds($r; $s) | .last_user_ts = ([.last_user_ts, $s.ts] | max) else . end)   # 只往后走：重写的旧记录带着旧时间
+  # user 记录不结束这次调用：2.1.260 边生成边执行工具，工具结果会夹在同一次调用的几条记录中间（09-15 本机 96 次调用曾因此被拆开）
+  (if $s.type == "user" then toolEnds($r; $s) | .prev_end_ts = ([.prev_end_ts, $s.ts] | max) else . end)   # 只往后走：重写的旧记录带着旧时间
   | (if $s.type == "assistant" and ($s.synthetic | not) then
        ($s.mid // $s.rid // $s.uuid) as $k
        | (if .call != null and .call.key != $k then flushCall(false) else . end)
        | if .call == null
          then .call = {key: $k, mid: $s.mid, rid: $s.rid, model: $s.model, usage: $s.usage, stop_reason: stopReasonOf($r),
-                       tools: [$s.tools[] | .name], thinking: thinkingIn($r), last_ts: $s.ts, last_uuid: $s.uuid,
-                       started_at: .last_user_ts, agent: $s.agent, turn: {id: (.turn // $s.uuid), inferred: (.turn == null)}}
+                       tools: [$s.tools[] | .name], thinking: thinkingIn($r), last_ts: $s.ts, last_uuid: $s.uuid, ck: baseCheckpoint,
+                       started_at: .prev_end_ts, agent: $s.agent, turn: {id: (.turn // $s.uuid), inferred: (.turn == null)}}
          else .call.last_ts = ($s.ts // .call.last_ts) | .call.last_uuid = $s.uuid
               | .call.stop_reason = (stopReasonOf($r) // .call.stop_reason)
               | .call.tools += [$s.tools[] | .name] | .call.thinking = (.call.thinking or thinkingIn($r))
@@ -480,10 +490,9 @@ def step($r):
     elif ($r.uuid | type) != "string" then .ledger.skipped_no_uuid += 1
     else
       ($r | slim($ln)) as $s | [$r | diverge] as $hits
-      | (($hits | length) > 0 or $s.human or $s.slash) as $keyrec
-      | if $keyrec and (.run_uuids[$r.uuid] or (.prior[$r.uuid] != null and .prior[$r.uuid] != $ln)) then .ledger.replayed += 1
+      | if (.run_uuids[$r.uuid] or (.prior[$r.uuid] != null and .prior[$r.uuid] != $ln)) then .ledger.replayed += 1
     else
-      (if $keyrec then .run_uuids[$r.uuid] = true else . end)
+      .run_uuids[$r.uuid] = true
       | .ledger.records += 1
       | .last_ts = ($r.timestamp // .last_ts) | .version = ($r.version // .version)
       | .entrypoint = ($r.entrypoint // .entrypoint) | .branch = ($r.gitBranch // .branch)
@@ -499,7 +508,7 @@ def step($r):
       | turnAccumulate($r; $s)
       | turnStopMarker($r; $s)
       | (if $turns then traceStep($r; $s) else . end)
-      | (if $ln > $from_line and $keyrec then .ledger.sources += [[$s.uuid, $ln]] else . end)
+      | (if $ln > $from_line then .ledger.sources += [[$s.uuid, $ln]] else . end)
       | (if ($r.toolUseResult | type) == "string" and ($r.toolUseResult | startswith("User rejected tool use"))
          then .ledger.sentinel.marker += 1
               | (if any($hits[]; .kind == "permission_denied") then . else .ledger.sentinel.marker_without_hit += 1 end)
@@ -509,16 +518,16 @@ def step($r):
     end
     end;
 
-# 下次的起读行：本轮开头；还有没等到人话的分歧时，退到那个分歧所在轮的开头；还没关的 promptId 轮从它开头读（关轮时用量才完整）
-def checkpoint: turnStart as $ts
-  | (if .pending != null then ([.pending.since, $ts] | min) else $ts end) as $c
-  | if .pturn != null then ([$c, .pturn.line] | min) else $c end;
+# 还没写出的那次模型调用：从它所在那一轮的起读行读起（上一轮最后一次调用要等下一个 message.id 才写，起读行不能越过它；
+# 也不能落在它那一轮中间——assistant 记录不带 promptId，从中间读认不出轮，请求开始时间也要靠它前面那条）
+def checkpoint: baseCheckpoint as $c | if .call != null then ([$c, .call.ck] | min) else $c end;
 
 # 文件末尾：$close_last 非空（会话结束 / 恢复 / 空闲）就把最后一轮也关掉
 def atEof:
   .out = []
-  # trace：最后一次模型调用在关轮时一起写出（没有下一条 user 记录来结束它）；子 agent 文件读到末尾就写（它跑完文件就不再长）
-  | (if $turns and .call != null and ($close_last != "" or .call.agent != null) then flushCall(true) else . end)
+  # trace：最后一次模型调用在关轮时一起写出（后面没有另一个 message.id 来结束它）；不带 $close_last 不写——文件可能还在长，
+  # 写出去的会是半截，完整的那条之后按 event_id 被拦下。子 agent 文件由 hook 在它结束后（SubagentStop 记下的大小没变，或会话结束 / 恢复 / 空闲）带上
+  | (if $turns and .call != null and $close_last != "" then flushCall(true) else . end)
   | if $close_last == "" or .pturn == null then .
     elif $close_last == "stop" then   # Stop hook：这次 Stop 的那一轮、有过模型回复、没看到拦停反馈，就当场关
       (if .pturn.id == $stop_turn and .pturn.answered and (.pturn.block_pending | not) and (.pturn.stop_blocked | not)
@@ -530,7 +539,8 @@ foreach (inputs, {"__vibetrail_eof__": true}) as $r (init;
   if $r == {"__vibetrail_eof__": true}
   then (.out[]),
        {"_ledger": (.ledger + {start_line: $start_line, from_line: $from_line, lines: .ln, checkpoint_line: checkpoint,
-                               sources: (.ledger.sources | unique),
+                               sources: .ledger.sources,
                                turns: (.ledger.turns + {open: (.pturn.id // null), open_line: (.pturn.line // null),
-                                                        closed: (.pturn.closed // false), model: (.pturn.model // .turn_model)})})}
+                                                        closed: (.pturn.closed // false), model: (.pturn.model // .turn_model)}),
+                               trace: {call_open: (.call != null)}})}
   else .out[] end)

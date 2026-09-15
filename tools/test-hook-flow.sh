@@ -2,7 +2,7 @@
 # 回归：hook 分发入口 + 分歧一路挂 hook（TODO G7 第 2 步）。用 experiments/collect-demo/scenario.json 在临时目录里真实回放：
 # 临时 git 仓当被观测项目，临时目录当 ~/.vibetrail 与 ~/.claude/projects，逐步追加 transcript、逐个触发 hook。
 # 断言：A4 未登记零写入；登记后 spool == 对最终 transcript 的一次全量映射；stdout 永远为空、exit 0；重复触发不重复写；
-# 锁被占时跳过、之后补上；半行等写完再读；文件被重写后不重复；打断后没有 Stop 也不漏；子 agent；回放副本；SessionStart 补做别的会话；scope=user；压缩时重写的旧工具结果不重发 tool.end。
+# 锁被占时跳过、之后补上；半行等写完再读；文件被重写后不重复；打断后没有 Stop 也不漏；子 agent（还在跑的不写半截调用）；回放副本；SessionStart 补做别的会话；scope=user；压缩时重写的旧工具结果不重发 tool.end；连续调用的请求开始；init 重跑不动 settings。
 # 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
 # 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
 export LC_ALL=C
@@ -123,6 +123,7 @@ echo "════ 6. 回放副本不上报 ════"
 head -n 8 "$TR" | jq -c '.promptId = "prompt-9"' >> "$TR"
 hook Stop "$(payload Stop)"
 check "追加 8 条副本后没有新事件" '[ "$(spool_events | wc -l | tr -d " ")" = 7 ]'
+check "副本带着新 promptId 也不会凭空开出一轮、不多出 trace" '! cat "$SPOOL"/*.jsonl | jq -e "select(.turn_id == \"prompt-9\")" >/dev/null'
 
 echo "════ 7. 子 agent 文件（SubagentStop）════"
 mkdir -p "$TDIR/$SID/subagents"
@@ -134,6 +135,30 @@ printf '%s\n' '{"agentType":"general-purpose","description":"查","spawnDepth":1
 hook SubagentStop "$(payload SubagentStop '{"agent_id":"s1"}')"
 check "子 agent 的拒绝进 spool，实例 s1、父实例 main、parent_call_id 取 meta" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"diverge-v1\")) | length == 2 and all(.[]; .agent_instance_id == \"s1\" and .parent_agent_instance_id == \"main\" and .parent_call_id == \"toolu_x\")" >/dev/null'
 check "子 agent 的那次模型调用有 trace：实例 s1、不带正文；被拒的调用不伪造 tool.end" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"call-v1\")) | length == 1 and .[0].type == \"message.assistant\" and .[0].agent_instance_id == \"s1\" and .[0].content_state == \"omitted\" and (.[0].payload | has(\"text\") | not) and .[0].extensions[\"vibetrail.call\"].tool_calls == [\"Bash\"]" >/dev/null'
+
+# 并行的另一个子 agent s2 还在跑，它的一次调用只写了一半（2.1.260 边生成边执行工具：tool_use 一个一个写，结果夹在中间）
+printf '%s\n' '{"agentType":"general-purpose","description":"并行","spawnDepth":1,"toolUseId":"toolu_y"}' > "$TDIR/$SID/subagents/agent-s2.meta.json"
+{ rec s2u "" P1 user '"并行查"' '{"agentId":"s2","isSidechain":true}' | jq -c '.parentUuid = null'
+  rec s2a s2u P1 assistant '[]' '{"agentId":"s2","isSidechain":true,"message":{"id":"sm2","model":"claude-sonnet-5","role":"assistant","content":[{"type":"tool_use","id":"s2t1","name":"Read","input":{"file_path":"calc.py"}}]}}'
+  rec s2r s2a P1 user '[{"type":"tool_result","tool_use_id":"s2t1","content":"def add"}]' '{"agentId":"s2","isSidechain":true}'
+} > "$TDIR/$SID/subagents/agent-s2.jsonl"
+hook Notification "$(payload Notification '{"notification_type":"idle_prompt"}')"   # 任何一次解析都会顺带读到 s2
+check "还在跑的子 agent：读到一半的那次调用先不写，工具结果照写" 'cat "$SPOOL"/*-agent-s2.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"call-v1\") | .type) == [\"tool.end\"]" >/dev/null'
+{ rec s2b s2r P1 assistant '[]' '{"agentId":"s2","isSidechain":true,"message":{"id":"sm2","model":"claude-sonnet-5","role":"assistant","content":[{"type":"tool_use","id":"s2t2","name":"Grep","input":{"pattern":"add"}}]}}'
+  rec s2s s2b P1 user '[{"type":"tool_result","tool_use_id":"s2t2","content":"calc.py:1"}]' '{"agentId":"s2","isSidechain":true}'
+  rec s2c s2s P1 assistant '[]' '{"agentId":"s2","isSidechain":true,"message":{"id":"sm3","model":"claude-sonnet-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"查完了。"}]}}'
+} >> "$TDIR/$SID/subagents/agent-s2.jsonl"
+hook SubagentStop "$(payload SubagentStop '{"agent_id":"s2"}')"
+check "s2 结束后：夹着工具结果的那次调用仍是一条、两个工具都在，最后一次回答也写出" 'cat "$SPOOL"/*-agent-s2.jsonl 2>/dev/null | jq -s -e "map(select(.type == \"message.assistant\" and .provenance.rule_version == \"call-v1\") | .extensions[\"vibetrail.call\"].tool_calls) == [[\"Read\", \"Grep\"], []]" >/dev/null'
+# s2 被续上（SendMessage）又开始写：结束标记记的是当时的文件大小，文件长了就不算结束，续上的那次调用写一半时不写出
+{ rec s2v s2c P1 user '"再查一个"' '{"agentId":"s2","isSidechain":true}'
+  rec s2w s2v P1 assistant '[]' '{"agentId":"s2","isSidechain":true,"message":{"id":"sm4","model":"claude-sonnet-5","role":"assistant","content":[{"type":"thinking","thinking":"…"}]}}'
+} >> "$TDIR/$SID/subagents/agent-s2.jsonl"
+hook Notification "$(payload Notification '{"notification_type":"idle_prompt"}')"
+check "s2 被续上、调用写了一半：不写出" '! cat "$SPOOL"/*-agent-s2.jsonl | jq -e "select(.extensions[\"vibetrail.call\"].response_id == \"sm4\")" >/dev/null'
+rec s2x s2w P1 assistant '[]' '{"agentId":"s2","isSidechain":true,"message":{"id":"sm4","model":"claude-sonnet-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"也查完了。"}]}}' >> "$TDIR/$SID/subagents/agent-s2.jsonl"
+hook SubagentStop "$(payload SubagentStop '{"agent_id":"s2"}')"
+check "续上的这段结束后：那次调用完整写出（thinking 与回答合成一条）" 'cat "$SPOOL"/*-agent-s2.jsonl | jq -s -e "map(select(.extensions[\"vibetrail.call\"].response_id == \"sm4\")) | length == 1 and .[0].extensions[\"vibetrail.call\"].stop_reason == \"end_turn\" and .[0].extensions[\"vibetrail.call\"].thinking == true" >/dev/null'
 
 echo "════ 8. 文件被重写（变短）：从 0 重读，不重复 ════"
 head -n 5 "$TR" > "$TR.tmp" && mv "$TR.tmp" "$TR"
@@ -189,6 +214,46 @@ map_r "$R" --start-line "$(jq -r .checkpoint_line "$T/rw-a.l")" --start-byte "$(
     --seen-uuids "$T/rw-a.src" --ledger /dev/null > "$T/rw-b.ev"
 check "整份解析：rt1 只有一条 tool.end，工具名是 Bash" 'map_r "$R" --ledger /dev/null | jq -s -e "map(select(.type == \"tool.end\")) | length == 1 and .[0].payload.tool_name == \"Bash\"" >/dev/null'
 check "分两次解析：后一次不再发 rt1 的 tool.end，两次合起来没有重复的 event_id" '! grep -q "\"tool.end\"" "$T/rw-b.ev" && [ "$(cat "$T/rw-a.ev" "$T/rw-b.ev" | jq -r .event_id | sort | uniq -d | wc -l | tr -d " ")" = 0 ]'
+
+echo "════ 12. 连着几次模型调用、中间没有 user 记录（连续撞 max_tokens）：后一次的请求开始是前一次的结尾 ════"
+R2=$T/maxtok.jsonl
+{ rec q1 "" P1 user '"想一想"' '{"timestamp":"2026-09-15T12:00:00.000Z"}' | jq -c '.parentUuid = null'
+  rec c1 q1 P1 assistant '[]' '{"timestamp":"2026-09-15T12:10:00.000Z","message":{"id":"mc1","model":"claude-opus-5","role":"assistant","stop_reason":"max_tokens","content":[{"type":"thinking","thinking":"…"}]}}'
+  rec c2 c1 P1 assistant '[]' '{"timestamp":"2026-09-15T12:20:00.000Z","message":{"id":"mc2","model":"claude-opus-5","role":"assistant","stop_reason":"max_tokens","content":[{"type":"thinking","thinking":"…"}]}}'
+  rec c3 c2 P1 assistant '[]' '{"timestamp":"2026-09-15T12:20:05.000Z","message":{"id":"mc3","model":"claude-opus-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"想好了。"}]}}'
+} > "$R2"
+check "三次调用的请求开始依次是人话、第一次的结尾、第二次的结尾" 'map_r "$R2" --ledger /dev/null --close-last stop --stop-turn P1 | jq -s -e "map(select(.type == \"message.assistant\") | .extensions[\"vibetrail.call\"].started_at) == [\"2026-09-15T12:00:00.000Z\", \"2026-09-15T12:10:00.000Z\", \"2026-09-15T12:20:00.000Z\"]" >/dev/null'
+
+R3=$T/interleave.jsonl
+{ rec i1 "" P1 user '"看两个文件"' | jq -c '.parentUuid = null'
+  rec i2 i1 P1 assistant '[]' '{"message":{"id":"mi1","model":"claude-opus-5","role":"assistant","content":[{"type":"tool_use","id":"it1","name":"Read","input":{"file_path":"a"}}]}}'
+  rec i3 i2 P1 user '[{"type":"tool_result","tool_use_id":"it1","content":"a"}]'
+  rec i4 i3 P1 assistant '[]' '{"message":{"id":"mi1","model":"claude-opus-5","role":"assistant","content":[{"type":"tool_use","id":"it2","name":"Read","input":{"file_path":"b"}}]}}'
+  rec i5 i4 P1 user '[{"type":"tool_result","tool_use_id":"it2","content":"b"}]'
+  rec i6 i5 P1 assistant '[]' '{"message":{"id":"mi2","model":"claude-opus-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"看完了。"}]}}'
+} > "$R3"
+check "同一次调用的记录中间夹着工具结果（2.1.260 边生成边执行）：仍是一条，两个工具都在" 'map_r "$R3" --ledger /dev/null --close-last stop --stop-turn P1 | jq -s -e "map(select(.type == \"message.assistant\") | .extensions[\"vibetrail.call\"].tool_calls) == [[\"Read\", \"Read\"], []]" >/dev/null'
+
+R4=$T/pending.jsonl
+{ rec p1 "" P1 user '"第一问"' '{"timestamp":"2026-09-15T12:00:00.000Z"}' | jq -c '.parentUuid = null'
+  rec p2 p1 P1 assistant '[]' '{"timestamp":"2026-09-15T12:00:30.000Z","message":{"id":"mp1","model":"claude-opus-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"答一。"}]}}'
+  rec p3 p2 P2 user '"第二问"' '{"timestamp":"2026-09-15T12:05:00.000Z"}'
+  rec p4 p3 P2 assistant '[]' '{"timestamp":"2026-09-15T12:05:20.000Z","message":{"id":"mp2","model":"claude-opus-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"答二。"}]}}'
+} > "$R4"
+head -n 3 "$R4" > "$T/pending-a.jsonl"     # 上一次读到第二问为止，上一轮没经过 Stop 关（第一问的回答还没写出）
+map_r "$T/pending-a.jsonl" --ledger "$T/pd-a.l" --sources-out "$T/pd-a.src" > "$T/pd-a.ev"
+map_r "$R4" --start-line "$(jq -r .checkpoint_line "$T/pd-a.l")" --start-byte "$(jq -r .checkpoint_byte "$T/pd-a.l")" --from-line 3 \
+    --seen-uuids "$T/pd-a.src" --ledger /dev/null > "$T/pd-b.ev"
+check "起读行不越过还没写出的调用：第一问的回答照样写出，归第一轮、请求开始是第一问" 'cat "$T/pd-a.ev" "$T/pd-b.ev" | jq -s -e "map(select(.type == \"message.assistant\" and .extensions[\"vibetrail.call\"].response_id == \"mp1\")) | length == 1 and .[0].turn_id == \"P1\" and .[0].extensions[\"vibetrail.call\"].started_at == \"2026-09-15T12:00:00.000Z\"" >/dev/null'
+
+echo "════ 13. init：别的设置原样保留；重跑没有变化就不动 settings、不多一份备份；uninstall 只去掉自己的 ════"
+IS=$T/init-home; mkdir -p "$IS/.claude"; printf '{\n    "model": "opus"\n}\n' > "$IS/.claude/settings.json"
+vcli(){ ( cd "$REPO" && VIBETRAIL_HOME=$IS/.vibetrail VIBETRAIL_CLAUDE_SETTINGS=$IS/.claude/settings.json bash "$SELF/vibetrail" "$@" >/dev/null 2>&1 ); }
+nhook(){ jq '[.. | objects | select(has("command")) | .command | select(test("vibetrail-hook"))] | length' "$IS/.claude/settings.json"; }
+vcli init --no-register; n1=$(nhook); vcli init --no-register
+check "两次 init：model 还在、条目没翻倍；第二次没变化，不写也不多备份；装之前的原样另存了一份" '[ "$(nhook)" = "$n1" ] && [ "$n1" -gt 0 ] && jq -e ".model == \"opus\"" "$IS/.claude/settings.json" >/dev/null && [ "$(ls "$IS/.vibetrail/backup"/settings.json.2* | wc -l | tr -d " ")" = 1 ] && jq -e ". == {model: \"opus\"}" "$IS/.vibetrail/backup/settings.json.before-vibetrail" >/dev/null 2>&1'
+vcli uninstall
+check "uninstall 之后回到原样，原样那份备份没被覆盖" 'jq -e ". == {model: \"opus\"}" "$IS/.claude/settings.json" >/dev/null && jq -e ". == {model: \"opus\"}" "$IS/.vibetrail/backup/settings.json.before-vibetrail" >/dev/null 2>&1'
 
 echo
 [ "$skipped_schema" -gt 0 ] && echo "  ⚠ 本机 python3 没有 jsonschema，协议 schema 校验跳过 $skipped_schema 处（pip install jsonschema 后重跑）"

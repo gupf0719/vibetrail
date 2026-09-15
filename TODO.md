@@ -52,6 +52,8 @@
   09-15 请用户按停止实测：没有任何 hook、没有 `idle_prompt`；按停止打断正在跑的工具被记成拒绝（OPEN-ISSUES K7，区分方案待定）。
 - [x] 调用 trace（09-15，用户：「trace是不是没采，genai那些」「参考下pilot，它全采了」）：每次模型调用、每次工具调用各一条，照 Pilot 的粒度、不带正文（DESIGN D8）；
   演示报告第一块下面有每个会话的调用明细。
+  重采后核出 5 处（重写副本、连续调用的开始时间、工具结果夹在调用中间、子 agent 读到半截、起读行越过未写出的调用），逐条对照 Pilot 与 teamai 后修掉（DESIGN D8 表）。
+- [x] settings 备份照 Pilot 改（09-15，用户问「backup的目的是啥」）：没变化不写、写前核对没被别人改过、装之前的原样只存一次永不覆盖。
 - [x] commit ↔ 轮次推导（09-15）：轮起 / 轮止快照（`state/<sid>/turns/`），本轮 commit = `rev-list 起..止` + 本轮 reflog 里新建的提交，归因看 transcript 里 agent 有没有跑
   `git commit`（DESIGN §3.5）；demo.sh 第 1 轮中途真的提交一次，turn.end 带上了。原写的「`vibetrail show` 按 commit 查改走它」不做了：按 commit 查是读取端的事（D5），
   现在的 `vibetrail show` 是本地预览。Bash stdout 里短 sha 的旁证还没做。

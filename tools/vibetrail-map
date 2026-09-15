@@ -11,9 +11,9 @@
 #   --project-id / --workspace-id  协议的两个必填 id；默认都取 transcript 第一条带 cwd 记录的 cwd（hook 分发入口会传真值）
 #   --meta         子 agent 的 meta.json（agentType / toolUseId / spawnDepth）；默认取同名 .meta.json（有就用）
 #   --parent-instance  子 agent 的父实例；默认按 meta 的 toolUseId 在兄弟子 agent 文件里找派它的那个，找不到就是 main
-#   --seen-uuids FILE  前几次记下的触发记录与人话记录，每行「uuid<TAB>行号」；同一 uuid 出现在别的行就是回放副本，跳过不上报。
+#   --seen-uuids FILE  前几次记下的记录，每行「uuid<TAB>行号」；同一 uuid 出现在别的行就是回放副本，整条跳过。
 #                      文件不存在当空
-#   --sources-out FILE 把本次新读到的触发记录与人话记录按同样格式追加进去（下一次的 --seen-uuids 用它）
+#   --sources-out FILE 把本次新读到的记录按同样格式追加进去（下一次的 --seen-uuids 用它）
 #   --hook-turns FILE  hook 记的轮次证据（vt_hook_turns 的输出：{<turn_id>: {start, stop, gap, fail}}），关轮时拼 status / vcs / commits；
 #                      不给就当 {}（轮次事件照发，只是没有 HEAD、commit，status 多是 unknown）
 #   --no-turns         只出分歧事件，不切轮（默认切轮：主会话按 promptId 切，turn.start 补位、模型答完（stop_hook_summary 前没有拦停反馈）或拒绝停下时发 turn.end）；

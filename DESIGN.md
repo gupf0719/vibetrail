@@ -320,7 +320,7 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
 
 | 层 | 做什么 | 幂等 / 升级 |
 |---|---|---|
-| 机器级（一次） | 运行时放 `~/.vibetrail/bin/`（hook 命令必须是绝对路径，触发时还不知道在哪个仓）；往 `~/.claude/settings.json` 写 hook 条目；建 `~/.vibetrail/{spool,state,projects,config}`；将来的云端鉴权 token 放 `~/.vibetrail/`（0600，teamai 的 `~/.teamai/token` 同款） | 条目按命令里的 `vibetrail-hook` 认，升级时整条换掉（Pilot 按命令认条目的做法）；改 settings 前备份到 `~/.vibetrail/backup/`（留 10 份）、临时文件 + rename；读不懂的 settings 不动；不建守护进程、不改 shell rc、不注入进程 |
+| 机器级（一次） | 运行时放 `~/.vibetrail/bin/`（hook 命令必须是绝对路径，触发时还不知道在哪个仓）；往 `~/.claude/settings.json` 写 hook 条目；建 `~/.vibetrail/{spool,state,projects,config}`；将来的云端鉴权 token 放 `~/.vibetrail/`（0600，teamai 的 `~/.teamai/token` 同款） | 条目按命令里的 `vibetrail-hook` 认，升级时整条换掉（Pilot 按命令认条目的做法）；改 settings 照 Pilot 的 `writeTextFileAtomic`：与现有的按 JSON 语义相同就不写（重跑 init 不多一份备份、不改人手写的格式），读进来之后被别人改过就不写（备份前、rename 前各查一次），第一次改之前的原样另存 `settings.json.before-vibetrail`、永不覆盖（Pilot 用 `COPYFILE_EXCL` 只备份一次），每次改之前再存一份带时间的（留 10 份），临时文件 + rename（09-15 用户问「backup的目的是啥」后改：原先每次重跑都备份一份，原样那份十次后就被挤掉）；读不懂的 settings 不动；不建守护进程、不改 shell rc、不注入进程 |
 | scope（可配） | `project`（**默认**，用户 09-15 定，参考 teamai）：只采登记过的项目，分发入口查 `~/.vibetrail/projects/`，未登记直接退出（G8）。`user`：本机所有目录都采，不看登记表——用户显式选才开。配置在 `~/.vibetrail/config` | 改配置即生效，hook 每次触发读一次 |
 | 登记（scope=project 的开关） | `vibetrail init` 在仓里跑时顺手登记本仓（键 = `git worktree list` 第一条的主 checkout，worktree 共享）；另有 `vibetrail projects add / remove / list`（U2）。登记表在 HOME，仓里不留痕 | 幂等 |
 | 自检 | `vibetrail doctor`：运行时按 MANIFEST 校验、jq 在不在、条目在不在且指向的运行时存在、**本机每个 Claude Code 都认识登记的事件**（下一段）；scope 与本仓登记了没；spool 积压、transcript 落后（10 分钟没动还没采完）、重写次数、错误日志、端点配没配（09-15 已做）。还没做：最近 N 个会话的 `stop_hook_summary` 里有几个跑过我们的命令、本机语料里有没有已知清单之外的 `type` / `attachment.type` / hook 事件名（G6，随完整性钉子做） | — |
@@ -409,24 +409,41 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
 
 ### D8 — 采调用 trace：照 Pilot 的粒度，一次调用一条，不带正文（2026-09-15，现行）
 
-用户原话：「trace是不是没采，genai那些」「除了协议，你还可以参考下pilot，它全采了，我没看teamai有没有采」「旧的展示数据可以先删掉」。
+用户原话：「trace是不是没采，genai那些」「除了协议，你还可以参考下pilot，它全采了，我没看teamai有没有采」「旧的展示数据可以先删掉」；
+重采后核出几处问题，又要求「你遇到的几个问题，都看看teamai和pilot，看看他们有没有遇到」「看看他们怎么解决的」「从backup的目的是啥你开始自己修补的问题都去看看有没有更优解」。
 
 对照（本机两个仓的源码）：Pilot 每轮按调用拆（`assets/hooks/claude-code-hook-processor.mjs`）——每次模型调用一对 `llm.request` / `llm.response`
 （`gen_ai.request.model`、`gen_ai.response.id`、`finish_reasons`，入 / 出 / 缓存读 / 缓存写 token，外加输入输出全文），每次工具调用一对 `tool.call` / `tool.result`
-（工具名、call id，外加参数与结果全文）；请求开始时间取同一轮里上一条工具结果的时间，没有就取人话的时间（`claude-code/transcript-parser.mjs`）。
-teamai 没有调用这一级（`src/dashboard-collector.ts`）：每次 PostToolUse 记一条工具名（没有耗时、状态），token 是 Stop 时扫整份 transcript 加总的会话累计。
+（工具名、call id，外加参数与结果全文）。teamai 没有调用这一级（`src/dashboard-collector.ts`）：每次 PostToolUse 记一条工具名（没有耗时、状态），
+token 是 Stop 时扫整份 transcript 加总的会话累计。
 
-定了什么：映射层（`tools/map-events.jq` 的 trace 部分，rule_version `call-v1`；`trace-v1` 已是审计记录格式的名字）从 transcript 出，不另挂 hook——
-- 每次模型调用（同一 `message.id` 的几条记录）一条 `message.assistant`，`content_state` = `omitted`，`extensions.vibetrail.call` 带 `response_id`、`request_id`、
-  `stop_reason`、这次的 token、`started_at`（上一条 user 记录——工具结果或人话——的时间，与 Pilot 同法）、调了哪些工具、有没有 thinking。
-  这次调用结束时发：读到下一条 user 记录或另一个 `message.id`，或关轮时读到文件末尾（Stop 时与 `turn.end` 同一块）。
-- 每个工具结果一条 `tool.end`（工具名、`call_id`、success / error / cancelled、`duration_ms` = 结果时间 − 调用时间）；执行前被拒的没执行，不出 `tool.end`，拒绝本身已有 `permission.decision`。
-- 子 agent 文件同样出，实例 = agentId。
+定了什么：映射层（`tools/map-events.jq` 的 trace 部分，rule_version `call-v1`；`trace-v1` 已是审计记录格式的名字）从 transcript 出，不另挂 hook。**不带正文**（D5 不变），
+一次调用一条而不是 Pilot 的两条，每条百字节级（本机当时最重的会话 257 次模型调用、254 次工具调用，事件从 25 条变成 530 多条）。
+- **每次模型调用一条 `message.assistant`**（`content_state` = `omitted`），`extensions.vibetrail.call` 带 `response_id`、`request_id`、`stop_reason`、这次的 token、
+  `started_at`、调了哪些工具、有没有 thinking。同一 `message.id` 的几条记录是一次调用；**出现另一个 `message.id`、或关轮时读到文件末尾才算结束**——
+  2.1.260 边生成边执行工具，工具结果会夹在同一次调用的记录中间。
+- **请求开始**＝最近一条 user 记录与上一次调用结尾里晚的那个，不晚于这次调用的结束；只往后走。
+- **每个工具结果一条 `tool.end`**（工具名、`call_id`、success / error / cancelled、`duration_ms` = 结果时间 − 调用时间）；这次没读到调用的结果不发；
+  执行前被拒的没执行，不出 `tool.end`，拒绝本身已有 `permission.decision`。
+- **子 agent 文件**同样出，实例 = agentId；它的最后一次调用只在它结束后写：SubagentStop 记下的文件大小与现在相同，或会话结束 / 恢复 / 空闲。
+- 增量解析的**起读行不越过还没写出的那次调用所在那一轮的开头**；所有带 uuid 的记录都查**重写副本**（D8 下表第 1 条）。
 
-**不带正文**（D5 不变），一次调用一条而不是 Pilot 的两条：每条百字节级。本机当时最重的会话（`ffe1c0f1`，09-15）257 次模型调用、254 次工具调用，
-事件从 25 条变成 530 多条。本机 10 份真 transcript、89 个切点，trace 打开后增量解析与整份解析逐条一致。途中查出一处：压缩上下文时 Claude Code 会把早先一条并行工具的结果
-按原 uuid、换上新 promptId 再写一遍（本机只此一例），增量解析读不到它的调用，会以 `unknown` 工具名重发一条 `tool.end`（event_id 相同，spool 按 id 会拦下，但映射层不该发）。
-现在读不到对应调用的工具结果不发 `tool.end`：结果与调用同在一轮，增量解析从当前轮开头读起，正常的都读得到（`test-hook-flow.sh` 第 11 段）。
+用新版本重采本机全部会话后逐条核对，查出下面几处，都已修、都有回归（`test-hook-flow.sh` 第 6、7、11、12 段，撤掉修复即失败）。
+两份核对都跑了对方自己的代码（Pilot 用 node 直接调它的解析器，teamai 用 Node 25 加载它的 TypeScript）：
+
+| # | 问题（本机实例） | 我们的修法 | Pilot | teamai |
+|---|---|---|---|---|
+| 1 | 同一 uuid 的旧记录被重写：压缩时 Claude Code 把早先一条并行工具的结果按原 uuid、换上新 promptId 再写一遍；测试里的回放副本还会凭空开出一轮 | 所有带 uuid 的记录都查副本、整条跳过（原先只查触发记录与人话；两份核对都建议全查）；首次整读 65 MB 4.9 s → 7.1 s | 只给同一次读到调用的结果发，不按 uuid 去重；重写记录进了下一次调用的输入 | 不去重，打断 / 拒绝 / 出错 / 人话计数重复算 |
+| 2 | 连着几次调用中间没有 user 记录（子 agent 连续 4 次撞 max_tokens）：开始时间停在最早那条，耗时算成 14 / 28 / 42 / 56 分钟 | 取上一次调用结尾与最近 user 记录里晚的 | 同样的问题（它的实测数就是这四个） | 不按调用计时，碰不到 |
+| 3 | 工具结果夹在同一次调用中间：897 次调用里 96 次少记工具、共 237 个，27 次少记输出 token | 只在另一个 message.id 出现时结束 | 按 message.id 在一次读里归组，打平；但把调用结束时间取成第一条记录 | 只数 token（按 message.id 去重），打平 |
+| 4 | 并行 / 后台子 agent 还在跑时被顺带读到末尾，写出半截调用，完整的那条按 event_id 被拦下 | 子 agent 结束后才写最后一次调用；SubagentStop 记文件大小不记「结束过」（Pilot 核对的建议：子 agent 会被续上接着写，本机 4 个文件跨了 2～3 个父轮） | 碰不到：子 agent 跑完才读一次；但 SubagentStop 不来时父轮会一直卡在 state 里 | 不读子 agent 文件，这部分 token、拒绝全漏 |
+| 5 | 起读行越过还没写出的调用（上一轮最后一次调用要等下一个 message.id）：那次调用就丢了 | 起读行退到它那一轮的开头（子 agent 文件里 promptId 跟着父轮变，不能只靠「人话结束调用」） | 同样的问题，更重：没有换行保护，跨偏移的消息发两次 | 每次 Stop 整份重扫，碰不到；代价是每次全读，超过 50 MB 数字冻住 |
+| 6 | 同一 message.id 的用量：流式早期记录可能是占位值 | 取 output_tokens 最大的那条（照 ccusage） | 取最后一条（本机数据上与最大相同） | 取第一条，输出会少算 |
+
+没照搬的：Pilot 把父会话里 Agent 工具结果当子 agent 跑完的信号——被转到后台的子 agent 工具结果会先回来，要再认 `isAsync`，SubagentStop 在 desktop 里前后台都实测到了，
+先不加；「开着的调用按 message.id 分别记」——本机没有一次调用的记录中间夹着另一次调用的记录（0 例），副本又已整条跳过，不需要。
+记下待做：`system/api_error` 重试次数进 `vibetrail.call`（teamai 核对的建议，重试等待不算进调用耗时）；新版人话记录的 `origin.kind` 可以替代文本判人话。
+验证：本机 10 份主会话 transcript、89 个切点，20 个子 agent 文件、100 个切点，增量解析与整份解析逐条一致。
 
 ### D7 — turn.end 在模型答完的那一刻写：Stop 时当场关轮，被别的 Stop hook 拦下时补发更新的一条（2026-09-15，现行）
 

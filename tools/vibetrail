@@ -138,12 +138,28 @@ settings_read(){ # settings_read → stdout 当前 settings（没有文件当 {}
     else echo '{}'; fi
 }
 
-settings_write(){ # settings_write < 新内容：先备份原文件到 ~/.vibetrail/backup/，再临时文件 + rename
-    local new; new=$(cat)
+settings_same(){ # settings_same <读进来时的内容>：settings 现在与读进来时按 JSON 语义相同（没有文件、空文件都当 {}）
+    local now; now=$( { [ -s "$SETTINGS" ] && "$JQ" -S -c . "$SETTINGS" 2>/dev/null; } || echo '{}')
+    [ "$now" = "$(printf '%s' "$1" | "$JQ" -S -c .)" ]
+}
+
+settings_write(){ # settings_write <读进来时的内容> < 新内容。照 Pilot 的 writeTextFileAtomic（src/utils/fs-utils.ts）：
+    # 1. 读进来之后被别人改过（Claude Code、别的会话）就不写，备份前、rename 前各查一次——init 在读与写之间要扫 Claude Code 可执行文件，首次 2 s 多
+    # 2. 第一次改之前的原样另存 settings.json.before-vibetrail，永不覆盖、不参与轮换（Pilot 用 COPYFILE_EXCL 只备份一次）；
+    #    那时里面已经有 vibetrail 的条目就不算原样，不存。另外每次改之前再存一份带时间的，只留最近 10 份（撤销某一次改动用）
+    # 3. 临时文件 + rename
+    local expect=$1 new f; new=$(cat)
     mkdir -p "$VT_HOME/backup" "$(dirname "$SETTINGS")"
-    [ -f "$SETTINGS" ] && cp -p "$SETTINGS" "$VT_HOME/backup/settings.json.$(date -u +%Y%m%dT%H%M%SZ)"
-    ls -1t "$VT_HOME/backup"/settings.json.* 2>/dev/null | tail -n +11 | while IFS= read -r f; do rm -f "$f"; done   # 留最近 10 份
-    printf '%s\n' "$new" > "$SETTINGS.vibetrail.tmp" && mv "$SETTINGS.vibetrail.tmp" "$SETTINGS"
+    settings_same "$expect" || { say "⚠ $SETTINGS 在这期间被改过，没写；再跑一次即可"; return 1; }
+    if [ -s "$SETTINGS" ]; then
+        f="$VT_HOME/backup/settings.json.before-vibetrail"
+        [ -e "$f" ] || grep -q 'vibetrail-hook' "$SETTINGS" || cp -p "$SETTINGS" "$f"
+        cp -p "$SETTINGS" "$VT_HOME/backup/settings.json.$(date -u +%Y%m%dT%H%M%SZ)-$$"
+        ls -1t "$VT_HOME/backup"/settings.json.2* 2>/dev/null | tail -n +11 | while IFS= read -r f; do rm -f "$f"; done
+    fi
+    printf '%s\n' "$new" > "$SETTINGS.vibetrail.tmp" || return 1
+    settings_same "$expect" || { rm -f "$SETTINGS.vibetrail.tmp"; say "⚠ $SETTINGS 在这期间被改过，没写；再跑一次即可"; return 1; }
+    mv "$SETTINGS.vibetrail.tmp" "$SETTINGS"
 }
 
 cmd_init(){
@@ -193,15 +209,22 @@ cmd_init(){
     # 3. settings 条目
     local events bins; events=$(events_for "$mode"); bins=$(claude_binaries | sort -u)
     # shellcheck disable=SC2086
-    local entries; entries=$(entries_json $events)
-    printf '%s' "$cur" | "$JQ" --argjson e "$entries" "$JQ_STRIP"' | reduce $e[] as $x (.; .hooks[$x.event] = ((.hooks[$x.event] // []) + [$x.group]))' \
-        | settings_write || die "写不了 $SETTINGS"
-    say "✓ hook 条目 → ${SETTINGS}（$(printf '%s\n' $events | wc -l | tr -d ' ') 个事件：${events}）"
+    local entries new written=0; entries=$(entries_json $events)
+    new=$(printf '%s' "$cur" | "$JQ" --argjson e "$entries" "$JQ_STRIP"' | reduce $e[] as $x (.; .hooks[$x.event] = ((.hooks[$x.event] // []) + [$x.group]))') \
+        || die "算不出新的 settings"
+    # 与现有的按 JSON 语义相同（重跑 init、版本没变）就不动：不多一份备份，也不把人手写的格式改掉
+    if [ "$(printf '%s' "$new" | "$JQ" -S -c .)" = "$(printf '%s' "$cur" | "$JQ" -S -c .)" ]; then
+        say "✓ hook 条目已是最新（${SETTINGS} 没动，$(printf '%s\n' $events | wc -l | tr -d ' ') 个事件：${events}）"
+    else
+        printf '%s\n' "$new" | settings_write "$cur" || die "写不了 $SETTINGS"
+        written=1
+        say "✓ hook 条目 → ${SETTINGS}（$(printf '%s\n' $events | wc -l | tr -d ' ') 个事件：${events}）"
+    fi
     if [ "$mode" = auto ]; then
         if [ -n "$bins" ]; then say "  按本机 $(printf '%s\n' "$bins" | wc -l | tr -d ' ') 个 Claude Code 可执行文件都认识的事件登记（--events all 可全登记）"
         else say "  ⚠ 没找到 Claude Code 可执行文件，只登记老版本也有的 6 个事件"; fi
     fi
-    say "  原文件备份在 $VT_HOME/backup/；settings 热加载，已开着的会话从下一次 hook 起生效"
+    [ "$written" = 1 ] && say "  改之前的备份在 $VT_HOME/backup/（装之前的原样是 settings.json.before-vibetrail）；settings 热加载，已开着的会话从下一次 hook 起生效"
 
     # 4. 登记本仓
     if [ "$(vt_conf scope project)" = project ] && [ $register = 1 ]; then
@@ -222,7 +245,7 @@ cmd_uninstall(){
     if [ -f "$SETTINGS" ]; then
         local cur; cur=$(settings_read) || exit 1
         if printf '%s' "$cur" | grep -q 'vibetrail-hook'; then
-            printf '%s' "$cur" | "$JQ" "$JQ_STRIP" | settings_write || die "写不了 $SETTINGS"
+            printf '%s' "$cur" | "$JQ" "$JQ_STRIP" | settings_write "$cur" || die "写不了 $SETTINGS"
             say "✓ 已从 $SETTINGS 去掉 vibetrail 的 hook 条目（原文件备份在 $VT_HOME/backup/）"
         else say "  $SETTINGS 里没有 vibetrail 的条目"; fi
     fi

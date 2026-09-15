@@ -146,22 +146,29 @@ turn_fail(){ # StopFailure：API 错误结束了这一轮
 # ---- 一份 transcript 文件：从 checkpoint 起映射 → 去重 → 写一块 spool → 推进 state ----
 process_file(){ # process_file <sid> <state 目录> <文件> <名> [close_last] [stop_turn]
     local sid=$1 sd=$2 f=$3 name=$4 close=${5:-} stop_turn=${6:-} st="$2/$4.json" seen="$2/$4.seen"
-    local size lines=0 consumed=0 ckl=1 ckb=0 fp_old="" rewrites=0 ino tmp rc fp open closed
+    local size lines=0 consumed=0 ckl=1 ckb=0 fp_old="" rewrites=0 ino tmp rc fp open closed call_open
     local extra_args=()
     size=$(wc -c < "$f" 2>/dev/null | tr -d ' ') || return 0
+    # 子 agent 文件只在它结束后才带 close_last（把最后一次模型调用写出）：SubagentStop 记下的文件大小与现在相同，或会话结束 / 恢复 / 空闲。
+    # 主会话 Stop 时后台子 agent 可能还在跑；并行的子 agent 里一个结束时也会顺带读到别的——那时写出去的是半截调用。
+    # 记大小不记「结束过」（照 Pilot 核对的建议）：子 agent 会被续上接着写，本机 4 个子 agent 文件跨了 2～3 个父轮
+    if [ "$name" != main ]; then
+        case "$close" in session_end|resume|idle) ;; *) close=""; [ "$(cat "$sd/$name.done" 2>/dev/null)" = "$size" ] && close=stop;; esac
+    fi
     ino=$(stat -f %i "$f" 2>/dev/null || stat -c %i "$f" 2>/dev/null)
     if [ -f "$st" ]; then
-        IFS=$'\x1f' read -r lines consumed ckl ckb fp_old rewrites open closed < <("$JQ" -r \
-            '[.lines, .consumed_bytes, .checkpoint_line, .checkpoint_byte, (.fprint // ""), (.rewrites // 0), (.turn_open // ""), (.turn_closed // false)]
+        IFS=$'\x1f' read -r lines consumed ckl ckb fp_old rewrites open closed call_open < <("$JQ" -r \
+            '[.lines, .consumed_bytes, .checkpoint_line, .checkpoint_byte, (.fprint // ""), (.rewrites // 0), (.turn_open // ""), (.turn_closed // false), (.call_open // false)]
              | map(tostring) | join("\u001f")' "$st" 2>/dev/null)
         lines=${lines:-0}; consumed=${consumed:-0}; ckl=${ckl:-1}; ckb=${ckb:-0}; rewrites=${rewrites:-0}
     fi
     # offset 信任检查（照 agentsview，09-15）：换了 inode、变短、开头或 checkpoint 前 4 KB 的哈希变了，都算被重写过——从 0 重读，
     # ids 留着，重读出的同一批事件在写 spool 前按 event_id 拦下。没有新字节时只比 inode（一次 stat），不算哈希：
     # 一个会话几十个子 agent 文件，每个都算两段哈希会让每次 Stop 多一两秒；大小完全不变的原地改写只能靠 inode 发现。
-    # 没有新字节、但要关最后一轮（会话结束 / 恢复 / 空闲）而上次还没关过的，照样往下走一次
+    # 没有新字节、但要关最后一轮（会话结束 / 恢复 / 空闲）而上次还没关过的，或者末尾还有一次模型调用没写出的，照样往下走一次
     if [ "$size" -eq "$consumed" ] && { [ -z "$fp_old" ] || [ "${fp_old%%:*}" = "$ino" ]; }; then
-        if [ -z "$close" ] || [ -z "${open:-}" ] || [ "${closed:-false}" = "true" ]; then return 0; fi
+        if [ -z "$close" ]; then return 0; fi
+        if { [ -z "${open:-}" ] || [ "${closed:-false}" = "true" ]; } && [ "${call_open:-false}" != "true" ]; then return 0; fi
     fi
     if [ "$consumed" -gt 0 ] && { [ "$size" -lt "$consumed" ] || { [ -n "$fp_old" ] && [ "$(vt_fprint "$f" "$consumed")" != "$fp_old" ]; }; }; then
         rm -f "$st" "$seen"; lines=0; consumed=0; ckl=1; ckb=0; rewrites=$((rewrites + 1))
@@ -172,6 +179,8 @@ process_file(){ # process_file <sid> <state 目录> <文件> <名> [close_last] 
         extra_args=(--hook-turns "$tmp/turns")
         [ -n "$close" ] && extra_args+=(--close-last "$close")
         [ -n "$stop_turn" ] && extra_args+=(--stop-turn "$stop_turn")
+    elif [ -n "$close" ]; then
+        extra_args=(--close-last "$close")
     fi
     # bash 3.2 + set -u：空数组展开会报 unbound，写成 ${a[@]+"${a[@]}"}
     bash "$SELF/vibetrail-map" "$f" --sid "$sid" --project-id "$project" --workspace-id "$workspace" \
@@ -185,7 +194,7 @@ process_file(){ # process_file <sid> <state 目录> <文件> <名> [close_last] 
     fp=$(vt_fprint "$f" "$("$JQ" -r '.consumed_bytes' "$tmp/ledger")") || fp=""
     "$JQ" -c --arg fp "$fp" --argjson rw "$rewrites" \
         '{lines, consumed_bytes, file_bytes, checkpoint_line, checkpoint_byte, parent_instance, fprint: $fp, rewrites: $rw,
-          turn_open: (.turns.open // null), turn_closed: (.turns.closed // false), updated_at: (now | todate)}' \
+          turn_open: (.turns.open // null), turn_closed: (.turns.closed // false), call_open: (.trace.call_open // false), updated_at: (now | todate)}' \
         "$tmp/ledger" > "$st.tmp" && mv "$st.tmp" "$st"
     if [ "$name" = "main" ]; then      # 会话最近的 model，给下一轮的 turn.start 用
         local model; model=$("$JQ" -r '.turns.model // empty' "$tmp/ledger" 2>/dev/null)
@@ -201,7 +210,7 @@ process_session(){ # process_session <sid> <主 transcript> [close_last] [stop_t
     vt_lock "$sd" || return 0                                      # 同一会话已在跑：跳过，下一次 hook 补上
     [ -f "$main_t" ] && process_file "$sid" "$sd" "$main_t" main "$close" "$stop_turn"
     for f in "$(dirname "$main_t")/$sid/subagents"/agent-*.jsonl; do
-        [ -f "$f" ] && process_file "$sid" "$sd" "$f" "$(basename "$f" .jsonl)"
+        [ -f "$f" ] && process_file "$sid" "$sd" "$f" "$(basename "$f" .jsonl)" "$close"
     done
     vt_unlock "$sd"
 }
@@ -270,6 +279,10 @@ run(){ # 门控通过之后按事件干活
             [ -n "$agent_id" ] && emit_hook SubagentStart null "$(extra_subagent)" ;;
         SubagentStop|subagent-stop)
             [ -n "$agent_id" ] && emit_hook SubagentStop null "$(extra_subagent)"
+            if [ -n "$agent_id" ]; then   # 它结束了：记下此刻文件的大小，之后读到末尾、文件没再长，才把最后一次调用写出
+                local af="$(dirname "$tpath")/$sid/subagents/agent-$agent_id.jsonl"
+                [ -f "$af" ] && { wait_stable "$af"; mkdir -p "$SD" && wc -c < "$af" | tr -d ' ' > "$SD/agent-$agent_id.done"; }
+            fi
             [ -f "$tpath" ] && process_session "$sid" "$tpath" ;;
         SessionEnd|session-end)
             local snap prev; snap=$(vt_git_snapshot "$cwd")
