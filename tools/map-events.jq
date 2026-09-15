@@ -4,7 +4,8 @@
 # 用法（由 vibetrail-map 调）：
 #   jq -n -c -L tools --arg sid … --arg project_id … --arg workspace_id … --arg parent_instance main \
 #         --argjson start_line S --argjson from_line N --argjson meta <子 agent 的 meta.json 或 null> \
-#         --slurpfile seen_uuids <前几次记下的 [uuid, 行号] 数组> \
+#         --slurpfile seen_uuids <前几次记下的 [uuid, 行号] 数组> --slurpfile hook_turns <hook 记的轮次证据> \
+#         --argjson turns <true|false> --arg close_last <""|session_end|resume|idle> \
 #         --arg vt_version … --arg rule_version diverge-v1 -f map-events.jq < 从第 S 行起的 transcript
 # 输出：每行一个协议事件（event_id 为 null、多一个 _key，由 vibetrail-map 算 UUIDv5 后填上并删掉 _key），
 #      最后一行 {"_ledger": …} 账本（进出条数、反查方式、跳过的记录、下次的起读行 checkpoint_line）。
@@ -26,6 +27,16 @@
 #      Pilot / teamai 都不处理：Pilot 只在一条消息内按工具调用 id 去重，teamai 只按消息 id 给 token 去重。
 # ⚠️ jq 的函数参数在调用处的输入上求值：`$r | slim(.ln)` 里的 .ln 是 $r.ln（null），不是状态的行号。
 #    状态里的值一律先 `as $x` 绑定再往下传（这里曾让所有记录的行号都是 null，断链兜底从未生效）。
+#
+# 轮次元数据（DESIGN §3.1、§4.1，09-15 加；与分歧同一条事件流，$turns 默认 true，只有分歧判据的回归传 false）：
+#      主会话文件按 promptId 切轮——hook 的 prompt_id 与记录的 promptId 是同一个值
+#      （09-15 本机探针实测），轮中插话不换 promptId。每轮开头发 turn.start（hook 已经发过的同 event_id 在写 spool 前被拦下，
+#      这里是 hook 没跑时的补位）；**轮确定结束了才发 turn.end**：下一轮开始、或 $close_last（会话结束 / 恢复 / 空闲）。
+#      不在 Stop 当场发：别的 Stop hook 拦停时同一轮会接着干活、再来一次 Stop（agentDock 的审计闸门就会拦，DESIGN D7），当场发会丢掉续上那段的
+#      commit 与用量。status 取证据：被打断的轮已由分歧一路发了 turn.end(interrupted)，这里不再发；拒绝后停下的轮 denied；
+#      hook 记到本轮开始后的 Stop 是 completed；只有 StopFailure 是 error；什么证据都没有是 unknown。vcs / commits 来自 $hook_turns
+#      （Stop 时 hook 按轮起 HEAD 算好的，DESIGN §3.5）；用量是本轮 assistant 记录按 message.id 去重求和（与打断同一定义）。
+#      子 agent 文件不切轮：子 agent 的起止由 SubagentStart / SubagentStop hook 发。
 
 include "diverge-rules";
 
@@ -36,11 +47,14 @@ def codeOk: type == "string" and test("^[a-z][a-z0-9]*([._-][a-z0-9]+)*$");
 # text：user / assistant 记录的正文——只取 text 块（不含 thinking / tool_result），去掉 <system-reminder> 块；
 # IDE 扩展注入的 <ide_opened_file> / <ide_selection> 之类标签常和人打的字混在同一条消息里，只剥标签、不整条排除（照 agentsview，09-15 调研）
 def stripIde: gsub("<ide_[a-z_]+>.*?</ide_[a-z_]+>"; ""; "m") | sub("^\\s+"; "") | sub("\\s+$"; "");
+# 完整的 system-reminder 块只剥块、不整条排除：desktop 把它和人打的字塞进同一个字符串——worktree 会话的第一句人话就是
+# "<system-reminder>…</system-reminder>\n\npull main"（09-15 本机实测），原先整条当注入，这一轮的开头就认不出来
+def stripReminders: gsub("<system-reminder>.*?</system-reminder>"; ""; "m");
 def textOf:
   (msg.content) as $c
-  | if ($c | type) == "string" then ($c | stripIde)
+  | if ($c | type) == "string" then ($c | stripReminders | stripIde)
     elif ($c | type) == "array"
-    then [$c[]? | objects | select(.type == "text") | (.text // "") | strings
+    then [$c[]? | objects | select(.type == "text") | (.text // "") | strings | stripReminders
           | select((sub("^\\s+"; "") | (startswith("<system-reminder>") or startswith("<ide_"))) | not)
           | stripIde | select(length > 0)] | join("\n")
     else "" end;
@@ -92,6 +106,7 @@ def init: {
   seen: {},               # 已派生事件的 _key（去重）
   denials: [],            # 当前轮里 permission_denied 记录的 uuid，给 for-tool-use 配对
   pending: null,          # {after: [uuid…], kind, since}：等「人的下一句」；since＝第一个触发所在轮的开头行
+  pturn: null,            # 按 promptId 切的当前轮（轮次元数据一路）：{id, line, last_ts, usage, model, interrupted, denied, git_commit, closed}
   last_ts: null, version: null, entrypoint: null, branch: null,
   ledger: {in: {}, in_total: {}, out: {}, events: {}, absorbed_for_tool_use: 0, unpaired_for_tool_use: 0,
            lookup: {index: 0, regex: 0, missing: 0}, dedup: 0, records: 0, skipped_no_uuid: 0, skipped_non_object: 0,
@@ -99,6 +114,7 @@ def init: {
            # marker_without_hit > 0 ＝ 有这个标记、判据却没认出人拒——判据漂了
            sentinel: {marker: 0, marker_without_hit: 0},
            replayed: 0,       # 跳过的回放副本条数
+           turns: {started: 0, ended: {}},   # 轮次元数据一路：本次新开的轮、按 status.code 数的关轮
            sources: []},      # 本次新读到的触发记录与人话记录的 [uuid, 行号]——交给下一次当 $seen_uuids
   out: []
 };
@@ -119,6 +135,8 @@ def emit($e):
   if .seen[$e._key] then .ledger.dedup += 1 else
     .seen[$e._key] = true
     | if .ln > $from_line then .out += [$e] | .ledger.events[$e.type] += 1 else . end end;
+def emitAlways($e):    # 不看门控：文件末尾关轮（$close_last）时用，上一次可能已经读到了末尾；重复的由 hook 按 event_id 拦下
+  if .seen[$e._key] then .ledger.dedup += 1 else .seen[$e._key] = true | .out += [$e] | .ledger.events[$e.type] += 1 end;
 
 def turnOf($s):        # 轮次 id：记录自带 promptId；没有就按位置推（最近见到的 promptId），provenance 标 inferred
   if $s.promptId != null then {id: $s.promptId, inferred: false}
@@ -155,8 +173,8 @@ def message($s; $t; $m; $type; $author; $ext):
   | .extensions += $ext
   | ._key = ($m.uuid + "|" + $type);
 
-def usageSum:          # 当前轮的 token 用量：同一 message.id 的多条记录 usage 相同，按 id 去重后求和
-  [.turn_usage[] | select(type == "object")] as $us
+def usageOf($m):       # 一轮的 token 用量：同一 message.id 的多条记录 usage 相同，按 id 去重后求和
+  [$m[] | select(type == "object")] as $us
   | if ($us | length) == 0 then null else
     ($us | map((.output_tokens_details | if type == "object" then (.thinking_tokens // 0) else 0 end)) | add) as $think
     | {input_tokens: ($us | map((.input_tokens // 0) + (.cache_creation_input_tokens // 0)) | add),
@@ -166,6 +184,22 @@ def usageSum:          # 当前轮的 token 用量：同一 message.id 的多条
     | .total_tokens = (.input_tokens + .cached_input_tokens + .output_tokens)
     | with_entries(select(.value | type == "number"))
     end;
+def usageSum: usageOf(.turn_usage);
+
+# ---------- 轮次元数据：hook 记的证据（$hook_turns，vibetrail-hook 从 state/<sid>/turns/ 拼的） ----------
+def hookTurn($id): (($hook_turns[0] // {}) | if type == "object" then .[$id] else null end) // {};
+# 本轮的「止」：本轮开始之后的最后一次 Stop 快照；没有 Stop 就用下一轮开始 / 会话结束时补的那份（gap）
+def hookStop($h): if $h.stop != null and (($h.stop.at_epoch // 0) >= ($h.start.at_epoch // 0)) then $h.stop else null end;
+def hookEnd($h): hookStop($h) // $h.gap // null;
+def vcsMerge($branch; $hv):
+  ((if $branch != null then {branch: $branch} else {} end)
+   + (if ($hv | type) == "object" then ($hv | {head_sha, branch, dirty} | with_entries(select(.value != null))) else {} end))
+  | if length > 0 then . else null end;
+def codeify: tostring | ascii_downcase | gsub("[^a-z0-9._-]+"; "_") | gsub("^[^a-z]+"; "") | gsub("[._-]+$"; "")
+             | gsub("[._-]{2,}"; "_") | if . == "" then "unknown" else .[0:128] end;
+def commitsOf($end): if ($end.commits | type) == "array" and ($end.commits | length) > 0
+  then [$end.commits[] | select(type == "string") | {sha: ., relation: "observed", evidence: "before_after"}] else null end;
+def mainRec($r): ($r.isSidechain != true) and ($r.agentId == null);
 
 def turnStart: if .turn_line > 0 then .turn_line else $start_line end;
 def addPending($uuid; $kind):
@@ -237,14 +271,22 @@ def interrupted($r; $s; $h; $detail):
   | ($s.agent != null) as $sub
   # ⚠️ emit(base(…) | …) 里管道之后的 . 是事件、不是状态：状态里的值必须先绑成变量再用
   | ($reply.model // .turn_model) as $model | usageSum as $usage | .branch as $branch
+  # 主会话的打断轮：hook 记过这一轮的 HEAD 就补上（打断时 Stop 不来，「止」取下一轮开始或会话结束时补的快照，DESIGN §3.5）
+  | (if $sub then null else hookEnd(hookTurn($t.id)) end) as $hend
+  | vcsMerge($branch; $hend.vcs) as $vcs | commitsOf($hend) as $commits | (.pturn.git_commit // false) as $gc
   | emit( base($s; (if $sub then "subagent.end" else "turn.end" end); $s.uuid; $s.ts; $t)
           | .payload = ({status: {code: (if $sub then "cancelled" else "interrupted" end), category: "cancellation", detail: ($detail | .[0:4096])}}
                         + (if $sub then opt("agent_type"; $meta.agentType)
-                           else opt("model"; $model) + opt("usage"; $usage)
-                                + (if $branch != null then {vcs: {branch: $branch}} else {} end) end))
+                           else opt("model"; $model) + opt("usage"; $usage) + opt("vcs"; $vcs) end))
+          | (if $commits != null
+             then .commits = $commits
+                  | .extensions += {"vibetrail.commit_method": ($hend.commit_method // "rev-list"),
+                                    "vibetrail.commit_attribution": (if $gc then "agent_tool" else "inferred" end)}
+             else . end)
           | .raw = {event_name: ("diverge." + $h.kind), data: $h}
           | .extensions += ({"vibetrail.kind": $h.kind, "vibetrail.human": true} + opt("vibetrail.interrupted_uuid"; $reply.uuid))
           | ._key = ($s.uuid + "|" + .type) )
+  | (if ($sub | not) and .pturn != null and .pturn.id == $t.id then .pturn.interrupted = true else . end)
   | addPending($s.uuid; $h.kind);
 
 # for-tool-use 变体：同一轮里前面有 permission_denied 就是它的伴随记录，不另发事件（计一次）；
@@ -252,6 +294,8 @@ def interrupted($r; $s; $h; $detail):
 def forToolUse($r; $s; $h):
   if (.denials | length) > 0
   then .ledger.absorbed_for_tool_use += 1 | addPending($s.uuid; "interrupt_for_tool_use")
+       # 这一轮是被拒绝停下的：关轮时 status 记 denied（不算打断，打断只数 turn.end(interrupted)，K5）
+       | (if .pturn != null and .pturn.id == turnOf($s).id then .pturn.denied = true else . end)
   else .ledger.unpaired_for_tool_use += 1 | interrupted($r; $s; $h; "unpaired interrupt_for_tool_use: " + $s.text) end;
 
 def handle($r; $s; $h):
@@ -269,6 +313,61 @@ def emitAfter($s):
          {"vibetrail.after": $p.after, "vibetrail.after_kind": $p.kind} + (if $s.slash then {"vibetrail.slash_command": true} else {} end)))
   | (if $s.human then .pending = null else . end);
 
+# ---------- 轮次元数据：开轮 / 关轮 / 累计（DESIGN §3.1、§4.1） ----------
+def openTurn($s):
+  .pturn = {id: $s.promptId, line: $s.ln, last_ts: $s.ts, usage: {}, model: null,
+            interrupted: false, denied: false, git_commit: false, closed: false}
+  | (if $s.ln > $from_line then .ledger.turns.started += 1 else . end)
+  | hookTurn($s.promptId) as $h | vcsMerge(.branch; $h.start.vcs) as $vcs
+  | emit( base($s; "turn.start"; $s.uuid; $s.ts; {id: $s.promptId, inferred: false})
+          | .provenance = {kind: "transcript", rule_version: "turn-v1", source_event_id: $s.uuid}
+          | .payload = opt("vcs"; $vcs)
+          | ._key = ($s.promptId + "|turn.start") );
+
+def closeTurn($how; $s; $eof):
+  if .pturn == null or .pturn.closed or .pturn.interrupted then .
+  else
+    .pturn as $pt | hookTurn($pt.id) as $h | hookStop($h) as $stop | hookEnd($h) as $end
+    | ($eof or .ln > $from_line) as $new
+    | (if $pt.denied then {code: "denied", category: "denial", detail: "turn stopped by a permission denial"}
+       elif $stop != null then {code: "completed", category: "success"}
+       elif $h.fail != null then {code: (($h.fail.error // "error") | codeify), category: "error"}
+       else {code: "unknown", category: "unknown"} end) as $status
+    | usageOf($pt.usage) as $usage | vcsMerge(.branch; $end.vcs) as $vcs | commitsOf($end) as $commits
+    | (base($s; "turn.end"; null; ($stop.at // $pt.last_ts); {id: $pt.id, inferred: false})
+       | .provenance = ({kind: "transcript", rule_version: "turn-v1"} + (if $stop != null then {source_event: "Stop"} else {} end))
+       | .payload = ({status: $status} + opt("model"; $pt.model) + opt("usage"; $usage) + opt("vcs"; $vcs))
+       | (if $commits != null
+          then .commits = $commits
+               | .extensions += {"vibetrail.commit_method": ($end.commit_method // "rev-list"),
+                                 "vibetrail.commit_attribution": (if $pt.git_commit then "agent_tool" else "inferred" end)}
+          else . end)
+       | .extensions += ({"vibetrail.closed_by": $how, "vibetrail.stops": ($stop.stops // 0)} + opt("vibetrail.dirty_files"; $end.vcs.dirty_files))
+       | ._key = ($pt.id + "|turn.end")) as $e
+    | (if $eof then emitAlways($e) else emit($e) end)
+    | (if $new then .ledger.turns.ended[$status.code] += 1 else . end)
+    | .pturn.closed = true
+  end;
+
+def turnBoundary($r; $s):   # 主会话里 promptId 换了：上一轮关、这一轮开
+  if $turns and mainRec($r) and $r.type == "user" and ($r.promptId | type) == "string" and $r.promptId != (.pturn.id // null)
+  then closeTurn("next_turn"; $s; false) | openTurn($s)
+  else . end;
+
+# agent 自己用 Bash 跑了 git commit：本轮观察到的 commit 归因标 agent_tool，否则 inferred（人可能在别的终端提交，DESIGN §3.5）
+def gitCommitCmd: type == "string" and test("(^|[;&|(\\s])git(\\s+-[Cc]\\s+\\S+|\\s+--no-pager)*\\s+commit(\\s|$)");
+def turnAccumulate($r; $s):
+  if .pturn == null or (mainRec($r) | not) then .
+  else .pturn.last_ts = ($s.ts // .pturn.last_ts)
+    | (if $s.type == "assistant" and $s.usage != null and ($s.synthetic | not)
+       then ($s.mid // $s.rid // $s.uuid) as $uk
+            | (if ((.pturn.usage[$uk].output_tokens // -1) > ($s.usage.output_tokens // 0)) then . else .pturn.usage[$uk] = $s.usage end)
+            | .pturn.model = ($s.model // .pturn.model)
+       else . end)
+    | (if any($s.tools[]; .name == "Bash" and ((.input | if type == "object" then .command else null end) | gitCommitCmd))
+       then .pturn.git_commit = true else . end)
+  end;
+
 def step($r):
   .out = [] | .ln += 1 | .ln as $ln
   | if ($r | type) != "object" then .ledger.skipped_non_object += 1
@@ -283,6 +382,7 @@ def step($r):
       | .last_ts = ($r.timestamp // .last_ts) | .version = ($r.version // .version)
       | .entrypoint = ($r.entrypoint // .entrypoint) | .branch = ($r.gitBranch // .branch)
       | (if ($r.promptId | type) == "string" and $r.promptId != .turn then .turn = $r.promptId | .denials = [] else . end)
+      | turnBoundary($r; $s)
       | index($s)
       | (if $s.human then .turn_usage = {} | .turn_model = null | .turn_line = $s.ln else . end)
       # 同一 message.id 留 output_tokens 最大的那份（照 ccusage：早期流式记录可能是占位值，取最大与读取顺序无关）
@@ -290,6 +390,7 @@ def step($r):
          then ($s.mid // $s.rid // $s.uuid) as $uk
               | (if ((.turn_usage[$uk].output_tokens // -1) > ($s.usage.output_tokens // 0)) then . else .turn_usage[$uk] = $s.usage end)
               | .turn_model = ($s.model // .turn_model) else . end)
+      | turnAccumulate($r; $s)
       | (if $ln > $from_line and $keyrec then .ledger.sources += [[$s.uuid, $ln]] else . end)
       | (if ($r.toolUseResult | type) == "string" and ($r.toolUseResult | startswith("User rejected tool use"))
          then .ledger.sentinel.marker += 1
@@ -300,12 +401,22 @@ def step($r):
     end
     end;
 
-# 下次的起读行：本轮开头；还有没等到人话的分歧时，退到那个分歧所在轮的开头
-def checkpoint: turnStart as $ts | if .pending != null then ([.pending.since, $ts] | min) else $ts end;
+# 下次的起读行：本轮开头；还有没等到人话的分歧时，退到那个分歧所在轮的开头；还没关的 promptId 轮从它开头读（关轮时用量才完整）
+def checkpoint: turnStart as $ts
+  | (if .pending != null then ([.pending.since, $ts] | min) else $ts end) as $c
+  | if .pturn != null then ([$c, .pturn.line] | min) else $c end;
+
+# 文件末尾：$close_last 非空（会话结束 / 恢复 / 空闲）就把最后一轮也关掉
+def atEof:
+  .out = []
+  | if $close_last != "" and .pturn != null then closeTurn($close_last; {agent: null, uuid: null, ts: null}; true) else . end;
 
 foreach (inputs, {"__vibetrail_eof__": true}) as $r (init;
-  if $r == {"__vibetrail_eof__": true} then . else step($r) end;
+  if $r == {"__vibetrail_eof__": true} then atEof else step($r) end;
   if $r == {"__vibetrail_eof__": true}
-  then {"_ledger": (.ledger + {start_line: $start_line, from_line: $from_line, lines: .ln, checkpoint_line: checkpoint,
-                               sources: (.ledger.sources | unique)})}
+  then (.out[]),
+       {"_ledger": (.ledger + {start_line: $start_line, from_line: $from_line, lines: .ln, checkpoint_line: checkpoint,
+                               sources: (.ledger.sources | unique),
+                               turns: (.ledger.turns + {open: (.pturn.id // null), open_line: (.pturn.line // null),
+                                                        closed: (.pturn.closed // false), model: (.pturn.model // .turn_model)})})}
   else .out[] end)

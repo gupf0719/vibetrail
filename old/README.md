@@ -5,7 +5,7 @@
 | 文件 | 是什么 | 状态 |
 |---|---|---|
 | `vibetrail` / `vibetrail-sync` | 查询端、会话流水投影进仓 | 退役（DESIGN D4） |
-| `vibetrail-install` / `vibetrail-doctor` / `prepare-commit-msg` / `test-hook.sh` | 每个 clone 接入、`Claude-Session` trailer、自检 | 退役（D4）；doctor 要按 DESIGN §5 重写 |
+| `vibetrail-install` / `vibetrail-doctor` / `prepare-commit-msg` / `test-hook.sh` | 每个 clone 接入、`Claude-Session` trailer、自检 | 退役（D4）；doctor 已按 DESIGN §5 重写成 `tools/vibetrail doctor`（09-15） |
 | `vibetrail-audit` / `test-audit.sh` / `test-faults.sh` / `fixtures/` | 审计记录线与它的闸门、故障注入 | 仍在用，去向未定（OPEN-ISSUES U6） |
 
 测试照旧可跑：`bash old/test-hook.sh`、`bash old/test-audit.sh`、`bash old/test-faults.sh`。

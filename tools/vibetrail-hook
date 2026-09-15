@@ -1,19 +1,27 @@
 #!/bin/bash
 # vibetrail-hook <事件>：Claude Code hook 的分发入口（DESIGN §3.1）。stdin 是 Claude Code 给 hook 的 JSON。
 #
-#   SessionStart       补做：本仓所有 worktree 下落后的 transcript 各补一次（后台跑，hook 立即返回）
-#   Stop / SubagentStop  等 transcript 写稳 → 从本轮开头解析本会话主文件与 subagents/ 下全部文件 → 写 spool（配 async: true）
-#   SessionEnd         同上但不等写稳（预算 1.5 s；来不及的交给下一次 SessionStart）
-#   UserPromptSubmit   不读 transcript（U11）；turn.start 由轮次元数据一路发（TODO 下一项）
+#   SessionStart        发 session.start（source、capabilities、git 状态）→ 补做：本仓所有 worktree 下落后的 transcript 各补一次，
+#                       同会话 resume、别的会话空闲超过 turn_idle_close（默认 1 小时）时把最后一轮也关掉
+#   UserPromptSubmit    发 turn.start（turn_id = prompt_id、model、HEAD / 分支 / 脏否），记轮起快照；上一轮没等到 Stop 的补一份「止」快照。
+#                       不读 transcript（U11）
+#   Stop                记轮止快照与本轮 commit（轮起 HEAD..现在 + reflog，DESIGN §3.5）→ 等 transcript 写稳 → 从本轮开头解析主文件与
+#                       subagents/ 下全部文件：分歧事件 + 已经确定结束的轮的 turn.end（配 async: true）
+#   SubagentStart/Stop  发 subagent.start / subagent.end（实例 = agent_id，父实例与派生调用取 meta.json）；Stop 时再扫一遍子 agent 文件
+#   SessionEnd          发 session.end（reason）→ 解析并关掉最后一轮
+#   PostToolUseFailure / PermissionDenied / StopFailure / Notification / InstructionsLoaded / CwdChanged
+#                       只记事件头，发 ext.claude.<事件名>（不带正文，D5）；StopFailure 另记进本轮，关轮时 status 取 error
 #
+# SessionStart / UserPromptSubmit / SessionEnd 是同步 hook：读完 stdin 就把活丢到脱离的后台进程里，自己立刻退出——
+# 不让人等，也不受 SessionEnd 1.5 s 的预算限制（后台进程在 -p 与 desktop 关会话时活不活没实测，丢了由下一次 SessionStart 补做兜底）。
 # 纪律（§3.4）：stdout 永远为空、永远 exit 0、失败日志只留元数据；scope=project 时未登记的仓什么都不写（A4）。
 # 环境变量（测试用）：VIBETRAIL_HOME（本机数据根）、VIBETRAIL_CLAUDE_PROJECTS（~/.claude/projects）、
-#   VIBETRAIL_STABLE_WAIT=0（不等写稳）、VIBETRAIL_FOREGROUND=1（补做不丢后台）
+#   VIBETRAIL_STABLE_WAIT=0（不等写稳）、VIBETRAIL_FOREGROUND=1（不丢后台，全部同步做完）
 set -uo pipefail
 SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$SELF/vibetrail-lib.sh"
 exec 1>/dev/null            # stdout 必须为空：SessionStart / UserPromptSubmit 的 stdout 会进模型上下文
-CLAUDE_PROJECTS=${VIBETRAIL_CLAUDE_PROJECTS:-$HOME/.claude/projects}
+CLAUDE_PROJECTS=$(vt_claude_projects)
 
 event=${1:-}
 [ -t 0 ] && exit 0          # 人手在终端里跑、没有 payload
@@ -22,72 +30,169 @@ JQ=$(vt_conf jq jq); export JQ
 command -v "$JQ" >/dev/null 2>&1 || { vt_log_error "$event" "" "missing_jq" 127; exit 0; }
 
 # 用 \x1f 分隔：tab 是 IFS 空白字符，连续的 tab 会被合并，某个字段为空时后面的字段整体错位
-IFS=$'\x1f' read -r sid tpath cwd hname < <(printf '%s' "$payload" | "$JQ" -r \
-    '[(.session_id // ""), (.transcript_path // ""), (.cwd // ""), (.hook_event_name // "")] | map(tostring) | join("")' 2>/dev/null) || exit 0
+IFS=$'\x1f' read -r sid tpath cwd hname prompt_id agent_id source < <(printf '%s' "$payload" | "$JQ" -r \
+    '[(.session_id // ""), (.transcript_path // ""), (.cwd // ""), (.hook_event_name // ""), (.prompt_id // ""),
+      (.agent_id // ""), (.source // "")] | map(tostring) | join("\u001f")' 2>/dev/null) || exit 0
 [ -n "$event" ] || event=$hname
 case "$sid" in ''|*/*|.*) exit 0;; esac   # 会话 id 要能当目录名
 
+now_iso(){ "$JQ" -n -r 'now | (floor | todate | sub("Z$"; "")) + "." + ((. * 1000 | floor) % 1000 | tostring | ("00" + .)[-3:]) + "Z"'; }
+
 # ---- 门控（scope，DESIGN §5；G8）----
-scope=$(vt_conf scope project)
-main=$(vt_main_checkout "${cwd:-.}") || main=""
-if [ "$scope" = "project" ]; then
-    [ -n "$main" ] && vt_registered "$main" || exit 0
-fi
-workspace=${main:-$(vt_realpath "${cwd:-.}")}
-project=$(git -C "$workspace" remote get-url origin 2>/dev/null | sed -E 's#^[a-z+]+://([^@/]*@)?##; s#^[^@/]*@##; s#:#/#; s#\.git$##')
-project=${project:-$workspace}
-pkey=$(vt_project_key "$workspace")
+gate(){
+    scope=$(vt_conf scope project)
+    main=$(vt_main_checkout "${cwd:-.}") || main=""
+    if [ "$scope" = "project" ]; then
+        [ -n "$main" ] && vt_registered "$main" || return 1
+    fi
+    workspace=${main:-$(vt_realpath "${cwd:-.}")}
+    project=$(git -C "$workspace" remote get-url origin 2>/dev/null | sed -E 's#^[a-z+]+://([^@/]*@)?##; s#^[^@/]*@##; s#:#/#; s#\.git$##')
+    project=${project:-$workspace}
+    pkey=$(vt_project_key "$workspace")
+    SD="$VT_HOME/state/$sid"
+    AGENT_VERSION=$(vt_agent_version "$tpath")
+    SURFACE=${CLAUDE_CODE_ENTRYPOINT:-}
+    return 0
+}
+
+# ---- hook 直接给得出的事件：构造（hook-events.jq）→ 填 event_id → 写一块 spool ----
+emit_hook(){ # emit_hook <事件名> <vcs JSON 或 null> <extra JSON>
+    local tmp name
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/vibetrail-hook.XXXXXX") || return 0
+    printf '%s' "$payload" | "$JQ" -c --arg event "$1" --arg project_id "$project" --arg workspace_id "$workspace" \
+        --arg vt_version "$VT_RUNTIME_VERSION" --arg agent_version "$AGENT_VERSION" --arg surface "$SURFACE" --arg now "$(now_iso)" \
+        --argjson vcs "${2:-null}" --argjson extra "${3:-{\}}" -f "$SELF/hook-events.jq" > "$tmp/ev" 2> "$tmp/err" \
+        || { vt_log_error "$event" "$sid" "hook-events" 1; rm -rf "$tmp"; return 0; }
+    if [ -s "$tmp/ev" ]; then
+        vt_fill_ids "$sid" < "$tmp/ev" > "$tmp/ev2" 2> "$tmp/err" || { vt_log_error "$event" "$sid" "event_id" 1; rm -rf "$tmp"; return 0; }
+        name="hook-$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+        vt_spool_write "$pkey" "$sid" "$name" "$tmp/ev2" || vt_log_error "$event" "$sid" "spool:$name" 1
+    fi
+    rm -rf "$tmp"
+}
+
+extra_model(){ # 会话已知的 model（SessionStart 给的，之后每次解析 transcript 更新）
+    [ -f "$SD/session.json" ] && "$JQ" -c '{model: (.model // null)}' "$SD/session.json" 2>/dev/null || echo '{}'
+}
+
+extra_subagent(){ # 子 agent 的父实例与派生调用：meta.json 的 toolUseId；被子 agent 派出的，父实例是 toolUseId 所在的那个兄弟文件
+    local dir meta tid hit parent=main
+    dir="$(dirname "$tpath")/$sid/subagents"; meta="$dir/agent-$agent_id.meta.json"
+    tid=$([ -f "$meta" ] && "$JQ" -r '.toolUseId // empty' "$meta" 2>/dev/null)
+    if [ -n "$tid" ]; then
+        hit=$(grep -lF "\"id\":\"$tid\"" "$dir"/agent-*.jsonl 2>/dev/null | grep -vF "agent-$agent_id.jsonl" | head -1)
+        [ -n "$hit" ] && parent=$(basename "$hit" .jsonl) && parent=${parent#agent-}
+    fi
+    "$JQ" -n -c --arg p "$parent" --arg t "$tid" '{parent_instance: $p} + (if $t != "" then {parent_call_id: $t} else {} end)'
+}
+
+# ---- 轮次证据（state/<sid>/turns/，映射层关轮时读，DESIGN §3.5）----
+close_gap(){ # close_gap <turn_id> <快照 JSON> <由谁补>：这一轮没有有效的 Stop，就拿此刻的快照当它的「止」
+    local p=$1 snap=$2 by=$3 sf gf start_head since commits
+    sf=$(vt_turn_file "$sid" "$p" start); gf=$(vt_turn_file "$sid" "$p" gap)
+    [ -f "$sf" ] && [ ! -f "$gf" ] || return 0
+    if [ -f "$(vt_turn_file "$sid" "$p" stop)" ] && "$JQ" -e -n --slurpfile a "$sf" --slurpfile b "$(vt_turn_file "$sid" "$p" stop)" \
+        '($b[0].at_epoch // 0) >= ($a[0].at_epoch // 0)' >/dev/null 2>&1; then return 0; fi
+    start_head=$("$JQ" -r '.vcs.head_sha // empty' "$sf" 2>/dev/null); since=$("$JQ" -r '.at_epoch // empty' "$sf" 2>/dev/null)
+    commits=$(vt_commits "$cwd" "$start_head" "$since")
+    "$JQ" -n -c --arg t "$p" --arg at "$(now_iso)" --arg by "$by" --argjson vcs "${snap:-null}" --argjson c "${commits:-null}" \
+        '{turn_id: $t, at: $at, at_epoch: (now | floor), by: $by, vcs: $vcs}
+         + (if $c != null then {commits: $c.commits, commit_method: $c.method} else {} end)' | vt_write_json "$gf"
+}
+
+turn_start(){ # UserPromptSubmit
+    local snap prev sf
+    snap=$(vt_git_snapshot "$cwd")
+    if [ -n "$prompt_id" ]; then
+        mkdir -p "$SD/turns"
+        prev=$(cat "$SD/last_turn" 2>/dev/null)
+        [ -n "$prev" ] && [ "$prev" != "$prompt_id" ] && close_gap "$prev" "$snap" UserPromptSubmit
+        # 同一 prompt_id 再来一次（轮中插话等）不覆盖：轮起 HEAD 取第一次，本轮 commit 才从真正的开头算
+        sf=$(vt_turn_file "$sid" "$prompt_id" start)
+        [ -f "$sf" ] || "$JQ" -n -c --arg t "$prompt_id" --arg at "$(now_iso)" --argjson vcs "$snap" \
+            '{turn_id: $t, at: $at, at_epoch: (now | floor), vcs: $vcs}' | vt_write_json "$sf"
+        printf '%s\n' "$prompt_id" > "$SD/last_turn"
+    fi
+    emit_hook UserPromptSubmit "$snap" "$(extra_model)"
+}
+
+turn_stop(){ # Stop：每次 Stop 覆盖一份（被别的 Stop hook 拦停后同一轮会再来一次 Stop），stops 计次数
+    local f sf n=0 snap start_head="" since="" commits active
+    [ -n "$prompt_id" ] || return 0
+    snap=$(vt_git_snapshot "$cwd")
+    f=$(vt_turn_file "$sid" "$prompt_id" stop); sf=$(vt_turn_file "$sid" "$prompt_id" start)
+    [ -f "$f" ] && n=$("$JQ" -r '.stops // 0' "$f" 2>/dev/null)
+    if [ -f "$sf" ]; then start_head=$("$JQ" -r '.vcs.head_sha // empty' "$sf" 2>/dev/null); since=$("$JQ" -r '.at_epoch // empty' "$sf" 2>/dev/null); fi
+    commits=$(vt_commits "$cwd" "$start_head" "$since")
+    active=$(printf '%s' "$payload" | "$JQ" -r '.stop_hook_active // false' 2>/dev/null)
+    "$JQ" -n -c --arg t "$prompt_id" --arg at "$(now_iso)" --argjson n "$((${n:-0} + 1))" --argjson active "${active:-false}" \
+        --argjson vcs "${snap:-null}" --argjson c "${commits:-null}" \
+        '{turn_id: $t, at: $at, at_epoch: (now | floor), stops: $n, stop_hook_active: $active, vcs: $vcs}
+         + (if $c != null then {commits: $c.commits, commit_method: $c.method} else {} end)' | vt_write_json "$f"
+}
+
+turn_fail(){ # StopFailure：API 错误结束了这一轮
+    [ -n "$prompt_id" ] || return 0
+    printf '%s' "$payload" | "$JQ" -c --arg at "$(now_iso)" '{turn_id: .prompt_id, at: $at, at_epoch: (now | floor), error: (.error // "unknown" | tostring)}' \
+        | vt_write_json "$(vt_turn_file "$sid" "$prompt_id" fail)"
+}
 
 # ---- 一份 transcript 文件：从 checkpoint 起映射 → 去重 → 写一块 spool → 推进 state ----
-process_file(){ # process_file <sid> <state 目录> <文件> <名>
-    local sid=$1 sd=$2 f=$3 name=$4 st="$2/$4.json" seen="$2/$4.seen"
-    local size lines=0 consumed=0 ckl=1 ckb=0 fp_old="" rewrites=0 ino tmp rc fp
+process_file(){ # process_file <sid> <state 目录> <文件> <名> [close_last]
+    local sid=$1 sd=$2 f=$3 name=$4 close=${5:-} st="$2/$4.json" seen="$2/$4.seen"
+    local size lines=0 consumed=0 ckl=1 ckb=0 fp_old="" rewrites=0 ino tmp rc fp open closed
+    local extra_args=()
     size=$(wc -c < "$f" 2>/dev/null | tr -d ' ') || return 0
     ino=$(stat -f %i "$f" 2>/dev/null || stat -c %i "$f" 2>/dev/null)
     if [ -f "$st" ]; then
-        IFS=$'\x1f' read -r lines consumed ckl ckb fp_old rewrites < <("$JQ" -r \
-            '[.lines, .consumed_bytes, .checkpoint_line, .checkpoint_byte, (.fprint // ""), (.rewrites // 0)] | map(tostring) | join("")' "$st" 2>/dev/null)
+        IFS=$'\x1f' read -r lines consumed ckl ckb fp_old rewrites open closed < <("$JQ" -r \
+            '[.lines, .consumed_bytes, .checkpoint_line, .checkpoint_byte, (.fprint // ""), (.rewrites // 0), (.turn_open // ""), (.turn_closed // false)]
+             | map(tostring) | join("\u001f")' "$st" 2>/dev/null)
         lines=${lines:-0}; consumed=${consumed:-0}; ckl=${ckl:-1}; ckb=${ckb:-0}; rewrites=${rewrites:-0}
     fi
     # offset 信任检查（照 agentsview，09-15）：换了 inode、变短、开头或 checkpoint 前 4 KB 的哈希变了，都算被重写过——从 0 重读，
     # ids 留着，重读出的同一批事件在写 spool 前按 event_id 拦下。没有新字节时只比 inode（一次 stat），不算哈希：
-    # 一个会话几十个子 agent 文件，每个都算两段哈希会让每次 Stop 多一两秒；大小完全不变的原地改写只能靠 inode 发现
-    if [ "$size" -eq "$consumed" ] && { [ -z "$fp_old" ] || [ "${fp_old%%:*}" = "$ino" ]; }; then return 0; fi
+    # 一个会话几十个子 agent 文件，每个都算两段哈希会让每次 Stop 多一两秒；大小完全不变的原地改写只能靠 inode 发现。
+    # 没有新字节、但要关最后一轮（会话结束 / 恢复 / 空闲）而上次还没关过的，照样往下走一次
+    if [ "$size" -eq "$consumed" ] && { [ -z "$fp_old" ] || [ "${fp_old%%:*}" = "$ino" ]; }; then
+        if [ -z "$close" ] || [ -z "${open:-}" ] || [ "${closed:-false}" = "true" ]; then return 0; fi
+    fi
     if [ "$consumed" -gt 0 ] && { [ "$size" -lt "$consumed" ] || { [ -n "$fp_old" ] && [ "$(vt_fprint "$f" "$consumed")" != "$fp_old" ]; }; }; then
         rm -f "$st" "$seen"; lines=0; consumed=0; ckl=1; ckb=0; rewrites=$((rewrites + 1))
     fi
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/vibetrail-hook.XXXXXX") || return 0
+    if [ "$name" = "main" ]; then      # 主会话文件才切轮：带上 hook 记的轮次证据
+        vt_hook_turns "$sid" > "$tmp/turns"
+        extra_args=(--hook-turns "$tmp/turns")
+        [ -n "$close" ] && extra_args+=(--close-last "$close")
+    fi
+    # bash 3.2 + set -u：空数组展开会报 unbound，写成 ${a[@]+"${a[@]}"}
     bash "$SELF/vibetrail-map" "$f" --sid "$sid" --project-id "$project" --workspace-id "$workspace" \
         --start-line "$ckl" --start-byte "$ckb" --from-line "$lines" --seen-uuids "$seen" \
-        --ledger "$tmp/ledger" --sources-out "$tmp/src" > "$tmp/ev" 2> "$tmp/err"
+        --ledger "$tmp/ledger" --sources-out "$tmp/src" ${extra_args[@]+"${extra_args[@]}"} > "$tmp/ev" 2> "$tmp/err"
     rc=$?
     if [ $rc -ne 0 ]; then vt_log_error "$event" "$sid" "map:$name" "$rc"; rm -rf "$tmp"; return 0; fi
     # 已写进 spool 的 event_id 不再写（进程在写 spool 与推进 state 之间被杀时，下一次会重发同一批）
-    # ⚠️ 不用 `NR == FNR` 读 ids：首次运行 ids 是空文件，NR == FNR 会对后一个文件也成立，事件全被当成 id 吞掉
-    touch "$sd/ids"
-    awk -v idsf="$sd/ids" 'BEGIN { while ((getline l < idsf) > 0) seen[l] = 1 }
-         { if (match($0, /"event_id":"[0-9a-f-]+"/)) { id = substr($0, RSTART + 12, RLENGTH - 13); if (id in seen) next; seen[id] = 1 }
-           print }' "$tmp/ev" > "$tmp/new"
-    if [ -s "$tmp/new" ]; then
-        local dest="$VT_HOME/spool/$pkey/$sid" chunk
-        mkdir -p "$dest" && chunk="$(date -u +%Y%m%dT%H%M%SZ)-$$-$name.jsonl"
-        cp "$tmp/new" "$dest/.$chunk.tmp" && mv "$dest/.$chunk.tmp" "$dest/$chunk" \
-            || { vt_log_error "$event" "$sid" "spool:$name" 1; rm -rf "$tmp"; return 0; }
-        sed -n 's/.*"event_id":"\([0-9a-f-]*\)".*/\1/p' "$tmp/new" >> "$sd/ids"
-    fi
+    vt_spool_write "$pkey" "$sid" "$name" "$tmp/ev" || { vt_log_error "$event" "$sid" "spool:$name" 1; rm -rf "$tmp"; return 0; }
     [ -f "$tmp/src" ] && cat "$tmp/src" >> "$seen"
     fp=$(vt_fprint "$f" "$("$JQ" -r '.consumed_bytes' "$tmp/ledger")") || fp=""
     "$JQ" -c --arg fp "$fp" --argjson rw "$rewrites" \
-        '{lines, consumed_bytes, file_bytes, checkpoint_line, checkpoint_byte, parent_instance, fprint: $fp, rewrites: $rw, updated_at: (now | todate)}' \
+        '{lines, consumed_bytes, file_bytes, checkpoint_line, checkpoint_byte, parent_instance, fprint: $fp, rewrites: $rw,
+          turn_open: (.turns.open // null), turn_closed: (.turns.closed // false), updated_at: (now | todate)}' \
         "$tmp/ledger" > "$st.tmp" && mv "$st.tmp" "$st"
+    if [ "$name" = "main" ]; then      # 会话最近的 model，给下一轮的 turn.start 用
+        local model; model=$("$JQ" -r '.turns.model // empty' "$tmp/ledger" 2>/dev/null)
+        [ -n "$model" ] && { [ -f "$sd/session.json" ] && cat "$sd/session.json" || echo '{}'; } \
+            | "$JQ" -c --arg m "$model" '.model = $m' | vt_write_json "$sd/session.json"
+    fi
     rm -rf "$tmp"
 }
 
-process_session(){ # process_session <sid> <主 transcript>
-    local sid=$1 main_t=$2 sd="$VT_HOME/state/$1" f
+process_session(){ # process_session <sid> <主 transcript> [close_last]
+    local sid=$1 main_t=$2 close=${3:-} sd="$VT_HOME/state/$1" f
     mkdir -p "$sd" || return 0
     vt_lock "$sd" || return 0                                      # 同一会话已在跑：跳过，下一次 hook 补上
-    [ -f "$main_t" ] && process_file "$sid" "$sd" "$main_t" main
+    [ -f "$main_t" ] && process_file "$sid" "$sd" "$main_t" main "$close"
     for f in "$(dirname "$main_t")/$sid/subagents"/agent-*.jsonl; do
         [ -f "$f" ] && process_file "$sid" "$sd" "$f" "$(basename "$f" .jsonl)"
     done
@@ -105,23 +210,75 @@ wait_stable(){ # 照 Pilot：文件大小连续两次不变才读，最多 1.5 s
 }
 
 catch_up(){ # 本仓每个 worktree 对应的 Claude 项目目录里，落后的 transcript 各补一次
-    local wt dir t
-    git -C "$workspace" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | while IFS= read -r wt; do
+    local wt dir t s close idle now mt
+    idle=$(vt_conf turn_idle_close 3600); now=$(date +%s)
+    while IFS= read -r wt; do
         dir="$CLAUDE_PROJECTS/$(vt_slug "$wt")"
         [ -d "$dir" ] || continue
-        for t in "$dir"/*.jsonl; do [ -f "$t" ] && process_session "$(basename "$t" .jsonl)" "$t"; done
-    done
-    [ -n "$main" ] || { [ -f "$tpath" ] && process_session "$sid" "$tpath"; }   # scope=user 且不在 git 仓：只补本会话
+        for t in "$dir"/*.jsonl; do
+            [ -f "$t" ] || continue
+            s=$(basename "$t" .jsonl); close=""
+            if [ "$s" = "$sid" ]; then
+                [ "$source" = "resume" ] && close=resume     # 同一会话恢复：旧进程已经没了，它的最后一轮结束了
+            else
+                mt=$(stat -f %m "$t" 2>/dev/null || stat -c %Y "$t" 2>/dev/null || echo "$now")
+                [ $((now - mt)) -ge "$idle" ] && close=idle   # 别的会话空闲够久：最后一轮按已有证据关掉
+            fi
+            process_session "$s" "$t" "$close"
+        done
+    done < <(git -C "$workspace" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
+    [ -n "$main" ] || { [ -f "$tpath" ] && process_session "$sid" "$tpath" "$([ "$source" = resume ] && echo resume)"; }   # scope=user 且不在 git 仓
+    find "$VT_HOME/state" -path '*/turns/*.json' -mtime +14 -delete 2>/dev/null   # 轮次证据留两周够关轮用
+}
+
+run(){ # 门控通过之后按事件干活
+    case "$event" in
+        SessionStart|session-start)
+            local snap; snap=$(vt_git_snapshot "$cwd")
+            mkdir -p "$SD"
+            { [ -f "$SD/session.json" ] && cat "$SD/session.json" || echo '{}'; } \
+                | "$JQ" -c --argjson p "$payload" '. + {source: ($p.source // null)} + (if ($p.model // "") != "" then {model: $p.model} else {} end)' \
+                | vt_write_json "$SD/session.json"
+            emit_hook SessionStart "$snap" "$(extra_model)"
+            catch_up ;;
+        UserPromptSubmit|user-prompt-submit)
+            turn_start ;;
+        Stop|stop)
+            turn_stop
+            [ -f "$tpath" ] && { wait_stable "$tpath"; process_session "$sid" "$tpath"; } ;;
+        SubagentStart|subagent-start)
+            [ -n "$agent_id" ] && emit_hook SubagentStart null "$(extra_subagent)" ;;
+        SubagentStop|subagent-stop)
+            [ -n "$agent_id" ] && emit_hook SubagentStop null "$(extra_subagent)"
+            [ -f "$tpath" ] && process_session "$sid" "$tpath" ;;
+        SessionEnd|session-end)
+            local snap prev; snap=$(vt_git_snapshot "$cwd")
+            emit_hook SessionEnd "$snap" '{}'
+            prev=$(cat "$SD/last_turn" 2>/dev/null)
+            [ -n "$prev" ] && close_gap "$prev" "$snap" SessionEnd
+            [ -f "$tpath" ] && process_session "$sid" "$tpath" session_end ;;
+        StopFailure)
+            turn_fail; emit_hook StopFailure null '{}' ;;
+        InstructionsLoaded)
+            local fp sha="" bytes=""
+            fp=$(printf '%s' "$payload" | "$JQ" -r '.file_path // empty' 2>/dev/null)
+            if [ -n "$fp" ] && [ -f "$fp" ]; then
+                sha=$( (command -v sha256sum >/dev/null 2>&1 && sha256sum "$fp" || shasum -a 256 "$fp") 2>/dev/null | cut -c1-64)
+                bytes=$(wc -c < "$fp" | tr -d ' ')
+            fi
+            emit_hook InstructionsLoaded null "$("$JQ" -n -c --arg s "$sha" --arg b "$bytes" \
+                '(if $s != "" then {sha256: $s} else {} end) + (if $b != "" then {bytes: ($b | tonumber)} else {} end)')" ;;
+        PostToolUseFailure|PermissionDenied|Notification|CwdChanged)
+            emit_hook "$event" null '{}' ;;
+        *) ;;
+    esac
 }
 
 case "$event" in
-    SessionStart|session-start)
-        if [ "${VIBETRAIL_FOREGROUND:-0}" = "1" ]; then catch_up
-        else ( catch_up ) </dev/null >/dev/null 2>&1 & disown; fi ;;
-    Stop|stop|SubagentStop|subagent-stop)
-        [ -f "$tpath" ] && { wait_stable "$tpath"; process_session "$sid" "$tpath"; } ;;
-    SessionEnd|session-end)
-        [ -f "$tpath" ] && process_session "$sid" "$tpath" ;;
-    *) ;;
+    SessionStart|session-start|UserPromptSubmit|user-prompt-submit|SessionEnd|session-end)
+        # 同步 hook：丢到脱离的后台进程里做，自己立刻退出
+        if [ "${VIBETRAIL_FOREGROUND:-0}" = "1" ]; then gate && run
+        else ( gate && run ) </dev/null >/dev/null 2>&1 & disown; fi ;;
+    *) gate && run ;;
 esac
 exit 0

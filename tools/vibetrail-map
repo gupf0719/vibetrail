@@ -1,5 +1,6 @@
 #!/bin/bash
-# vibetrail-map：把一份 transcript 映射成 paas-coding-hook 协议 1.0 事件（分歧一路），逐行输出到 stdout。
+# vibetrail-map：把一份 transcript 映射成 paas-coding-hook 协议 1.0 事件，逐行输出到 stdout。
+# 人机分歧与轮次元数据是同一条事件流（同一个 spool、同一批 push）；transcript 里得出的两类都在这里出，hook 当场给的在 hook-events.jq。
 #
 # 用法：vibetrail-map <transcript.jsonl> [--sid ID] [--start-line S] [--from-line N] [--project-id X] [--workspace-id Y]
 #                     [--meta meta.json] [--parent-instance ID] [--ledger FILE] [--vt-version V]
@@ -13,19 +14,25 @@
 #   --seen-uuids FILE  前几次记下的触发记录与人话记录，每行「uuid<TAB>行号」；同一 uuid 出现在别的行就是回放副本，跳过不上报。
 #                      文件不存在当空
 #   --sources-out FILE 把本次新读到的触发记录与人话记录按同样格式追加进去（下一次的 --seen-uuids 用它）
+#   --hook-turns FILE  hook 记的轮次证据（vt_hook_turns 的输出：{<turn_id>: {start, stop, gap, fail}}），关轮时拼 status / vcs / commits；
+#                      不给就当 {}（轮次事件照发，只是没有 HEAD、commit，status 多是 unknown）
+#   --no-turns         只出分歧事件，不切轮（默认切轮：主会话按 promptId 切，turn.start 补位、轮确定结束后发 turn.end）；
+#                      分歧判据的回归 test-map.sh 用它，golden 只钉分歧那部分
+#   --close-last WHY   把文件里最后一轮也关掉（WHY = session_end / resume / idle，记进 vibetrail.closed_by）；默认不关，等下一轮开始再关
 #   --ledger FILE  账本写到文件（默认写 stderr）：进出条数、反查方式、下次的 start / from 行、消费到的字节数
 #
 # 只读 transcript，不复制、不在它旁边写东西；产物只有 stdout 与账本。只解析到源文件最后一个换行符（源可能正在写半行）。
 # event_id = UUIDv5(vibetrail 命名空间, "<sid>|<记录 uuid>|<事件类型>|<限定符>")，同一输入重跑得到同一个 id（幂等重发靠它）。
 set -uo pipefail
 SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-: "${JQ:=jq}"
+: "${JQ:=jq}"; export JQ
+. "$SELF/vibetrail-lib.sh"
 
 die(){ echo "✗ vibetrail-map: $*" >&2; exit 2; }
 isnum(){ case "$1" in ''|*[!0-9]*) return 1;; esac; }
 
-f=""; sid=""; start_line=1; start_byte=""; from_line=0; project_id=""; workspace_id=""; meta=""; parent=""; ledger=""; vt_version="0.2.0-dev"
-seen_file=""; sources_out=""
+f=""; sid=""; start_line=1; start_byte=""; from_line=0; project_id=""; workspace_id=""; meta=""; parent=""; ledger=""; vt_version="$VT_RUNTIME_VERSION"
+seen_file=""; sources_out=""; hook_turns=""; close_last=""; turns=true
 while [ $# -gt 0 ]; do
     case "$1" in
         --sid) sid=$2; shift 2;;
@@ -39,8 +46,11 @@ while [ $# -gt 0 ]; do
         --ledger) ledger=$2; shift 2;;
         --seen-uuids) seen_file=$2; shift 2;;
         --sources-out) sources_out=$2; shift 2;;
+        --hook-turns) hook_turns=$2; shift 2;;
+        --close-last) close_last=$2; shift 2;;
+        --no-turns) turns=false; shift;;
         --vt-version) vt_version=$2; shift 2;;
-        -h|--help) sed -n '2,21p' "$0"; exit 0;;
+        -h|--help) sed -n '2,27p' "$0"; exit 0;;
         -*) die "未知参数 $1";;
         *) [ -n "$f" ] && die "只接受一个 transcript"; f=$1; shift;;
     esac
@@ -49,6 +59,7 @@ done
 [ -f "$f" ] || die "文件不存在: $f"
 isnum "$from_line" || die "--from-line 要是非负整数"
 isnum "$start_line" && [ "$start_line" -ge 1 ] || die "--start-line 要是正整数"
+case "$close_last" in ''|session_end|resume|idle) ;; *) die "--close-last 只认 session_end / resume / idle";; esac
 [ -z "$start_byte" ] || isnum "$start_byte" || die "--start-byte 要是非负整数"
 
 # ---- sid / meta：从路径推 ----
@@ -96,18 +107,24 @@ fi
 [ "$start_byte" -le "$consumed" ] || die "起读偏移 $start_byte 超过文件可读长度 $consumed（文件被重写过？从 0 重读）"
 
 tmp=$(mktemp "${TMPDIR:-/tmp}/vibetrail-map.XXXXXX") || die "mktemp 失败"
-trap 'rm -rf "$tmp" "$tmp.err" "$tmp.ids" "$tmp.ids.json" "$tmp.seen" "$tmp.keys" "$tmp.k"' EXIT
+trap 'rm -rf "$tmp" "$tmp.err" "$tmp.seen" "$tmp.turns"' EXIT
 if [ -n "$seen_file" ] && [ -f "$seen_file" ]; then
     $JQ -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | [.[0], (.[1] | tonumber)])' "$seen_file" > "$tmp.seen" \
         || die "读不了 $seen_file（每行应是 uuid<TAB>行号）"
 else
     echo '[]' > "$tmp.seen"
 fi
+if [ -n "$hook_turns" ] && [ -s "$hook_turns" ]; then
+    $JQ -c 'if type == "object" then . else {} end' "$hook_turns" > "$tmp.turns" 2>/dev/null || die "读不了 $hook_turns（要是 JSON 对象）"
+else
+    echo '{}' > "$tmp.turns"
+fi
 
 # ---- 映射：从 start_byte 读到最后一个换行（按偏移跳读、走管道，不落临时副本） ----
 tail -c +$((start_byte + 1)) "$f" | head -c $((consumed - start_byte)) | $JQ -n -c -L "$SELF" \
     --arg sid "$sid" --arg project_id "$project_id" --arg workspace_id "$workspace_id" --arg parent_instance "$parent" \
     --argjson start_line "$start_line" --argjson from_line "$from_line" --argjson meta "$meta_json" --slurpfile seen_uuids "$tmp.seen" \
+    --slurpfile hook_turns "$tmp.turns" --arg close_last "$close_last" --argjson turns "$turns" \
     --arg vt_version "$vt_version" --arg rule_version "diverge-v1" \
     -f "$SELF/map-events.jq" > "$tmp" 2>"$tmp.err"
 rc=$?
@@ -115,34 +132,9 @@ if [ $rc -ne 0 ] || [ -s "$tmp.err" ]; then
     die "jq 失败（rc=$rc）: $(head -c 300 "$tmp.err")"
 fi
 
-# ---- event_id：UUIDv5 ----
-# 命名空间 = uuid5(NS_URL, "vibetrail")，固定值；名字 = "<sid>|<_key>"。
+# ---- event_id：UUIDv5(uuid5(NS_URL, "vibetrail"), "<sid>|<_key>")，实现在 vibetrail-lib.sh 的 vt_fill_ids（hook 直接发的事件共用） ----
 # 每个名字写成一个小文件，一次 shasum / sha1sum 算完——macOS 的 shasum 是 perl，逐条起进程 151 条要 2.7 s。
-NS=6c90e594-0cb4-59d0-9186-740d215c8b7f
-if command -v sha1sum >/dev/null 2>&1; then SHA1=(sha1sum)
-elif command -v shasum >/dev/null 2>&1; then SHA1=(shasum -a 1)
-else die "缺 shasum / sha1sum"; fi
-NSB=$(printf '%s' "$NS" | tr -d '-' | sed 's/../\\x&/g')
-mkdir "$tmp.k" || die "mktemp 失败"
-$JQ -r 'select(._key != null) | ._key' "$tmp" > "$tmp.keys"
-i=0
-while IFS= read -r key; do
-    i=$((i + 1)); { printf "$NSB"; printf '%s' "$sid|$key"; } > "$tmp.k/$i"
-done < "$tmp.keys"
-: > "$tmp.ids"
-if [ "$i" -gt 0 ]; then
-    # 按编号顺序出哈希，与 keys 行一一对应
-    ( cd "$tmp.k" && seq 1 "$i" | xargs "${SHA1[@]}" ) | cut -c1-40 \
-      | awk '{ h = $0; printf "%s-%s-5%s-%x%s-%s\n", substr(h,1,8), substr(h,9,4), substr(h,14,3),
-               (index("0123456789abcdef", substr(h,17,1)) - 1) % 4 + 8, substr(h,18,3), substr(h,21,12) }' \
-      | paste "$tmp.keys" - > "$tmp.ids"
-fi
-dups=$(cut -f1 "$tmp.ids" | sort | uniq -d | head -3)
-[ -n "$dups" ] && die "事件 _key 重复（同一记录派生了两条同型事件）: $dups"
-$JQ -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: .[1]}) | from_entries' "$tmp.ids" > "$tmp.ids.json"
-
-$JQ -c --slurpfile ids "$tmp.ids.json" \
-    'select(._ledger == null) | .event_id = $ids[0][._key] | del(._key)' "$tmp"
+vt_fill_ids "$sid" < "$tmp" || die "算 event_id 失败（事件 _key 重复：同一记录派生了两条同型事件？）"
 
 # ---- 账本 ----
 # 下次的起读字节：checkpoint 行的偏移，只在本次读过的那段里数（不扫整个文件）

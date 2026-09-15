@@ -81,3 +81,126 @@ vt_fprint(){ # vt_fprint <文件> <已消费字节> → "inode:开头 4 KB 的 s
     tail=$(tail -c +$((s + 1)) "$f" | head -c $((n - s)) | vt_sha_stdin)
     printf '%s:%s:%s' "$ino" "$head" "$tail"
 }
+
+# ======== 以下 09-15 起为轮次元数据一路与安装加的（DESIGN §3.1、§3.5、§5） ========
+# 目录补充：
+#   state/<sid>/turns/<turn_id>.{start,stop,gap,fail}.json  hook 侧记的轮次证据：UserPromptSubmit 记轮起快照（start）、每次 Stop 覆盖一份
+#                              轮止快照与本轮 commit（stop）、没有 Stop 的轮在下一轮开始或会话结束时补一份（gap）、StopFailure（fail）；
+#                              映射层关轮时读它们（map-events.jq 的 $hook_turns），拼出 turn.end 的 status / vcs / commits
+#   state/<sid>/last_turn      hook 最近开的一轮的 turn_id；state/<sid>/session.json  会话级：model、source
+VT_RUNTIME_VERSION=0.2.0-dev   # vibetrail 自己的版本，进每条事件的 extensions.vibetrail.version
+VT_NS=6c90e594-0cb4-59d0-9186-740d215c8b7f     # uuid5(NS_URL, "vibetrail")，DESIGN §4.2
+
+vt_sha1_files(){ # 一次算完多份文件的 sha1（macOS 的 shasum 是 perl，逐个起进程慢）
+    if command -v sha1sum >/dev/null 2>&1; then sha1sum "$@"; else shasum -a 1 "$@"; fi
+}
+
+vt_fill_ids(){ # vt_fill_ids <sid> < 带 _key 的事件 → 填上 event_id = UUIDv5(NS, "<sid>|<_key>")、删掉 _key
+    # 同一 _key 出现两次是映射层的错（同一记录派生了两条同型事件），报错退出
+    local sid=$1 tmp i key nsb
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/vibetrail-ids.XXXXXX") || return 1
+    cat > "$tmp/in"
+    "${JQ:-jq}" -r 'select(._key != null) | ._key' "$tmp/in" > "$tmp/keys" || { rm -rf "$tmp"; return 1; }
+    nsb=$(printf '%s' "$VT_NS" | tr -d '-' | sed 's/../\\x&/g')
+    mkdir "$tmp/k"; i=0
+    while IFS= read -r key; do i=$((i + 1)); { printf "$nsb"; printf '%s' "$sid|$key"; } > "$tmp/k/$i"; done < "$tmp/keys"
+    : > "$tmp/ids"
+    if [ "$i" -gt 0 ]; then
+        ( cd "$tmp/k" && seq 1 "$i" | xargs "$(command -v sha1sum >/dev/null 2>&1 && echo sha1sum || echo shasum)" ) | cut -c1-40 \
+          | awk '{ h = $0; printf "%s-%s-5%s-%x%s-%s\n", substr(h,1,8), substr(h,9,4), substr(h,14,3),
+                   (index("0123456789abcdef", substr(h,17,1)) - 1) % 4 + 8, substr(h,18,3), substr(h,21,12) }' \
+          | paste "$tmp/keys" - > "$tmp/ids"
+    fi
+    if [ -n "$(cut -f1 "$tmp/ids" | sort | uniq -d | head -1)" ]; then
+        echo "✗ 事件 _key 重复: $(cut -f1 "$tmp/ids" | sort | uniq -d | head -3 | tr '\n' ' ')" >&2; rm -rf "$tmp"; return 1
+    fi
+    "${JQ:-jq}" -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: .[1]}) | from_entries' "$tmp/ids" > "$tmp/ids.json"
+    "${JQ:-jq}" -c --slurpfile ids "$tmp/ids.json" 'select(._ledger == null) | .event_id = $ids[0][._key] | del(._key)' "$tmp/in"
+    local rc=$?; rm -rf "$tmp"; return $rc
+}
+
+vt_spool_write(){ # vt_spool_write <项目键> <sid> <块名> <事件文件>：去掉已写过的 event_id，余下的写成一块（临时文件 + rename），登记 ids
+    # ids 在 state/<sid>/ids；同步 hook 不拿会话锁（不能让人等），与 Stop 并发时最坏多写一条同 event_id 的事件，云端按 event_id 幂等
+    local pkey=$1 sid=$2 name=$3 f=$4 sd="$VT_HOME/state/$2" dest chunk
+    mkdir -p "$sd" || return 1
+    touch "$sd/ids"
+    # ⚠️ 不用 `NR == FNR` 读 ids：首次运行 ids 是空文件，NR == FNR 会对后一个文件也成立，事件全被当成 id 吞掉
+    awk -v idsf="$sd/ids" 'BEGIN { while ((getline l < idsf) > 0) seen[l] = 1 }
+         { if (match($0, /"event_id":"[0-9a-f-]+"/)) { id = substr($0, RSTART + 12, RLENGTH - 13); if (id in seen) next; seen[id] = 1 }
+           print }' "$f" > "$f.new"
+    if [ -s "$f.new" ]; then
+        dest="$VT_HOME/spool/$pkey/$sid"
+        mkdir -p "$dest" && chunk="$(date -u +%Y%m%dT%H%M%SZ)-$$-$name.jsonl"
+        cp "$f.new" "$dest/.$chunk.tmp" && mv "$dest/.$chunk.tmp" "$dest/$chunk" || { rm -f "$f.new"; return 1; }
+        sed -n 's/.*"event_id":"\([0-9a-f-]*\)".*/\1/p' "$f.new" >> "$sd/ids"
+    fi
+    rm -f "$f.new"
+    return 0
+}
+
+vt_timeout(){ # vt_timeout <秒> <命令…>：到点杀掉（macOS 没有 timeout 命令）；超时返回非零
+    local s=$1 pid w rc; shift
+    "$@" & pid=$!
+    ( sleep "$s"; kill -TERM "$pid" ) >/dev/null 2>&1 </dev/null & w=$!
+    wait "$pid"; rc=$?
+    kill "$w" >/dev/null 2>&1; wait "$w" 2>/dev/null
+    return $rc
+}
+
+vt_git_snapshot(){ # vt_git_snapshot <目录> → 一行 JSON：{head_sha, branch, dirty, dirty_files, worktree, at_epoch}；不在 git 仓里输出 null
+    # 全程 GIT_OPTIONAL_LOCKS=0：git status 会顺手刷新并写回 .git/index，被观测仓零写入（A8）不许；status 限时 3 s，超时就不报脏否
+    local d=$1 top head branch n
+    top=$(GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse --show-toplevel 2>/dev/null) || { echo null; return 0; }
+    head=$(GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse -q --verify HEAD 2>/dev/null)
+    branch=$(GIT_OPTIONAL_LOCKS=0 git -C "$d" symbolic-ref -q --short HEAD 2>/dev/null)
+    n=$( { vt_timeout 3 env GIT_OPTIONAL_LOCKS=0 git -C "$d" status --porcelain=v1 -z --untracked-files=normal 2>/dev/null \
+           || echo "__vt_timeout__"; } | tr '\0' '\n' | grep -v '^$' | awk '/__vt_timeout__/ { t = 1 } END { if (t) print ""; else print NR }')
+    "${JQ:-jq}" -n -c --arg top "$top" --arg head "$head" --arg branch "$branch" --arg n "$n" --argjson at "$(date +%s)" \
+        '{worktree: $top, at_epoch: $at}
+         + (if $head != "" then {head_sha: $head} else {} end)
+         + (if $branch != "" then {branch: $branch} else {} end)
+         + (if $n != "" then {dirty: (($n | tonumber) > 0), dirty_files: ($n | tonumber)} else {} end)'
+}
+
+vt_commits(){ # vt_commits <目录> <轮起 HEAD> <轮起时间 epoch> → 一行 JSON：{commits: [完整 sha…], method}（DESIGN §3.5）
+    # 本轮的 commit = 现在的 HEAD 与本轮 reflog 里「新建提交」那几类操作留下的 sha，减去轮起 HEAD 能到的。
+    # 起是止的祖先时就是 rev-list 起..止；rebase / reset / 切分支后又提交时，reflog 那一路把新提交补回来，切到已有分支不会被算进来。
+    # 人在别的终端提交也会被算进当轮——区分靠映射层看 transcript 里有没有 agent 的 git commit 调用（commit_attribution）
+    local d=$1 start=$2 since=$3 end tips list method=rev-list
+    [ -n "$start" ] || { echo null; return 0; }
+    end=$(GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse -q --verify HEAD 2>/dev/null) || { echo null; return 0; }
+    tips=$(GIT_OPTIONAL_LOCKS=0 git -C "$d" reflog --date=unix --format='%gd%x09%H%x09%gs' HEAD 2>/dev/null | awk -F'\t' -v since="${since:-0}" '
+        { t = $1; sub(/^.*@\{/, "", t); sub(/\}$/, "", t); if (t + 0 < since + 0) exit
+          if ($3 ~ /^(commit|cherry-pick|revert|merge|rebase|pull|am)/) print $2 }' | sort -u)
+    if [ -n "$tips" ] && [ -n "$(printf '%s\n' "$tips" | grep -vxF "$end")" ]; then method=reflog; fi
+    # shellcheck disable=SC2086
+    list=$(GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-list --reverse -n 256 "$end" $tips "^$start" 2>/dev/null) || { echo null; return 0; }
+    printf '%s\n' "$list" | "${JQ:-jq}" -R -s -c --arg m "$method" '{commits: (split("\n") | map(select(test("^[0-9a-f]{40,64}$")))), method: $m}'
+}
+
+vt_turn_file(){ # vt_turn_file <sid> <turn_id> <start|stop|gap|fail> → 路径（turn_id 里不能当文件名的字符换成 _）
+    local t; t=$(printf '%s' "$2" | tr -c 'A-Za-z0-9._-' '_'); t=${t#.}
+    printf '%s/state/%s/turns/%s.%s.json' "$VT_HOME" "$1" "$t" "$3"
+}
+
+vt_write_json(){ # vt_write_json <路径> < JSON：临时文件 + rename
+    mkdir -p "$(dirname "$1")" && cat > "$1.$$.tmp" && mv "$1.$$.tmp" "$1"
+}
+
+vt_hook_turns(){ # vt_hook_turns <sid> → 一行 JSON：{<turn_id>: {start, stop, gap, fail}}，映射层关轮时用
+    local dir="$VT_HOME/state/$1/turns"
+    if ls "$dir"/*.json >/dev/null 2>&1; then
+        "${JQ:-jq}" -n -c 'reduce (inputs | {f: (input_filename | sub("^.*/"; "") | sub("\\.json$"; "")), v: .}) as $x ({};
+            ($x.f | capture("^(?<id>.*)\\.(?<k>start|stop|gap|fail)$")) as $m | .[$m.id][$m.k] = $x.v)' "$dir"/*.json 2>/dev/null || echo '{}'
+    else echo '{}'; fi
+}
+
+vt_agent_version(){ # vt_agent_version <transcript> → Claude Code 版本：先看 hook 环境的 AI_AGENT（claude-code_2-1-266_agent），再看 transcript 末尾
+    local v
+    v=$(printf '%s' "${AI_AGENT:-}" | sed -n 's/^claude-code_\([0-9][0-9]*\)-\([0-9][0-9]*\)-\([0-9][0-9]*\).*/\1.\2.\3/p')
+    if [ -z "$v" ] && [ -f "${1:-}" ]; then v=$(tail -c 65536 "$1" 2>/dev/null | grep -o '"version":"[^"]*"' | tail -1 | cut -d'"' -f4); fi
+    printf '%s' "$v"
+}
+
+vt_settings_path(){ printf '%s' "${VIBETRAIL_CLAUDE_SETTINGS:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json}"; }
+vt_claude_projects(){ printf '%s' "${VIBETRAIL_CLAUDE_PROJECTS:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects}"; }

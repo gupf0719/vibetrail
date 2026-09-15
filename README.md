@@ -29,11 +29,37 @@ vibetrail init（每台机器一次）
 
 被观测仓里不写 settings、不装 git hook、不放运行时、不进 git。现阶段云端还没有，spool 里的文件就是将来 push 的内容。
 
+## 演示：安装 → 采集 → 看本地文件
+
+先在沙箱里看一遍（临时目录，不碰真实的 `~/.claude` 与 `~/.vibetrail`；回放一段示例会话，第 1 轮中途真的提交一次）：
+
+```bash
+bash experiments/collect-demo/demo.sh
+```
+
+在自己机器上装（在要采的仓里跑，顺手登记这个仓；默认 scope=project，只采登记过的仓）：
+
+```bash
+bash tools/vibetrail init
+```
+
+之后在这个仓里正常用 Claude Code（CLI 或 desktop 都行，settings 热加载，已开着的会话从下一次 hook 起生效）。看采了什么：
+
+```bash
+~/.vibetrail/bin/vibetrail show
+```
+
+- `vibetrail list` 列出 spool 里的每个块文件，文件在 `~/.vibetrail/spool/<项目>/<会话>/*.jsonl`，每行一条协议事件，直接 `cat` 就能看。
+- `vibetrail doctor` 自检；`vibetrail uninstall` 卸载（只去掉 settings 里自己的条目，spool 留着，`--purge` 才全删）。
+- 什么时候出现什么：说一句话就有 `turn.start`（带 HEAD）；这一轮结束（Stop）后分歧事件落盘；`turn.end`（状态、用量、本轮 commit）
+  要等这一轮**确定**结束才写——下一轮开始、会话结束、或空闲超过 1 小时后的补做。别的 Stop hook 拦停时同一轮会接着干活，当场写会丢掉后半段。
+
 ## 状态
 
-2026-09-14 需求与设计定稿、09-15 定不传 transcript 原文件并选定云端协议（DESIGN D5）；同日做完第 1 步：分歧命中映射成协议 1.0 事件
-（`tools/vibetrail-map`，回归 `tools/test-map.sh`），并对照 Pilot / teamai 补强、定下「只在 Stop 与补做时读、从本轮开头读」；hook 分发、安装、push 未开工。
-G7 之前的代码与测试已归档到 `old/`。已有并沿用的是人机分歧判据（755 会话实测精确率 100%，裸 grep 只有 10.5%）。
+2026-09-14 需求与设计定稿、09-15 定不传 transcript 原文件并选定云端协议（DESIGN D5）；同日做完：分歧映射成协议 1.0 事件（`tools/vibetrail-map`）、
+hook 分发入口（`tools/vibetrail-hook`：会话 / 轮次 / 子 agent 起止、`ext.claude.*` 事件头、git 状态、commit ↔ 轮次推导）、
+机器级安装与本地查看（`tools/vibetrail`：init / uninstall / projects / doctor / list / show）。人机分歧与轮次元数据是同一条事件流。
+push 与五个补充回归场景按用户 09-15 的要求往后放。G7 之前的代码与测试已归档到 `old/`。已有并沿用的是人机分歧判据（755 会话实测精确率 100%，裸 grep 只有 10.5%）。
 上一版设计（留痕投影进被观测仓、git hook 写 trailer）已退役，理由与替代见 [DESIGN.md §7](DESIGN.md)。
 
 已实测确立的地基（`experiments/` 可复现）：Claude Code 的 hook 在 **desktop app 下正常触发且热加载**，stdin 直接给出 `transcript_path`；

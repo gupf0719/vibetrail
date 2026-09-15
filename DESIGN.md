@@ -2,7 +2,10 @@
 
 > **状态**（2026-09-15）：需求与设计定稿；第 1 步「提取器扩展与协议映射」已做（`tools/map-events.jq` + `tools/vibetrail-map`，细则 §4.2），
 > 同日对照 Pilot / teamai 补强并定下 U11（只在 Stop / SessionEnd / 补做里解析、从本轮开头读，§3.1、§3.3）；随后分歧一路挂上 hook
-> （`tools/vibetrail-hook`：门控、会话锁、state、spool 块文件，§3.3）。session / turn 事件、安装、push 未开工。
+> （`tools/vibetrail-hook`：门控、会话锁、state、spool 块文件，§3.3）。同日接着做完 hook 分发入口的其余事件（会话 / 轮次 / 子 agent 起止、
+> `ext.claude.*` 事件头、git 状态、commit ↔ 轮次推导，§3.1、§3.5、§4.1）与机器级安装、本地查看（`tools/vibetrail`，§5），沙箱演示
+> `experiments/collect-demo/demo.sh`。人机分歧与轮次元数据是同一条事件流（用户 09-15：「以后推的接口是一个，可以不用特意分的特别开」）。
+> push 与补充回归场景按用户 09-15 的要求往后放（「push，回归这些都先不急着做」），见 TODO。
 > 沿用的判据见 [spec/diverge-v1.md](spec/diverge-v1.md)。G7 之前的代码与测试 09-15 归档到 `old/`，`tools/` 只留新代码。
 > 上一版设计（留痕数据投影进被观测仓、git hook 写 `Claude-Session` trailer）已于 2026-09-14 退役，见 §7 D4；仍在用的审计记录线见 §8。
 > 2026-09-15 D5：不传 transcript 原文件，正文只随人机分歧事件走，云端定为 paas-coding-hook 事件协议 1.0，索引保留 30 天够用。
@@ -105,14 +108,14 @@ Pilot 的拦截器路线（[对比 §6.3](third-party/teamai-cli-vs-vibetrail.md
 
 | 事件 | 动作 | 同步 / 异步 |
 |---|---|---|
-| `SessionStart` | 门控（按 scope，§5）→ 发 `session.start`（`source`、capabilities）、记 git 状态 → **补做**：本仓（按 `git worktree list` 归属）所有 offset 落后于文件大小的 transcript，各补一次解析（分歧 + 轮次元数据），然后 **push 全机待发、不看门槛**（只看退避期，§4）。startup / resume / clear / compact 都触发，频率不低，是最靠得住的兜底：agent 崩溃、被杀、`-p` 模式下 Stop / SessionEnd 都不来，全靠这一步 | 门控与记录同步；补做与 push 丢后台 |
-| `UserPromptSubmit` | 只发 `turn.start`（`prompt_id` 作 turn_id、model、git 状态），**不读 transcript**（U11，09-15 定）：这里解析的结果本来也不 push、云端看到的时间不变，同步 hook 却要让人等；Pilot、teamai 也都不在这里读 | 30 s 上限；stdout 会进模型上下文，**必须为空** |
-| `Stop` | 等 transcript 写稳（照 Pilot，最多 1.5 s，异步所以不卡人）→ 从本轮开头解析（§3.3）+ 发 `turn.end`（status、usage、git 状态、`rev-list` 出的 commits）→ 落 spool，再**看门槛决定推不推**（D6，09-15 定，规则在 §4）：全机最早待发事件超过 1 小时、或全机待发满 100 条，任一满足且不在退避期就推，推的是全机所有待发、不只本会话；都不满足就只落盘，本轮不发；端点未配置时只记账不发。同一会话一把 mkdir 锁（照 Pilot），已在跑就跳过，下一次 hook 补上；push 另持一把机器级锁（§4） | `async: true`：不阻塞、不计 timeout |
-| `SubagentStart` / `SubagentStop` | 发 `subagent.start` / `subagent.end`（`agent_id` 作实例 id、`agent_type`、父实例 `main`、派生它的 `parent_call_id`）；Stop 时再扫一遍 `subagents/` 目录——后台子 agent 在父 Stop 之后才结束 | 异步 |
-| `PostToolUseFailure` / `PermissionDenied` / `StopFailure` / `Notification`（`permission_prompt`） | 只记事件头，发 `ext.claude.<事件名>`：`tool_use_id`、`error` / `reason` / `notification_type`、时间。类型化信号，见 §3.2 | 同步，毫秒级 |
-| `InstructionsLoaded` | 记 `file_path`、`load_reason`、正文 sha；正文不传（D5，有必要再补） | 官方说明它本身异步跑 |
-| `CwdChanged` | 记 `old_cwd` / `new_cwd`（G11 接手检测的同一挂载点） | 同步 |
-| `SessionEnd` | 发 `session.end`（`reason`、status）+ 从本轮开头解析最后一轮（最大一轮约 0.2 s，放得进预算）→ 起一个脱离当前进程的后台 push（照 SessionStart 补做的写法），**不看门槛**、只看退避期，自己不等结果。预算 1.5 s（`CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` 可抬）只够落 spool 与 fork，一次网络请求不一定来得及；后台进程在 `-p` 下活不活、desktop 里长开几天的会话什么时候触发 SessionEnd，都没实测。所以它只是弱兜底，来不及的交给下一次 SessionStart 补做 | 同步；push 丢后台 |
+| `SessionStart` | 门控（按 scope，§5）→ 发 `session.start`（`source`、capabilities；model、git 状态进 extensions）→ **补做**：本仓（按 `git worktree list` 归属）所有 offset 落后于文件大小的 transcript，各补一次解析（分歧 + 轮次元数据）；同一会话 `resume`、别的会话空闲超过 `turn_idle_close`（默认 3600 s）时把它的最后一轮也关掉（D7）；然后 **push 全机待发、不看门槛**（只看退避期，§4；push 未做）。startup / resume / clear / compact 都触发，频率不低，是最靠得住的兜底：agent 崩溃、被杀、`-p` 模式下 Stop / SessionEnd 都不来，全靠这一步 | 同步 hook，但读完 stdin 就把门控、记录、补做全丢进脱离的后台进程，自己约 0.02 s 退出（09-15 实现时定：不让人等） |
+| `UserPromptSubmit` | 发 `turn.start`（`prompt_id` 作 turn_id、会话已知的 model、HEAD / 分支 / 脏否，提示来源 `source` 进 extensions），记轮起快照（§3.3 `turns/`）；上一轮没等到 Stop 的（打断、拒绝、崩溃），用此刻的快照给它补一份「止」（gap）。**不读 transcript**（U11，09-15 定）：这里解析的结果本来也不 push、云端看到的时间不变，同步 hook 却要让人等；Pilot、teamai 也都不在这里读 | 同上：丢后台、立刻退出；stdout 会进模型上下文，**必须为空** |
+| `Stop` | 记轮止快照与本轮 commit（§3.5；被别的 Stop hook 拦停后同一轮会再来一次 Stop，每次覆盖、`stops` 计次）→ 等 transcript 写稳（照 Pilot，最多 1.5 s，异步所以不卡人）→ 从本轮开头解析（§3.3）：分歧事件 + **已经确定结束的轮**的 `turn.end`（本轮自己的 turn.end 等下一轮开始或会话结束再发，D7）→ 落 spool，再**看门槛决定推不推**（D6，09-15 定，规则在 §4；push 未做）：全机最早待发事件超过 1 小时、或全机待发满 100 条，任一满足且不在退避期就推，推的是全机所有待发、不只本会话；都不满足就只落盘，本轮不发；端点未配置时只记账不发。同一会话一把 mkdir 锁（照 Pilot），已在跑就跳过，下一次 hook 补上；push 另持一把机器级锁（§4） | `async: true`：不阻塞、不计 timeout |
+| `SubagentStart` / `SubagentStop` | 发 `subagent.start` / `subagent.end`（`agent_id` 作实例 id、`agent_type`、父实例：一级是 `main`，被子 agent 派出的是 meta.json 的 `toolUseId` 所在的兄弟文件；`parent_call_id` 取 meta.json 的 `toolUseId`，09-15 实跑 SubagentStart 时 meta.json 已经在）；Stop 时再扫一遍 `subagents/` 目录——后台子 agent 在父 Stop 之后才结束 | 异步 |
+| `PostToolUseFailure` / `PermissionDenied` / `StopFailure` / `Notification`（`permission_prompt`） | 只记事件头，发 `ext.claude.<事件名的 snake_case>`：`tool_use_id`、`tool_name`、`is_interrupt`、`reason`（≤ 1 KB）/ `error`（StopFailure 的错误类型）/ `notification_type`、时间。PostToolUseFailure 的 `error` 原文是工具输出，只记字节数（D5）。StopFailure 另记进本轮，关轮时 status 取 error。类型化信号，见 §3.2 | 异步（09-15 实现时改：只记事件头，不必让工具调用等） |
+| `InstructionsLoaded` | 记 `file_path`、`memory_type`、`load_reason`、正文 sha256 与字节数；正文不传（D5，有必要再补） | 异步 |
+| `CwdChanged` | 记 `old_cwd` / `new_cwd`（G11 接手检测的同一挂载点） | 异步 |
+| `SessionEnd` | 发 `session.end`（`reason`、status），给最后一轮补「止」快照（没等到 Stop 的话）→ 解析并关掉最后一轮（`closed_by` = `session_end`）→ 起一个脱离当前进程的后台 push（push 未做），**不看门槛**、只看退避期，自己不等结果。预算 1.5 s（`CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` 可抬）只够落 spool 与 fork，一次网络请求不一定来得及；后台进程在 `-p` 下活不活、desktop 里长开几天的会话什么时候触发 SessionEnd，都没实测。所以它只是弱兜底，来不及的交给下一次 SessionStart 补做 | 同步 hook，全部丢后台、立刻退出（不受 1.5 s 预算限制） |
 
 不挂 `PreToolUse` / `PostToolUse`：每次工具调用多跑一个进程，而它们给的 `tool_input` / `tool_response` transcript 里全有，且 D5 后除被拒调用的输入外都不传。
 hook payload 里的 `tool_input` / `tool_response` 也不另存一份——transcript 全有。Pilot 的输出里每份内容出现 3 次（`tool.call`、`llm.response`、
@@ -139,7 +142,12 @@ hook payload 里的 `tool_input` / `tool_response` 也不另存一份——trans
   `<名>.json`：读到的行号与字节（`lines` / `consumed_bytes`）、下次起读的 `checkpoint_line` / `checkpoint_byte`（本轮开头）；
   各一份 `<名>.seen`：触发记录与人话记录的 `uuid<TAB>行号`（认回放副本用，§4.2；行号按文件算，所以按文件分开存）；
   会话级一份 `ids`：已写进 spool 的 event_id。每次只解析到源文件**最后一个换行符**为止（源可能正在写半行）。不复制文件，按字节偏移跳读。
-  实现 `tools/vibetrail-hook`（共用函数 `tools/vibetrail-lib.sh`），回归 `tools/test-hook-flow.sh`（scenario 回放，21 项）。
+  实现 `tools/vibetrail-hook`（共用函数 `tools/vibetrail-lib.sh`），回归 `tools/test-hook-flow.sh`（scenario 回放，25 项）。
+- **轮次证据**（09-15）：`state/<sid>/turns/<turn_id>.{start,stop,gap,fail}.json`。UserPromptSubmit 记轮起快照（同一 prompt_id 再来一次不覆盖，
+  轮起 HEAD 取第一次）；每次 Stop 覆盖一份轮止快照与本轮 commit（`stops` 计次、`stop_hook_active` 照记）；没等到 Stop 的轮，在下一轮开始或会话结束时
+  用那一刻的快照补一份 gap；StopFailure 记 fail。映射层关轮时读它们（`vibetrail-map --hook-turns`）。一种证据一个文件：同步 hook 不拿会话锁，
+  分文件写就不会互相覆盖。Stop 快照早于轮起快照的不算这一轮的 Stop（斜杠命令 `/model` 之后也会来一次 Stop，而之后那句人话沿用同一个 promptId）。
+  `last_turn` 记 hook 最近开的一轮，`session.json` 记 model 与 source；两周前的轮次证据在补做时清掉。
 - **从本轮开头读，不从文件头读**（U11，09-15 定）。映射要回看的东西都在同一轮里，所以只重读本轮：106 MB 的会话一次从 10.5 s
   降到 0.19 s；676 轮里九成不超过 0.4 MB。借的是 Pilot「只读新字节」的思路，但它不保留上下文、全靠 Stop 恰好切在轮边界，
   我们退到本轮开头，边界落在轮中间也不丢上下文。首次整读仍是 O(文件)，106 MB 约 12 s，只发生一次、在后台。
@@ -181,6 +189,13 @@ UserPromptSubmit 记轮起 HEAD，Stop 记轮止 HEAD，并记 `git rev-list <�
 有没有对应的 Bash 调用区分，标 `inferred`。失去的只有一样：`git log` 里不用工具就能看到会话 id。这条推导替代了上一版的
 `Claude-Session` trailer（§7 D4）；它记的仍是「哪个会话执行了提交」，「每一行出自哪个会话」是 G11 的事。落到协议里是 `turn.start` / `turn.end` 的
 `vcs` 快照与 `turn.end.commits[]`（完整 sha、`relation=observed`、evidence `before_after`；Bash stdout 里的旁证走 `tool_result`）。
+
+实现（09-15，`tools/vibetrail-lib.sh`）：`vt_git_snapshot` 取 HEAD（完整 sha）、分支、脏否与改动文件数，全程 `GIT_OPTIONAL_LOCKS=0`——`git status`
+会顺手刷新并写回 `.git/index`，被观测仓零写入（A8）不许；status 限时 3 s，超时就不报脏否。`vt_commits` 算本轮 commit =
+`rev-list <现在的 HEAD> <本轮 reflog 里 commit / merge / cherry-pick / revert / rebase / am 留下的 sha…> ^<轮起 HEAD>`（≤ 256 条）：起是止的祖先时就是
+`rev-list 起..止`；rebase / reset / 切分支后又提交时，reflog 那一路把新提交补回来，切到已有分支不会被算进来。extensions 记
+`vibetrail.commit_method`（`rev-list` / `reflog`）与 `vibetrail.commit_attribution`：本轮 transcript 里 agent 自己用 Bash 跑过 `git commit` 是
+`agent_tool`，否则 `inferred`（人可能在别的终端提交）。轮起快照缺失（这一轮开始时还没装 hook）就不报 commits。Bash stdout 里的短 sha 旁证还没做。
 
 ### 3.6 流程
 
@@ -225,9 +240,9 @@ flowchart LR
 | `classifier_blocked` | 同上，decided_by `policy` | 同上 |
 | `permission_infra_fail` | 同上，decision `error`，decided_by `system` | 同上 |
 | 子 agent 文件里的打断 | `subagent.end`，status `cancelled` | 父会话那条是 `turn.end`，两个事实，不去重（K1 关闭）；统计打断只数 `turn.end` |
-| 轮次 | `turn.start`（model、vcs）/ `turn.end`（status、usage、vcs、commits[]） | UserPromptSubmit / Stop 各一条；Stop 不来（打断、崩溃）时 `turn.end` 由 transcript 或 SessionStart 补做给出，status `interrupted` / `unknown` |
-| 会话、子 agent | `session.start`（source、capabilities）/ `session.end`（reason、status）/ `subagent.start`（agent_type、父实例、`parent_call_id`）/ `subagent.end` | hook payload 直接给 |
-| hook 事件头 | `ext.claude.<事件名>`，provenance `hook` + `source_event` | `InstructionsLoaded` 只带路径与 sha |
+| 轮次 | `turn.start`（model、vcs）/ `turn.end`（status、usage、vcs、commits[]） | `turn.start`：UserPromptSubmit 当场发（provenance `hook`）；hook 没跑的轮由映射层按 promptId 补位（同一 event_id，先写的留下）。`turn.end`：映射层按 promptId 切轮，**这一轮确定结束了才发**（D7）——下一轮开始、会话结束（`closed_by` = `session_end`）、同会话恢复（`resume`）、空闲超过 `turn_idle_close`（`idle`）。status：本轮开始之后有过 Stop 是 `completed` / `success`；拒绝后停下是 `denied` / `denial`（for-tool-use 打断被拒绝吸收，不算打断，K5）；打断的由分歧一路发 `interrupted`，这里不重复；只有 StopFailure 是 `<错误类型>` / `error`；什么证据都没有是 `unknown` / `unknown`。usage 与打断同一定义（§4.2）；vcs、commits 取 hook 快照（Stop 优先，其次 gap）；打断的 turn.end 也补上这两样 |
+| 会话、子 agent | `session.start`（source、capabilities）/ `session.end`（reason、status）/ `subagent.start`（agent_type、父实例、`parent_call_id`）/ `subagent.end` | hook payload 直接给。capabilities 暂填我们会发的事件类型清单、session.end 的 status 填 `completed` / `success`、reason 按 code 规范化——都是自定义取值，接 collector 前确认（U13） |
+| hook 事件头 | `ext.claude.<事件名的 snake_case>`（如 `ext.claude.post_tool_use_failure`），provenance `hook` + `source_event` | `InstructionsLoaded` 只带路径、sha256 与字节数；PostToolUseFailure 的错误原文是工具输出，只带字节数 |
 
 Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-batch-1.0.schema.json)）：枚举类字段全是小写 `code` 型；`permission.decision` 必填
 `permission_id` / `tool_name` / `decision` / `decided_by`；`provenance.kind=transcript` 必带 `rule_version`；`files[].evidence=tool_argument` 只能是
@@ -288,6 +303,13 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
 - **状态有上界**：tool_use 索引 500 条、记录链 400 条；分歧引用的永远是最近几条记录。多态字段一律先判 type（判据的铁律照用）。
   jq 的函数参数在调用处的输入上求值：`$r | slim(.ln)` 里的 `.ln` 是 `$r.ln`，第一版因此所有行号都是 null，断链兜底从未生效（09-15 修，fixture 钉着）。
 - **默认值**：`project_id` / `workspace_id` 没传就取 transcript 第一条记录的 `cwd`，hook 分发入口会传真值；`vibetrail.version` 先填 `0.2.0-dev`。
+- **轮次切分**（09-15）。主会话文件里一条 `user` 记录的 promptId 与当前轮不同，就是新的一轮：上一轮关、这一轮开。hook 的 `prompt_id` 与记录的
+  `promptId` 是同一个值（09-15 在 desktop 2.1.266 上挂 PostToolUse 探针实测），轮中插话（排队后被并入当前轮的人话）不换 promptId，
+  所以 turn.start / turn.end / 分歧事件的 turn_id 都对得上。只有 user 记录带 promptId（assistant、attachment、system 都不带），它们归当前轮。
+  下次起读的 checkpoint 再退到还没关的那一轮的开头，关轮时用量才完整；fixtures 每个切点「前段 ∪ 从 checkpoint 起的后段 == 全量」在切轮打开时同样成立
+  （09-15 临时跑过；test-map.sh 的 golden 只钉分歧，调用时带 `--no-turns`）。本机 3.3 MB 的真会话 15 轮，turn.start / turn.end 各 15 条，0.2 s。
+- **人话里的 system-reminder**（09-15）。desktop 会把 `<system-reminder>…</system-reminder>` 和人打的字塞进同一个字符串——worktree 会话的第一句人话
+  就是 `"<system-reminder>…</system-reminder>\n\npull main"`（本机实测），原先整条当注入。现在只剥完整的 reminder 块，剥完还有字就是人话；fixtures 与 golden 无变化。
 
 ## 5. 安装与范围
 
@@ -296,11 +318,20 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
 
 | 层 | 做什么 | 幂等 / 升级 |
 |---|---|---|
-| 机器级（一次） | 运行时放 `~/.vibetrail/bin/`（hook 命令必须是绝对路径，触发时还不知道在哪个仓）；往 `~/.claude/settings.json` 写 hook 条目；建 `~/.vibetrail/{spool,state,projects,config}`；将来的云端鉴权 token 放 `~/.vibetrail/`（0600，teamai 的 `~/.teamai/token` 同款） | 条目带 marker，升级按 marker 换掉自家旧条目（Pilot 的做法）；不建守护进程、不改 shell rc、不注入进程 |
+| 机器级（一次） | 运行时放 `~/.vibetrail/bin/`（hook 命令必须是绝对路径，触发时还不知道在哪个仓）；往 `~/.claude/settings.json` 写 hook 条目；建 `~/.vibetrail/{spool,state,projects,config}`；将来的云端鉴权 token 放 `~/.vibetrail/`（0600，teamai 的 `~/.teamai/token` 同款） | 条目按命令里的 `vibetrail-hook` 认，升级时整条换掉（Pilot 按命令认条目的做法）；改 settings 前备份到 `~/.vibetrail/backup/`（留 10 份）、临时文件 + rename；读不懂的 settings 不动；不建守护进程、不改 shell rc、不注入进程 |
 | scope（可配） | `project`（**默认**，用户 09-15 定，参考 teamai）：只采登记过的项目，分发入口查 `~/.vibetrail/projects/`，未登记直接退出（G8）。`user`：本机所有目录都采，不看登记表——用户显式选才开。配置在 `~/.vibetrail/config` | 改配置即生效，hook 每次触发读一次 |
 | 登记（scope=project 的开关） | `vibetrail init` 在仓里跑时顺手登记本仓（键 = `git worktree list` 第一条的主 checkout，worktree 共享）；另有 `vibetrail projects add / remove / list`（U2）。登记表在 HOME，仓里不留痕 | 幂等 |
-| 自检 | `vibetrail-doctor`：条目在不在、指向的运行时与 jq 在不在、版本一致否；scope 与本仓登记了没；最近 N 个会话的 `stop_hook_summary` 里有几个跑过我们的命令（transcript 自带这条证据，不用另存状态）；spool 积压、offset 落后、端点配没配；本机语料里有没有已知清单之外的 `type` / `attachment.type` / hook 事件名（G6） | — |
-| 卸载 | `vibetrail uninstall`：settings 条目、`~/.vibetrail/bin` 与 state 还原；`--purge` 才删 spool。被观测仓里没有东西要还原 | — |
+| 自检 | `vibetrail doctor`：运行时按 MANIFEST 校验、jq 在不在、条目在不在且指向的运行时存在、**本机每个 Claude Code 都认识登记的事件**（下一段）；scope 与本仓登记了没；spool 积压、transcript 落后（10 分钟没动还没采完）、重写次数、错误日志、端点配没配（09-15 已做）。还没做：最近 N 个会话的 `stop_hook_summary` 里有几个跑过我们的命令、本机语料里有没有已知清单之外的 `type` / `attachment.type` / hook 事件名（G6，随完整性钉子做） | — |
+| 卸载 | `vibetrail uninstall`：去掉 settings 里自家的条目（别的原样留着），删 `~/.vibetrail/bin`、state、logs；spool、config、登记表、settings 备份留着，`--purge` 才整个删。被观测仓里没有东西要还原 | — |
+
+实现 `tools/vibetrail`（init / uninstall / projects / list / show / doctor，09-15）。**只登记本机 Claude Code 都认识的事件**：settings 的 `hooks` 按一个固定的
+事件名列表校验（2.1.266 二进制里的 `Gg` 数组，33 个），列表外的键是错误；而有错误的 settings 文件会被整个跳过——二进制里的原话是
+「Files with errors are skipped entirely, not just the invalid settings.」。老版本不认识 `CwdChanged` 这类新事件，照写就可能让它把用户整份
+`~/.claude/settings.json`（权限、别的 hook）一起丢掉。所以 init 默认（`--events auto`）先找本机的 Claude Code 可执行文件（desktop 自带的每个版本、
+PATH 里的 claude、本地安装），从每个里抽出这个事件名数组（在 200 MB 二进制的 157 MB 处，扫一遍约 1.2 s，按「大小:修改时间:路径」缓存），
+只登记它们都认识的；老版本也有的 6 个（SessionStart / UserPromptSubmit / Stop / SubagentStop / SessionEnd / Notification）总登记，一个可执行文件都没找到时也只登这 6 个。
+本机 2.1.260 与 2.1.266 都认识全部 12 个。doctor 按同一办法复查。hook 条目的 timeout 显式给：SessionStart / UserPromptSubmit 10 s、SessionEnd 5 s（三者自己立刻退出）、
+Stop / SubagentStop 120 s 且 `async`、其余 30 s 且 `async`；Notification 带 matcher `permission_prompt`。命令写成 `/bin/bash '<绝对路径>/vibetrail-hook' <事件>`，不靠可执行位与 PATH。
 
 ### 5.1 怎么参考 teamai
 
@@ -320,6 +351,11 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
   含 `check-audit-stop.sh` 1,941 次）。
 - settings 改动热加载（file watcher），desktop 与 CLI 都是。
 - Stop 支持 `async: true`；SessionEnd 预算 1.5 s；`-p` 模式下 async hook 在会话结束时被杀。
+- 09-15 从本机 desktop 自带的 2.1.266 二进制补核：`async` 是所有 command hook 都能用的选项（「If true, hook runs in background without blocking」）；
+  hook 输入的公共字段有 `prompt_id`（「UUID correlating a user prompt with all subsequent events until the next prompt… Absent until the first user input
+  of the process lifetime」）与 `agent_id`（只在子 agent 里触发时有）；SessionStart 给 `source`（startup / resume / clear / compact / fork）与 `model`；
+  SessionEnd 的 reason 是 clear / resume / logout / prompt_input_exit / other；UserPromptSubmit 有 `source`（user / sdk / system / loop_wakeup…）；
+  hook 进程的环境里有 `AI_AGENT=claude-code_2-1-266_agent` 与 `CLAUDE_CODE_ENTRYPOINT`（agent.version 与 surface 取这两个）。
 
 ### 5.3 实现栈：bash + jq + curl，不做 Go
 
@@ -368,6 +404,19 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
   [Pilot 实跑](third-party/loongsuite-pilot-collection-sample.md)、[Pilot 原始输出](third-party/loongsuite-pilot-collection-output.md)。
 
 ## 7. 决策记录
+
+### D7 — turn.end 等这一轮确定结束了才发，不在 Stop 当场发（2026-09-15，实现时定，待用户确认，OPEN-ISSUES U14）
+
+Stop 不等于这一轮结束：别的 Stop hook 拦停（decision block）时，Claude 在同一个 promptId 下接着干活，干完再来一次 Stop（payload 里 `stop_hook_active` 为 true）。
+agentDock 有三个 Stop hook，其中审计闸门缺记录就拦（§8）；§2.1 那份语料里 `hook_blocking_error` 332 条（不全是 Stop 拦停）对 `stop_hook_summary` 2,084 条，
+拦停不罕见。我们的 Stop hook 是异步的、与它们并行，当场不知道会不会被拦。在第一次 Stop 就发 turn.end（event_id 按轮定），续上那段的 commit 与用量就丢了，协议又只许 commits 挂在 turn.end 上。
+
+定了什么：Stop 只记快照（每次覆盖），turn.end 在**这一轮确定结束**时由映射层发——下一轮开始（transcript 里出现新的 promptId）、会话结束、同会话恢复、
+或补做时这个会话已经空闲超过 `turn_idle_close`（默认 1 小时，可配）。
+
+代价写明：turn.end 晚到一轮——第 N 轮的 turn.end 在第 N+1 轮的 Stop 时写；会话的最后一轮要等 SessionEnd 或空闲后的补做。push 本来就按 1 小时 / 100 条攒批（D6），
+晚到对复盘没有影响，但演示时要说清楚。空闲判定的边角：一个工具跑了一小时以上、期间 transcript 没动，这一轮会被当成空闲先按已有证据关掉，
+之后真正的 Stop 再来时同一 event_id 的 turn.end 被拦下，云端留的是那一份早的。另一种做法是每次 Stop 都发一条 turn.end、后到的覆盖先到的，协议没有「覆盖」这回事，没选。
 
 ### D6 — push 门槛：满 1 小时或 100 条才推，SessionEnd / SessionStart 兜底不看门槛（2026-09-15，现行）
 
@@ -469,5 +518,6 @@ D2 的「正文与指针分开」在 D5 后反转：分歧事件自带能判责�
 ## 10. 未定项
 
 只记在 [OPEN-ISSUES.md](OPEN-ISSUES.md)：U2 登记方式 · U4 端点 / token / 谁能看 · U5 spool 上限 ·
-U6 审计线去向 · U7 自建还是改造 Pilot · U8 类型化信号成不成 kind · U9 Codex / Cursor；另有 K6 脱敏（暂缓）、G5（升为前置）、
+U6 审计线去向 · U7 自建还是改造 Pilot · U8 类型化信号成不成 kind · U9 Codex / Cursor · U12 token 口径 · U13 自定义取值待 collector 确认 ·
+U14 turn.end 延后到轮确定结束（D7，待用户确认）；另有 K6 脱敏（暂缓）、G5（升为前置）、
 G8 / G9 / G6 / G10 / G11。U1 已定（scope 可配，默认 `project`）；U3 / U10 / K1 已由 D5 关闭。

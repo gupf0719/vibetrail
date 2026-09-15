@@ -13,13 +13,17 @@ FILES=("$FX"/*.jsonl "$FX"/fx-*/subagents/agent-*.jsonl)
 T=$(mktemp -d "${TMPDIR:-/tmp}/vibetrail-test-map.XXXXXX"); trap 'rm -rf "$T"' EXIT
 update=0; [ "${1:-}" = "--update" ] && update=1
 fail=0; pass=0
+# 协议 schema 校验要 python3 + jsonschema（只在测试里用）；本机没装就跳过这几项并在末尾说明，不算失败
+if python3 -c 'import jsonschema' 2>/dev/null; then HAVE_SCHEMA=1; else HAVE_SCHEMA=0; fi
+skipped_schema=0
+schema_check(){ if [ "$HAVE_SCHEMA" = 1 ]; then python3 "$SELF/schema-check.py"; else cat >/dev/null; skipped_schema=$((skipped_schema+1)); echo "(跳过)"; fi; }
 ok(){ pass=$((pass+1)); }
 ko(){ fail=$((fail+1)); printf '  ✗ %s\n' "$*"; }
 # 断言：jq 表达式对 events 文件（-s 整体）求值必须是 true
 check(){ local r; r=$(jq -s "$2" "$3" 2>&1); if [ "$r" = "true" ]; then ok; else ko "$1 （得到 $r）"; fi; }
 run(){ # run <名> <transcript> [额外参数…] → $T/<名>.events / .ledger；stderr 必须为空
     local n=$1 f=$2; shift 2
-    bash "$SELF/vibetrail-map" "$f" --ledger "$T/$n.ledger" "$@" > "$T/$n.events" 2> "$T/$n.err" \
+    bash "$SELF/vibetrail-map" "$f" --no-turns --ledger "$T/$n.ledger" "$@" > "$T/$n.events" 2> "$T/$n.err" \
         || { ko "$n: vibetrail-map 退出码非零: $(head -c 200 "$T/$n.err")"; return 1; }
     [ -s "$T/$n.err" ] && ko "$n: stderr 非空: $(head -c 200 "$T/$n.err")"
     return 0
@@ -36,7 +40,7 @@ if run scenario "$T/scenario.jsonl" --sid 11111111-2222-4333-8444-555555555555 -
     check "scenario: 拒绝后人的下一句带上，指回拒绝与打断两条记录" '[.[] | select(.type=="message.user")][0] | .payload.text == "别改 add，那是故意留的" and .payload.author_type == "user" and (.extensions["vibetrail.after"] | length == 2) and .turn_id == "prompt-3"' "$e"
     check "scenario: 会话 / 项目 / 工作区 id 照传入" 'all(.[]; .session_id == "11111111-2222-4333-8444-555555555555" and .project_id == "demo" and .workspace_id == "/tmp/demo-proj")' "$e"
     check "scenario: for-tool-use 被吸收、不另发事件" '.[0]' <(jq -c '.absorbed_for_tool_use == 1 and .unpaired_for_tool_use == 0 and (.events["turn.end"] // 0) == 0' "$T/scenario.ledger")
-    python3 "$SELF/schema-check.py" < "$e" > "$T/schema.out" && ok || ko "scenario: $(cat "$T/schema.out")"
+    schema_check < "$e" > "$T/schema.out" && ok || ko "scenario: $(cat "$T/schema.out")"
 fi
 
 echo "════ 2. fixtures：断言 + schema + golden ════"
@@ -44,7 +48,7 @@ for f in "${FILES[@]}"; do
     n=$(basename "$f" .jsonl)
     run "$n" "$f" || continue
     e=$T/$n.events; lg=$T/$n.ledger
-    python3 "$SELF/schema-check.py" < "$e" > "$T/schema.out" && ok || ko "$n: $(cat "$T/schema.out")"
+    schema_check < "$e" > "$T/schema.out" && ok || ko "$n: $(cat "$T/schema.out")"
     # event_id 唯一、且是 v5 形状
     check "$n: event_id 唯一且为 UUIDv5" '(map(.event_id) | length == (unique | length)) and all(.[]; .event_id | test("^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))' "$e"
     # golden
@@ -143,7 +147,7 @@ for f in "${FILES[@]}" "$T/scenario.jsonl"; do
     sid=$(jq -r .sid "$T/$n.ledger"); pid=$(jq -r '.[0].project_id // "x"' -s "$T/$n.events"); wid=$(jq -r '.[0].workspace_id // "x"' -s "$T/$n.events")
     meta=(); [ -f "${f%.jsonl}.meta.json" ] && meta=(--meta "${f%.jsonl}.meta.json")
     par=$(jq -r .parent_instance "$T/$n.ledger")   # 切出来的前段在临时目录里，查不到兄弟文件，父实例照全量那次给
-    common=(--sid "$sid" --parent-instance "$par" --project-id "$pid" --workspace-id "$wid" ${meta[@]+"${meta[@]}"})
+    common=(--no-turns --sid "$sid" --parent-instance "$par" --project-id "$pid" --workspace-id "$wid" ${meta[@]+"${meta[@]}"})
     sort "$full" > "$T/full.sorted"; badc=0
     for L in $(seq 1 $((N-1))); do
         head -n "$L" "$f" > "$T/cut.jsonl"
@@ -188,4 +192,5 @@ EOF
 then ok; else ko "event_id 与 python 的 UUIDv5 不一致: $(head -3 "$T/uuid.out")"; fi
 
 echo
+[ "$skipped_schema" -gt 0 ] && echo "  ⚠ 本机 python3 没有 jsonschema，协议 schema 校验跳过 $skipped_schema 处（pip install jsonschema 后重跑）"
 if [ $fail -eq 0 ]; then echo "  ✅ $pass/$pass 通过"; else echo "  ❌ $fail 失败 / $pass 通过"; exit 1; fi

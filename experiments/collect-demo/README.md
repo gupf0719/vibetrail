@@ -9,3 +9,11 @@
 
 用它跑出来的两份样例（2026-09-11，断网实跑）：[LoongSuite Pilot](../../third-party/loongsuite-pilot-collection-sample.md)、
 [teamai-cli](../../third-party/teamai-cli-collection-sample.md)。回放脚本写死了跑的那台机器的路径，没有入库。
+
+`demo.sh`（2026-09-15）用它在沙箱里演示 vibetrail 自己：临时目录里 `vibetrail init`（写沙箱的 settings.json、登记沙箱仓），
+按 `steps` 回放，hook 步骤用 init 真实写进 settings 的那条命令去跑、payload 补上当轮的 `prompt_id`，第 1 轮中途在仓里真的提交一次；
+最后 `vibetrail list / show / doctor`，并核对被观测仓零写入。不碰真实的 `~/.claude` 与 `~/.vibetrail`。
+
+```bash
+bash experiments/collect-demo/demo.sh [沙箱目录]
+```

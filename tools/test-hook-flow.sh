@@ -7,6 +7,10 @@ set -uo pipefail
 cd "$(dirname "$0")"; SELF=$PWD
 T=$(mktemp -d "${TMPDIR:-/tmp}/vibetrail-test-hook.XXXXXX"); trap 'rm -rf "$T"' EXIT
 fail=0; pass=0
+# 协议 schema 校验要 python3 + jsonschema（只在测试里用）；本机没装就跳过这几项并在末尾说明，不算失败
+if python3 -c 'import jsonschema' 2>/dev/null; then HAVE_SCHEMA=1; else HAVE_SCHEMA=0; fi
+skipped_schema=0
+schema_check(){ if [ "$HAVE_SCHEMA" = 1 ]; then python3 "$SELF/schema-check.py"; else cat >/dev/null; skipped_schema=$((skipped_schema+1)); echo "(跳过)"; fi; }
 ok(){ pass=$((pass+1)); }
 ko(){ fail=$((fail+1)); printf '  ✗ %s\n' "$*"; }
 check(){ if eval "$2"; then ok; else ko "$1"; fi; }
@@ -45,8 +49,11 @@ replay(){ # 按 scenario 的步骤回放：append 追加一行（cwd 换成临�
         fi
     done < <(jq -c '.steps[]' "$SC")
 }
-spool_events(){ cat "$SPOOL"/*.jsonl 2>/dev/null | jq -S -c . | sort; }
-full_map(){ bash "$SELF/vibetrail-map" "$TR" --sid "$SID" --project-id "$REPO" --workspace-id "$REPO" --ledger /dev/null | jq -S -c . | sort; }
+# spool 里分歧、轮次、hook 事件在同一条流里；这里只拿分歧那部分（rule_version diverge-v1）与全量分歧映射比。
+# 打断的 turn.end 会补上 hook 记的 HEAD / 脏否 / commit，全量映射那边没有 hook 证据，比之前两边都去掉这几项
+NORM='del(.payload.vcs.head_sha, .payload.vcs.dirty, .commits, .extensions["vibetrail.commit_method"], .extensions["vibetrail.commit_attribution"])'
+spool_events(){ cat "$SPOOL"/*.jsonl 2>/dev/null | jq -S -c "select(.provenance.rule_version == \"diverge-v1\") | $NORM" | sort; }
+full_map(){ bash "$SELF/vibetrail-map" "$TR" --no-turns --sid "$SID" --project-id "$REPO" --workspace-id "$REPO" --ledger /dev/null | jq -S -c "$NORM" | sort; }
 
 echo "════ 1. A4：scope=project、未登记的仓，回放整段会话，本机什么都不写 ════"
 replay
@@ -57,16 +64,18 @@ vt_register "$REPO" >/dev/null
 replay
 check "spool 有块文件" 'ls "$SPOOL"/*.jsonl >/dev/null 2>&1'
 check "spool 里的事件与全量映射逐条一致（3 条：被拒命令、人拒、之后的人话）" '[ "$(spool_events)" = "$(full_map)" ] && [ "$(spool_events | wc -l | tr -d " ")" = 3 ]'
-check "每条过协议 schema" 'cat "$SPOOL"/*.jsonl | python3 "$SELF/schema-check.py" >/dev/null'
+check "每条过协议 schema" 'schema_check < <(cat "$SPOOL"/*.jsonl) >/dev/null'
 check "state 记下 checkpoint 与消费到的字节" 'jq -e ".consumed_bytes == $(wc -c < "$TR" | tr -d " ") and .checkpoint_line >= 1" "$VT_HOME/state/$SID/main.json" >/dev/null'
 check "没有错误日志" '[ ! -s "$VT_HOME/logs/errors.log" ]'
 check "正常追加不算重写：state 里 rewrites 为 0、带文件指纹" 'jq -e ".rewrites == 0 and (.fprint | test(\"^[0-9]+:[0-9a-f]{40}:[0-9a-f]{40}$\"))" "$VT_HOME/state/$SID/main.json" >/dev/null'
 check "被观测仓里零写入（A8）" '[ -z "$(git -C "$REPO" status --porcelain)" ]'
 
 echo "════ 3. 重复触发不重复写 ════"
-n0=$(ls "$SPOOL" | wc -l | tr -d ' ')
+ndiv(){ spool_events | wc -l | tr -d ' '; }
+nodup(){ [ "$(cat "$SPOOL"/*.jsonl | jq -r .event_id | sort | uniq -d | wc -l | tr -d ' ')" = 0 ]; }
+n0=$(ndiv)
 hook Stop "$(payload Stop)"; hook SessionEnd "$(payload SessionEnd '{"reason":"other"}')"
-check "没有新块" '[ "$(ls "$SPOOL" | wc -l | tr -d " ")" = "$n0" ]'
+check "分歧事件不多一条、spool 里没有重复的 event_id（SessionEnd 自己会写 session.end 与最后一轮的 turn.end）" '[ "$(ndiv)" = "$n0" ] && nodup'
 
 rec(){ # rec <uuid> <parent> <promptId> <类型> <content JSON> [额外字段 JSON]
     local x=${6:-}; [ -n "$x" ] || x='{}'
@@ -78,12 +87,12 @@ rec(){ # rec <uuid> <parent> <promptId> <类型> <content JSON> [额外字段 JS
 echo "════ 4. 打断之后没有 Stop：下一轮的 Stop 补上；锁被占时跳过、放开后补上 ════"
 rec a4 67283ce6-2633-428e-a646-464e502787d9 x assistant '[{"type":"text","text":"我再改一下 div。"}]' '{"message":{"id":"m4","model":"claude-opus-5","role":"assistant","content":[{"type":"text","text":"我再改一下 div。"}]}}' >> "$TR"
 rec i4 a4 prompt-4 user '[{"type":"text","text":"[Request interrupted by user]"}]' >> "$TR"
-hook UserPromptSubmit "$(payload UserPromptSubmit '{"prompt":"不用改了"}')"
-check "UserPromptSubmit 不读 transcript（U11）：还没有新块" '[ "$(ls "$SPOOL" | wc -l | tr -d " ")" = "$n0" ]'
+hook UserPromptSubmit "$(payload UserPromptSubmit '{"prompt":"不用改了","prompt_id":"prompt-5"}')"
+check "UserPromptSubmit 不读 transcript（U11）：还没有新的分歧事件，只多一条 turn.start" '[ "$(ndiv)" = "$n0" ] && cat "$SPOOL"/*.jsonl | jq -s -e "map(select(.type == \"turn.start\" and .turn_id == \"prompt-5\")) | length == 1" >/dev/null'
 rec u5 i4 prompt-5 user '"不用改了"' >> "$TR"
 mkdir "$VT_HOME/state/$SID/.lock"
 hook Stop "$(payload Stop)"
-check "锁被占：跳过，不写" '[ "$(ls "$SPOOL" | wc -l | tr -d " ")" = "$n0" ]'
+check "锁被占：跳过，不写" '[ "$(ndiv)" = "$n0" ]'
 rmdir "$VT_HOME/state/$SID/.lock"
 hook Stop "$(payload Stop)"
 check "放开锁后补上：打断的 turn.end、被打断的回复、之后的人话" '[ "$(spool_events)" = "$(full_map)" ] && [ "$(spool_events | wc -l | tr -d " ")" = 6 ]'
@@ -140,7 +149,7 @@ SID2=22222222-3333-4444-8555-666666666666
   rec b3 b2 q1 user '[{"type":"text","text":"[Request interrupted by user]"}]' | jq -c --arg s "$SID2" '.sessionId = $s'
 } > "$TDIR/$SID2.jsonl"
 hook SessionStart "$(payload SessionStart '{"source":"startup"}')"
-check "别的会话的打断被补做进它自己的 spool 目录" 'cat "$VT_HOME/spool/$PKEY/$SID2"/*.jsonl 2>/dev/null | jq -s -e "map(.type) == [\"message.assistant\", \"turn.end\"]" >/dev/null'
+check "别的会话的打断被补做进它自己的 spool 目录" 'cat "$VT_HOME/spool/$PKEY/$SID2"/*.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"diverge-v1\") | .type) == [\"message.assistant\", \"turn.end\"]" >/dev/null'
 
 echo "════ 10. scope=user：未登记的仓也采 ════"
 vt_unregister "$REPO"; rm -rf "$VT_HOME/state" "$VT_HOME/spool"
@@ -151,4 +160,5 @@ replay
 check "scope=user：照样写" '[ "$(spool_events | wc -l | tr -d " ")" = 3 ]'
 
 echo
+[ "$skipped_schema" -gt 0 ] && echo "  ⚠ 本机 python3 没有 jsonschema，协议 schema 校验跳过 $skipped_schema 处（pip install jsonschema 后重跑）"
 if [ $fail -eq 0 ]; then echo "  ✅ $pass/$pass 通过"; else echo "  ❌ $fail 失败 / $pass 通过"; exit 1; fi

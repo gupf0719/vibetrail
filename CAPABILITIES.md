@@ -18,9 +18,15 @@
 | 人机分歧判据 | ✅ 已实现，755 会话实测精确率 100% | `tools/diverge-rules.jq`（jq 模块）+ 入口 `tools/extract-diverge.jq`（调用要带 `-L tools`），规范 [spec/diverge-v1.md](spec/diverge-v1.md) |
 | 判据回归 | ✅ | `tools/fixtures.jsonl` + `tools/test-extract.sh`（27 条正负例，比对整条输出并查 jq 报错） |
 | 协议映射（分歧一路） | ✅ 2026-09-15 | `tools/map-events.jq`（include 判据模块）+ `tools/vibetrail-map`（`event_id` UUIDv5、账本、只读到最后一个换行、按字节偏移从本轮开头读、回放副本不上报）；五类 kind → `permission.decision` / `turn.end(interrupted)` / `subagent.end(cancelled)`，带被拒调用的 `tool.request`、被打断的回复、之后人的下一句（含斜杠命令）；规则 [DESIGN §4.2](DESIGN.md) |
-| 映射回归 | ✅ | `tools/test-map.sh`：11 份 fixtures（`tools/fixtures-map/`，golden 在 `expect/`）+ scenario 回放；断言 + golden + 每条过协议 schema（`tools/schema-check.py`，python3 + jsonschema，只在测试用）+ A2 对账（提取器命中按记录去重后 == 事件数）+ 每个切点的增量等价（从头读、从 checkpoint 读两路）+ 半行 + 幂等 + event_id 用 python 重算，139 项 |
-| 分歧一路挂 hook | ✅ 2026-09-15 | `tools/vibetrail-hook`（共用函数 `tools/vibetrail-lib.sh`）：Stop / SubagentStop / SessionEnd / SessionStart 补做时调 `vibetrail-map`，不挂 UserPromptSubmit（U11）；scope 门控、会话锁、按 transcript 分文件的 state、spool 块文件、失败日志只留元数据；DESIGN §3.1、§3.3 |
-| hook 回归 | ✅ | `tools/test-hook-flow.sh`：scenario 在临时仓里真实回放，21 项——未登记零写入、spool 等于全量映射、重复触发、锁、半行、回放副本、子 agent、文件重写、补做别的会话、scope=user |
+| 映射回归 | ✅ | `tools/test-map.sh`：11 份 fixtures（`tools/fixtures-map/`，golden 在 `expect/`）+ scenario 回放；断言 + golden + 每条过协议 schema（`tools/schema-check.py`，python3 + jsonschema，只在测试用）+ A2 对账（提取器命中按记录去重后 == 事件数）+ 每个切点的增量等价（从头读、从 checkpoint 读两路）+ 半行 + 幂等 + event_id 用 python 重算，158 项；调用带 `--no-turns`，只钉分歧那部分；python 缺 jsonschema 时 schema 项跳过并在末尾说明 |
+| 分歧一路挂 hook | ✅ 2026-09-15 | `tools/vibetrail-hook`（共用函数 `tools/vibetrail-lib.sh`）：Stop / SubagentStop / SessionEnd / SessionStart 补做时调 `vibetrail-map`，UserPromptSubmit 不读 transcript（U11）；scope 门控、会话锁、按 transcript 分文件的 state、spool 块文件、失败日志只留元数据；DESIGN §3.1、§3.3 |
+| hook 分发入口：会话 / 轮次 / 子 agent 起止与事件头 | ✅ 2026-09-15 | `tools/vibetrail-hook` + `tools/hook-events.jq`：12 个事件——`session.start` / `session.end`、`turn.start`（HEAD / 分支 / 脏否）、`subagent.start` / `subagent.end`（父实例与 `parent_call_id` 取 meta.json）、`ext.claude.*`（PostToolUseFailure / PermissionDenied / StopFailure / Notification / InstructionsLoaded / CwdChanged，只记事件头）；同步 hook 读完 stdin 就丢后台、约 0.02 s 退出；desktop 2.1.266 真实 payload 实跑过（09-15）；DESIGN §3.1、§4.1 |
+| 轮次元数据：turn.end | ✅ 2026-09-15 | `tools/map-events.jq` 主会话按 promptId 切轮，轮确定结束才发 `turn.end`（D7）：status completed / denied / unknown / error（打断的由分歧一路发）、用量按 message.id 去重、vcs 与 commits 取 hook 快照；与分歧同一条事件流，`vibetrail-map --no-turns` 只出分歧；DESIGN §4.1、§4.2 |
+| commit ↔ 轮次推导 | ✅ 2026-09-15 | `vt_git_snapshot` / `vt_commits`（`tools/vibetrail-lib.sh`）：轮起 / 轮止快照在 `state/<sid>/turns/`，本轮 commit = rev-list 起..止 + 本轮 reflog 里新建的提交；`GIT_OPTIONAL_LOCKS=0` 保证不写被观测仓的 `.git/index`；DESIGN §3.5 |
+| 机器级安装 / 卸载 / 登记 | ✅ 2026-09-15 | `tools/vibetrail init / uninstall / projects`：运行时拷到 `~/.vibetrail/bin/`（MANIFEST 校验）、HOME settings 写 hook 条目（按命令认自家条目、改前备份）、config（scope、jq 绝对路径、device_id）；只登记本机每个 Claude Code 都认识的事件（有错的 settings 会被整个跳过）；被观测仓零写入；DESIGN §5 |
+| 本地查看与自检 | ✅ 2026-09-15 | `vibetrail list`（spool 里的块）、`vibetrail show`（按会话、按时间一行一条，`--json` 原样）、`vibetrail doctor`（运行时、jq、条目、事件兼容、scope 与登记、积压、落后、错误日志）；G9 的本地预览先由它承担 |
+| hook 回归 | ✅ | `tools/test-hook-flow.sh`：scenario 在临时仓里真实回放，25 项——未登记零写入、spool 里的分歧事件等于全量分歧映射、重复触发、锁、半行、回放副本、子 agent、文件重写与 offset 信任检查、补做别的会话、scope=user；python 缺 jsonschema 时 schema 项跳过并在末尾说明 |
+| 沙箱演示 | ✅ 2026-09-15 | `experiments/collect-demo/demo.sh`：临时目录里 init → 按 scenario 回放（hook 用 settings 里写下的命令触发、第 1 轮中途真的提交一次）→ list / show / doctor → 核对零写入；不碰真实的 `~/.claude` 与 `~/.vibetrail` |
 | hook 机制探针 | ✅ | `experiments/hook-probe.sh`（DESIGN §6.1 的实证来源） |
 | 采集回放样本 | ✅ | `experiments/collect-demo/scenario.json`：同一段示例会话，Pilot / teamai 实跑样例就是用它截的；G7 的回归输入 |
 
@@ -28,13 +34,10 @@
 
 | 功能 | 状态 | 形态 |
 |---|---|---|
-| `vibetrail init` / `uninstall` | ❌ | 机器级装一次：`~/.vibetrail/bin`、HOME settings 条目（带 marker）、scope 配置、登记；DESIGN §5 |
-| hook 分发入口里的元数据事件 | 🔁 | 入口、门控、锁、state、spool 已在（上表「分歧一路挂 hook」）；还缺 session / turn / subagent 起止事件、`ext.claude.*` 事件头、git 状态；DESIGN §3.1、§4.1 |
-| commit ↔ session 推导 | ❌ | 每轮起止 HEAD + `rev-list`；DESIGN §3.5 |
-| `vibetrail push [--list \| --show]` | ❌ | 端点没配不发；配了按协议打批、每条过 schema、`event_id` 幂等、ack 即删；DESIGN §4 |
-| doctor 扩展 | 🔁 | 现有 `old/vibetrail-doctor` 查的是退役的 git hook 与仓内 vendor，要改成 DESIGN §5 的自检项 |
-| 本地预览 | 🔁 | 现有 `old/vibetrail`（show / log / session / diverge）读仓内 `sessions/` 与 `Claude-Session` trailer，两者都退役；只留 push 前预览（`push --list / --show`），读取与分析不归本项目（D5） |
+| `vibetrail push [--list \| --show]` | ❌ 用户 09-15 定往后放 | 端点没配不发；配了按协议打批、每条过 schema、`event_id` 幂等、ack 即删、门槛与退避（D6）；DESIGN §4。本地看待发内容现在用 `vibetrail list / show` |
+| doctor 余项 | 🔁 | 已做的见上表；还缺最近会话的 `stop_hook_summary` 里有没有跑过我们的命令、本机语料里的未知 `type` / `attachment.type` / hook 事件名（G6） |
 | 完整性钉子 | 🔁 | 映射后事件全部过 schema、每类命中数 == 事件数已在 `test-map.sh` 钉住（测试期）；运行时的条数进出、超 1 MiB 被拒计数、未知类型 / 事件名告警待做（G10、G6） |
+| 补充回归场景 | ❌ 用户 09-15 定往后放 | 轮次元数据一路的断言（turn.start / turn.end 成对、status、commits）、一轮多 commit、后台子 agent 晚于父 Stop、端点未配置 / 配置后断网；现在只有 `demo.sh` 端到端跑一遍 |
 
 ### 退役（2026-09-14，D4；2026-09-15 代码归档到 `old/`，见 `old/README.md`）
 
