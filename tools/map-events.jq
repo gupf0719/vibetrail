@@ -33,13 +33,16 @@ def opt($k; $v): if $v == null then {} else {($k): $v} end;
 def codeOk: type == "string" and test("^[a-z][a-z0-9]*([._-][a-z0-9]+)*$");
 
 # ---------- 记录的精简形态（进链、进索引的就是它） ----------
-# text：user / assistant 记录的正文——只取 text 块（不含 thinking / tool_result），去掉 <system-reminder> 块
+# text：user / assistant 记录的正文——只取 text 块（不含 thinking / tool_result），去掉 <system-reminder> 块；
+# IDE 扩展注入的 <ide_opened_file> / <ide_selection> 之类标签常和人打的字混在同一条消息里，只剥标签、不整条排除（照 agentsview，09-15 调研）
+def stripIde: gsub("<ide_[a-z_]+>.*?</ide_[a-z_]+>"; ""; "m") | sub("^\\s+"; "") | sub("\\s+$"; "");
 def textOf:
   (msg.content) as $c
-  | if ($c | type) == "string" then $c
+  | if ($c | type) == "string" then ($c | stripIde)
     elif ($c | type) == "array"
     then [$c[]? | objects | select(.type == "text") | (.text // "") | strings
-          | select((sub("^\\s+"; "") | startswith("<system-reminder>")) | not)] | join("\n")
+          | select((sub("^\\s+"; "") | (startswith("<system-reminder>") or startswith("<ide_"))) | not)
+          | stripIde | select(length > 0)] | join("\n")
     else "" end;
 def toolUses:
   if (msg.content | type) == "array"
@@ -49,8 +52,11 @@ def mainUser:          # 主会话里人发出的 user 记录的公共条件：�
   .type == "user" and (.isSidechain != true) and (.isMeta != true) and (.isCompactSummary != true) and (.agentId == null)
   and ((msg.content | type) == "string"
        or ((msg.content | type) == "array" and (any(msg.content[]? | objects; .type == "tool_result") | not)));
-# 「人的一句话」：注入型（system-reminder、local-command-*、command-*、task-notification、bash-*）都不算
-def injectedText: sub("^\\s+"; "") | test("^<(system-reminder|local-command-[a-z]+|command-[a-z]+|task-notification|bash-[a-z]+)");
+# 「人的一句话」：注入型（system-reminder、local-command-*、command-*、task-notification、bash-*）都不算；
+# 另有两类纯文本注入（照 agentsview 的排除清单，09-15 调研）：Stop hook 拦停时回灌的「Stop hook feedback:」、压缩后续接的「This session is being continued」摘要
+def injectedText: sub("^\\s+"; "")
+  | test("^<(system-reminder|local-command-[a-z]+|command-[a-z]+|task-notification|bash-[a-z]+)")
+    or startswith("Stop hook feedback") or startswith("This session is being continued");
 def isHumanPrompt: mainUser and (textOf | length > 0 and (isInterruptText | not) and (injectedText | not));
 # 斜杠命令是人敲的（Pilot 也把 <command-name> 当人的动作，transcript-parser.mjs:34），不是注入。
 # 规范成 "/model claude-opus-5" 这样的一句；/model、/compact 常在分歧之后出现（09-15 语料 17 / 272）
@@ -200,9 +206,27 @@ def lastAssistantInTurn($s):   # 链断了的兜底：按文件顺序取本轮�
   . as $st | turnStart as $from
   | [.chain_order[] | $st.chain[.] | select(.type == "assistant" and (.synthetic | not) and .ln >= $from and .ln < $s.ln)] | last;
 
+# 同一条模型回复会拆成几条记录（thinking / text / tool_use 各一条，共用 message.id；09-15 语料 24048 条回复七成拆成 ≥2 条）。
+# 离打断最近的那条常是 tool_use，只取它会丢掉回复的文字——把本轮里同一 message.id、不晚于它的记录拼起来，工具调用合在一起。
+# 文字不能简单接：有 ≥2 段文字的 212 条里 210 条是逐步变长的快照（后一段以前一段开头），只有 2 条是互不包含的几段。
+# 所以快照换成长的、互不包含的才接起来。Pilot 只留最长一段（丢那 2 条的短段），teamai 只取最后一条带文字的记录（同样丢，还只看末尾 10 KB）
+# ⚠️ `$x | startswith(.[-1])` 里的 .[-1] 在 $x 上求值（同 slim(.ln) 的坑），先把末项绑成变量
+def mergeTexts: reduce (.[] | select(length > 0)) as $x ([];
+  if length == 0 then [$x]
+  else .[-1] as $last
+    | if ($x | startswith($last)) then .[:-1] + [$x]    # 新的是旧的变长快照：换掉
+      elif ($last | startswith($x)) then .              # 新的是落后的快照：不要
+      else . + [$x] end end) | join("\n");
+def wholeReply($near):
+  if $near == null or $near.mid == null then $near else
+    . as $st | turnStart as $from
+    | [.chain_order[] | $st.chain[.] | select(.type == "assistant" and (.synthetic | not) and .mid == $near.mid and .ln >= $from and .ln <= $near.ln)] as $grp
+    | if ($grp | length) <= 1 then $near
+      else $near + {text: ([$grp[] | .text] | mergeTexts), tools: ([$grp[] | .tools[]] | unique_by(.id))} end end;
+
 def interrupted($r; $s; $h; $detail):
   turnOf($s) as $t
-  | ((walkUp($s.parentUuid; 200)) // lastAssistantInTurn($s)) as $reply
+  | wholeReply((walkUp($s.parentUuid; 200)) // lastAssistantInTurn($s)) as $reply
   | (if $reply != null and ($reply.text | length) > 0
      then emit(message($s; $t; $reply; "message.assistant"; "agent"; {"vibetrail.trigger": $s.uuid, "vibetrail.kind": $h.kind}))
      else . end)
@@ -261,8 +285,11 @@ def step($r):
       | (if ($r.promptId | type) == "string" and $r.promptId != .turn then .turn = $r.promptId | .denials = [] else . end)
       | index($s)
       | (if $s.human then .turn_usage = {} | .turn_model = null | .turn_line = $s.ln else . end)
+      # 同一 message.id 留 output_tokens 最大的那份（照 ccusage：早期流式记录可能是占位值，取最大与读取顺序无关）
       | (if $s.type == "assistant" and $s.usage != null and ($s.synthetic | not)
-         then .turn_usage[($s.mid // $s.rid // $s.uuid)] = $s.usage | .turn_model = ($s.model // .turn_model) else . end)
+         then ($s.mid // $s.rid // $s.uuid) as $uk
+              | (if ((.turn_usage[$uk].output_tokens // -1) > ($s.usage.output_tokens // 0)) then . else .turn_usage[$uk] = $s.usage end)
+              | .turn_model = ($s.model // .turn_model) else . end)
       | (if $ln > $from_line and $keyrec then .ledger.sources += [[$s.uuid, $ln]] else . end)
       | (if ($r.toolUseResult | type) == "string" and ($r.toolUseResult | startswith("User rejected tool use"))
          then .ledger.sentinel.marker += 1

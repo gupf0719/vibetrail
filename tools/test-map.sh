@@ -101,6 +101,13 @@ check "edge: 之后打的字照样发，指回同一次打断；本地命令输�
 check "edge: 缺 message.id 时按 requestId 去重，断链时按本轮顺序兜底" '.[5].type == "turn.end" and .[5].payload.usage == {input_tokens:6,cached_input_tokens:60,output_tokens:12,total_tokens:78} and .[5].extensions["vibetrail.interrupted_uuid"] == "a3" and .[4].payload.text == "好，只删安装一节，其余不动。"' "$e"
 check "edge: 共 7 条事件，没认出的新拒绝措辞不发事件" 'length == 7 and all(.[]; .type != "permission.decision")' "$e"
 check "edge: 哨兵——有 User rejected tool use 标记而判据没认出，账本记 1；checkpoint 是最后一轮开头" '.[0]' <(jq -c '.sentinel == {marker:1, marker_without_hit:1} and .checkpoint_line == 12' "$T/edge-cases.ledger")
+e=$T/injected.events
+check "injected: 回复拆成文字与 tool_use 两条记录，按 message.id 拼回——文字与在跑的调用都发" '.[0].type == "message.assistant" and .[0].payload.text == "我先读一下 README。" and .[1].type == "tool.request" and .[1].payload.call_id == "jt1" and .[2].extensions["vibetrail.interrupted_uuid"] == "j-a1b"' "$e"
+check "injected: 同一 message.id 先 30 后 10，用量留大的（照 ccusage）" '.[2].payload.usage.output_tokens == 30' "$e"
+check "injected: Stop hook 反馈、会话续接摘要不算人话，IDE 标签（独立块、夹在句中）剥掉只留人打的字" '[.[] | select(.type == "message.user") | .payload.text] == ["只改第一段", "还有这里也改"]' "$e"
+e=$T/split-reply.events
+check "split-reply: 逐步变长的快照留完整的，互不包含的段接起来——不重复也不丢（语料 212 条多段文字里 210 条是快照）" '.[0].type == "message.assistant" and .[0].payload.text == "我先看一下测试日志\n同时看一下最近的改动"' "$e"
+check "split-reply: 同一条回复里的两个工具调用都发 tool.request，用量取这条消息里最大的 output" '([.[] | select(.type == "tool.request") | .payload.call_id] | sort) == ["kt1", "kt2"] and ([.[] | select(.type == "turn.end")][0].payload.usage.output_tokens == 31)' "$e"
 e=$T/replay.events
 check "replay: 回放副本整条跳过，原来的事实各报一次" 'length == 9 and ([.[] | .event_id] | length == (unique | length)) and ([.[] | select(.type == "turn.end")] | map(.provenance.source_event_id) == ["r-i1", "r-i9"])' "$e"
 check "replay: 副本里的旧人话不会被当成打断后的下一句；回放后人打的第一句挂在原来的打断上" '[.[] | select(.type == "message.user") | [.payload.text, .extensions["vibetrail.after"]]] == [["先别跑测试，直接看代码", ["r-d1","r-f1"]], ["接着昨天的继续", ["r-i1"]], ["够了", ["r-i9"]]]' "$e"

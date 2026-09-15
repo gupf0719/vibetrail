@@ -217,7 +217,7 @@ flowchart LR
 
 | 我们的 | 协议事件 | 关键字段 |
 |---|---|---|
-| `interrupt` | `turn.end`，status code `interrupted` / category `cancellation`，detail 是标记原文 | `turn_id` = promptId（打断记录带；缺失才按位置推、provenance 标 inferred）。正文：沿 `parentUuid` 回溯到最近的 assistant 记录——有 text 块发 `message.assistant`，有 `tool_use` 块发 `tool.request`（在跑的调用）；打断后人的下一句发 `message.user`（delivery `direct`）。payload 另带 model、本轮 usage、vcs.branch |
+| `interrupt` | `turn.end`，status code `interrupted` / category `cancellation`，detail 是标记原文 | `turn_id` = promptId（打断记录带；缺失才按位置推、provenance 标 inferred）。正文：沿 `parentUuid` 回溯到最近的 assistant 记录，再按 `message.id` 拼回整条回复（§4.2）——有文字发 `message.assistant`，有 `tool_use` 发 `tool.request`（在跑的调用）；打断后人的下一句发 `message.user`（delivery `direct`）。payload 另带 model、本轮 usage、vcs.branch |
 | `permission_denied`（+ 伴随的 `interrupt_for_tool_use`，n:1，计一次） | `permission.decision`，decision `deny`，decided_by `user`，`permission_id` = `call_id` | `tool_name` 必填：`The user doesn't want to proceed` 形态里没有工具名，用 `is_error` 块的 `tool_use_id` 反查 `tool_use` 块的 `name`（G5 已关）→ 反查不到退 `Permission to use (\S+)` 捕获 → 再退 `unknown`，来路记 `extensions.vibetrail.tool_lookup`。正文：反查到的 `input` 发一条 `tool.request`；拒绝原文放 `reason`（≤ 4096）；拒绝后人的下一句也发 `message.user`（与打断同款——判责要的就是这一句，比 §2 多带一句）。for-tool-use 记录被吸收不另发；同一轮没有拒绝可配的按打断发、detail 标 unpaired |
 | `classifier_blocked` | 同上，decided_by `policy` | 同上 |
 | `permission_infra_fail` | 同上，decision `error`，decided_by `system` | 同上 |
@@ -262,12 +262,22 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
 - **正文取法。** 回复正文 = text 块拼接（不含 thinking）；人话 = 字符串正文或 text 块，去掉 `<system-reminder>` 块；
   以 `<system-reminder>` / `<local-command-*>` / `<task-notification>` / `<bash-*>` 开头的、`isMeta`、`isCompactSummary` 都不算人话
   （09-15 抽样：`system-reminder` 是 `isMeta:false` 的字符串，`local-command-caveat` 才是 `isMeta:true`，所以不能只看 isMeta）。
+  另有两类纯文本注入也不算：Stop hook 拦停时回灌的「Stop hook feedback:」、压缩后续接的「This session is being continued」摘要；
+  IDE 扩展的 `<ide_opened_file>` / `<ide_selection>` 标签常和人打的字混在一条消息里，只剥标签不整条排除（这三条照 agentsview，
+  [调研](third-party/open-source-survey.md)；本机语料上有多少这次没量成，命令被安全检查拦了）。
   合成的 assistant 记录（model `<synthetic>`：No response requested.、额度用尽、API 报错）不算回复，找被打断的回复时越过它，也不计用量（照 Pilot）。
+- **被打断的回复要拼回整条。** 同一条模型回复会拆成几条记录（thinking / text / tool_use 各一条，共用 `message.id`）：本机 24048 条回复里七成拆成 ≥2 条。
+  离打断最近的那条常是 tool_use，第一版只取它，回复的文字就丢了——本机 243 次打断只发出 22 条被打断的回复，拼回之后是 97 条（09-15）。
+  现在把本轮里同一 `message.id`、不晚于最近那条的记录拼起来，工具调用合在一起、按 id 去重。文字不能简单接：有 ≥2 段文字的 212 条里
+  210 条是逐步变长的快照（后一段以前一段开头），2 条是互不包含的几段——所以快照留完整的、互不包含的才接起来。
+  对照：Pilot 按 `message.id` 合并但多段只留最长一段（丢那 2 条的短段）；teamai 知道会拆（测试注释写明）但只在用量上处理，
+  Stop 时只取末尾 10 KB 里最后一条带文字的记录（同样丢，还可能在窗口外）。
 - **斜杠命令算人的动作。** `<command-name>` 开头的 user 记录是人敲的，规范成「/model claude-opus-5」这样的一句发 `message.user`，
   标 `vibetrail.slash_command`，**不结束等待**——之后打的字照样作为下一句发出。本机分歧之后人的第一个动作：打字 255、/model 13、/compact 4。
   Pilot 识别 `<command-name>` 是为了统计 skill，我们拿来补判责上下文；teamai 不认。
-- **`turn.end(interrupted)` 的 usage** = 本轮 assistant 记录按 `message.id` 去重后求和（同一 id 的 4 条记录 usage 相同；缺 message.id 时
-  退到 `requestId`，照 teamai；本机没有缺 id 的记录，纯防御）：
+- **`turn.end(interrupted)` 的 usage** = 本轮 assistant 记录按 `message.id` 去重后求和（缺 message.id 时退到 `requestId`，照 teamai；
+  本机没有缺 id 的记录）。同一 id 留 output 最大的那份，照 ccusage（它说早期流式记录可能是占位值）；本机 24243 条消息里同一 id 各记录的用量
+  全部一致，取第一份、最后一份、最大那份结果相同，所以这条也是纯防御。Pilot 取最后一份，teamai 取第一份：
   input = `input_tokens` + `cache_creation_input_tokens`，cached = `cache_read_input_tokens`，reasoning = `thinking_tokens`，total = 三者之和。
   vcs 只有 branch——transcript 里没有 HEAD，hook 侧补。Stop 路径的 `turn.end` 用同一定义。
 - **哨兵（G6）。** 被拒记录的 `toolUseResult` 是字符串 `User rejected tool use`（或 `Error: Permission to use …` 原文），与正文判据是两个独立字段；
