@@ -31,6 +31,8 @@ vibetrail init（每台机器一次）
 
 ## 演示：安装 → 采集 → 看本地文件
 
+简明步骤与数据路径见 [DEMO.md](DEMO.md)。
+
 先在沙箱里看一遍（临时目录，不碰真实的 `~/.claude` 与 `~/.vibetrail`；回放一段示例会话，第 1 轮中途真的提交一次）：
 
 ```bash
@@ -53,7 +55,7 @@ bash tools/vibetrail init
 - `vibetrail doctor` 自检；`vibetrail uninstall` 卸载（只去掉 settings 里自己的条目，spool 留着，`--purge` 才全删）。
 - 什么时候出现什么：说一句话就有 `turn.start`（带 HEAD）；模型答完（Stop）后，这一轮的 `turn.end`（状态、用量、本轮 commit）与分歧事件一起落盘。
   答完的标记是 Claude Code 自己写的 `stop_hook_summary`；别的 Stop hook 把这次 Stop 拦下时，等它补完、真正结束再写（DESIGN D7）。
-  你按停止打断的轮，在工具运行中打断时当场写，在模型输出文字时打断要等下一个 hook（打断没有自己的 hook）。
+  你按停止打断的轮要等下一个 hook 才写（打断没有 hook，desktop 实测）；打断正在跑的工具现在会被记成「拒绝」，见 OPEN-ISSUES K7。
 
 ## 状态
 
@@ -74,6 +76,7 @@ push 与五个补充回归场景按用户 09-15 的要求往后放。G7 之前�
 - [spec/trace-v1.md](spec/trace-v1.md)：审计记录线的格式（仍在仓内，去向暂不定）。
 - [OPEN-ISSUES.md](OPEN-ISSUES.md)：唯一的未完成项清单——未定决策、已知缺陷、未量。
 - [TODO.md](TODO.md)：拆解（G7）与下一项需求的方案（G11）。
+- [DEMO.md](DEMO.md)：演示——怎么装、采到的数据在哪、怎么看。
 - [third-party/](third-party/)：teamai、LoongSuite Pilot、paas-coding-hook 协议的分析与实跑样例。
 
 ## 边界

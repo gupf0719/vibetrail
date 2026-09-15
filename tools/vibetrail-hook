@@ -12,8 +12,8 @@
 #   SessionEnd          发 session.end（reason）→ 解析并关掉最后一轮
 #   PostToolUseFailure / PermissionDenied / StopFailure / Notification / InstructionsLoaded / CwdChanged
 #                       只记事件头，发 ext.claude.<事件名>（不带正文，D5）；StopFailure 另记进本轮，关轮时 status 取 error。
-#                       PostToolUseFailure 的 is_interrupt 为 true＝人在工具运行中打断（打断没有自己的 hook，Stop 也不来）：等打断记录落盘后
-#                       当场解析，turn.end(interrupted) 不必等下一轮。Notification 的 idle_prompt（CLI 交互界面空闲时发，desktop 大概率不发）也解析一次
+#                       PostToolUseFailure 带 is_interrupt 时等打断记录落盘后当场解析（二进制里工具抛中止错误时置 true；desktop 按停止实测不触发，
+#                       打断没有自己的 hook，打断收尾的轮等下一个 hook）。Notification 的 idle_prompt（CLI 交互界面空闲时发，desktop 实测不发）也解析一次
 #
 # SessionStart / UserPromptSubmit / SessionEnd 是同步 hook：读完 stdin 就把活丢到脱离的后台进程里，自己立刻退出——
 # 不让人等，也不受 SessionEnd 1.5 s 的预算限制（后台进程在 -p 与 desktop 关会话时活不活没实测，丢了由下一次 SessionStart 补做兜底）。
