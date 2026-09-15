@@ -342,6 +342,9 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
   [采集清单](third-party/loongsuite-pilot-collection.md)、[实跑样例](third-party/loongsuite-pilot-collection-sample.md)。
 - **paas-coding-hook 事件协议 1.0**：云端已定（D5）。第二版采纳了第一轮全部意见（拒绝进 `permission.decision`、子 agent 挂父会话、`provenance` + `rule_version`、
   `agent.version`、`ext.*`）；第二轮意见（gzip、失败 event_id、SDK 上限、可见性、跨仓路径、`client.name`）见 [意见](third-party/paas-coding-hook-protocol-feedback.md)。映射见 §4.1。
+- **其他开源项目**（2026-09-15 调研，未在本机复核）：靠谱稳定的只有 ccusage 与 agentsview。可借的四条——offset 信任检查（同一文件、没变短、
+  前一段哈希不变）、同一消息的用量留大的那份、人话排除清单多三类前缀、上传的退避与永久失败记账；回放副本、打断与拒绝的判定没有比我们好的。
+  [open-source-survey.md](third-party/open-source-survey.md)。
 - **同一段示例会话过一遍 Pilot 与 teamai 各记下了什么**：[teamai 实跑](third-party/teamai-cli-collection-sample.md)、
   [Pilot 实跑](third-party/loongsuite-pilot-collection-sample.md)、[Pilot 原始输出](third-party/loongsuite-pilot-collection-output.md)。
 

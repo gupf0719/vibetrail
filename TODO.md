@@ -30,6 +30,9 @@
   Stop 先等 transcript 写稳；文件变短时清 state 从 0 重读；子 agent 按 `<sid>/subagents/` 目录扫；spool 改成块文件（DESIGN §3.3）。
   回归 `tools/test-hook-flow.sh` 21 项：scenario 回放 + 未登记零写入、重复触发、锁、半行、回放副本、子 agent、重写、补做别的会话、scope=user；
   两个变异（去掉会话锁、ids 去重换回 `NR == FNR`）都被抓到。
+- [ ] 借鉴开源调研（09-15，[third-party/open-source-survey.md](third-party/open-source-survey.md)，不照抄）：state 多记 inode 与 checkpoint 前一小段的哈希，
+  对不上从 0 重读（照 agentsview 的思路、只哈希一小段）；同一 message.id 的用量留 output 大的那份（照 ccusage）；人话排除清单补「This session is being continued」
+  「Stop hook feedback:」、IDE 标签三类前缀（照 agentsview，先在本机语料上核有多少、会不会误伤）。push 的退避与永久失败记账随 push 一项做。
 - [ ] 轮次元数据一路：每轮 `turn.start` / `turn.end`（status、usage、vcs）、`InstructionsLoaded` 只记路径与 sha；不传 transcript 原文件、不传非分歧正文（D5）；先做 Claude Code。
 - [ ] commit ↔ session 推导：每轮起止 HEAD + `rev-list`（DESIGN §3.5）；`vibetrail show` 按 commit 查改走它。
 - [ ] push：`vibetrail push [--list | --show]`，端点与 token 从 `~/.vibetrail/config` 读、没配不发；配了按协议打批（≤ 100 条 / 16 MiB）、每条先过 schema、`event_id` 幂等、accepted + duplicate 推进水位并删本机块、失败重发；
