@@ -424,7 +424,7 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
 - **补采按仓记**（加多选时查出的缺陷）：SessionStart / sync 的补采扫所有登记过的仓，却一直用本次 hook 所在仓的 project / workspace / spool 目录——
   登记两个仓，别的仓的会话就记到这个仓名下。现在每个仓按它自己的算。已经删掉的 desktop worktree 留下的会话目录也扫，归主仓。
 - **写 settings 的两道保险**：09-15 23:55 我新写的 test-hook-flow 第 16 段跑 `init` 时漏设 `VIBETRAIL_CLAUDE_SETTINGS`，把用户真实 settings 里
-  14 条 hook 命令写成了测试临时目录（随后被删），本机采集断了约 15 分钟，重跑真实 init 恢复，恢复时存下的那份坏备份挪进了废纸篓。
+  14 条 hook 命令写成了测试临时目录（随后被删），23:55 写坏、23:56:33 重跑真实 init 恢复——一分多钟，其间没有人话进来；恢复时存下的那份坏备份挪进了废纸篓。
   现在 `init` 在「运行时在临时目录、settings 却不在」时拒绝写；写完自检（JSON 对象、每条 hook 命令指向的脚本都在），不对就用这次的备份还原。
   test-hook-flow 全局导出 `VIBETRAIL_CLAUDE_SETTINGS`，末尾核对真实 settings 的校验和没变。回归：第 13、16 段。
 

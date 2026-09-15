@@ -261,6 +261,9 @@ check "在 git 仓里跑 init：不登记任何仓（免得在哪个目录跑一
 mkdir -p "$IS2/.vibetrail/removed/old-x" "$IS2/.vibetrail/removed/new-y"; perl -e 'utime(time - 2*86400, time - 2*86400, $ARGV[0])' "$IS2/.vibetrail/removed/old-x"
 check "projects remove --drop 挪出去的数据留一天：两天前的清掉，刚挪进去的留着" \
     'VIBETRAIL_HOME=$IS2/.vibetrail VIBETRAIL_CLAUDE_SETTINGS=$IS2/.claude/settings.json bash "$SELF/vibetrail" projects list >/dev/null 2>&1; [ ! -e "$IS2/.vibetrail/removed/old-x" ] && [ -d "$IS2/.vibetrail/removed/new-y" ]'
+IS3=$T/init-home3; mkdir -p "$IS3/.claude"
+check "全新机器（原来没有 settings.json）：init 说新建了一份，不说「备份在」（没有可备份的）" \
+    'out=$( cd "$REPO" && VIBETRAIL_HOME=$IS3/.vibetrail VIBETRAIL_CLAUDE_SETTINGS=$IS3/.claude/settings.json bash "$SELF/vibetrail" init 2>&1 ); printf "%s" "$out" | grep -q "新建了一份" && ! printf "%s" "$out" | grep -q "备份在"'
 mkdir -p "$T/g/home/.claude"; printf '{"model": "opus"}\n' > "$T/g/home/.claude/settings.json"; g0=$(cksum < "$T/g/home/.claude/settings.json")
 check "运行时在临时目录、settings 不在（模拟测试漏设 VIBETRAIL_CLAUDE_SETTINGS）：init 拒绝写，settings 一字不动" \
     '! ( cd "$REPO" && VIBETRAIL_HOME=$T/g/tmpvt VIBETRAIL_CLAUDE_SETTINGS=$T/g/home/.claude/settings.json VIBETRAIL_TMP_ROOTS=$T/g/tmpvt bash "$SELF/vibetrail" init --no-register --no-pick >/dev/null 2>&1 ) && [ "$(cksum < "$T/g/home/.claude/settings.json")" = "$g0" ]'
