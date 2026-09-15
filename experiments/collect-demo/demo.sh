@@ -6,9 +6,9 @@
 # 1. 在沙箱里建一个 git 仓当被观测项目，在仓里跑 vibetrail init（写沙箱的 settings.json、登记本仓）
 # 2. 按 scenario.json 回放一段会话：往沙箱的 transcript 追加记录；轮到 hook 时，用沙箱 settings.json 里 init 真实写下的那条命令去跑，
 #    stdin 给 Claude Code 同样形状的 payload（prompt_id 取当轮的 promptId）。第 1 轮中途在仓里真的提交一次，演示 commit ↔ 轮次。
-#    每次 Stop 之前照 Claude Code 的顺序先写一条 stop_hook_summary（它跑完 Stop hook 就写，是「模型答完」的标记，DESIGN D7）。
-#    会话结束前再加一轮：第一次 Stop 被别的 Stop hook 拦下（先写拦停反馈、再写 summary），模型补完再 Stop——这一轮只出一条 turn.end，带两次提交
-# 3. vibetrail list / show / doctor，最后列出 spool 目录与被观测仓的 git status（零写入）
+#    每次 Stop 之后再写一条 stop_hook_summary：Claude Code 的「答完」标记，desktop 要等下一句人话才把它落盘（09-15 核过），所以 turn.end 不等它，Stop 时就发（DESIGN D7）。
+#    会话结束前再加一轮：第一次 Stop 被别的 Stop hook 拦下（拦停反馈先落盘），模型补完再 Stop——这一轮只出一条 turn.end，带两次提交
+# 3. vibetrail list / show / doctor，最后列出 spool 目录与被观测仓的 git status（零写入），再用 report.sh 生成一份 markdown 报告
 # 跑完沙箱留着，想翻原始文件就进去看；不想留就 rm -rf 它。
 # 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
 # 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
@@ -79,15 +79,15 @@ while IFS= read -r step; do
         # 别的 Stop hook 拦下：拦停反馈先写，summary 后写（2.1.266 的顺序），模型在同一个 promptId 下接着干
         append '{"type":"attachment","uuid":"b4-h1","parentUuid":"b4-a2","attachment":{"type":"hook_blocking_error","hookName":"Stop","hookEvent":"Stop","blockingError":{"blockingError":"缺审计记录，先补一条再结束","command":"check-audit-stop.sh"}}}'
         append '{"type":"user","uuid":"b4-u3","parentUuid":"b4-h1","promptId":"prompt-4","isMeta":true,"message":{"role":"user","content":"Stop hook feedback:\n缺审计记录，先补一条再结束"}}'
-        summary "缺审计记录，先补一条再结束"
         fire Stop '{"prompt_id":"prompt-4","stop_hook_active":false}'
+        summary "缺审计记录，先补一条再结束"
         echo "     ↳ 第一次 Stop 被拦下之后：prompt-4 的 turn.end 有 $(cat "$VIBETRAIL_HOME"/spool/*/*/*.jsonl | jq -s '[.[] | select(.type == "turn.end" and .turn_id == "prompt-4")] | length') 条（应为 0）"
         append '{"type":"assistant","uuid":"b4-a3","parentUuid":"b4-u3","requestId":"rb3","message":{"id":"mb3","role":"assistant","model":"claude-opus-5","stop_reason":"tool_use","content":[{"type":"tool_use","id":"tb2","name":"Bash","input":{"command":"git commit -am \"audit: 补记录\""}}],"usage":{"input_tokens":80,"output_tokens":20}}}'
         ( cd "$REPO" && echo "audit ok" > AUDIT.md && git add AUDIT.md && git commit -q -m "audit: 补记录" && echo "     ↳ 仓里又提交了一次：$(git log -1 --format='%h %s')" )
         append '{"type":"user","uuid":"b4-u4","parentUuid":"b4-a3","promptId":"prompt-4","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tb2","content":"[main] audit: 补记录"}]}}'
         append '{"type":"assistant","uuid":"b4-a4","parentUuid":"b4-u4","requestId":"rb4","message":{"id":"mb4","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"审计记录补上了。"}],"usage":{"input_tokens":90,"output_tokens":10}}}'
-        summary ""
         fire Stop '{"prompt_id":"prompt-4","stop_hook_active":true}'
+        summary ""
         echo "     ↳ 第二次 Stop 之后：prompt-4 的 turn.end 有 $(cat "$VIBETRAIL_HOME"/spool/*/*/*.jsonl | jq -s '[.[] | select(.type == "turn.end" and .turn_id == "prompt-4")] | length') 条（应为 1）"
     fi
     if [ "$(printf '%s' "$step" | jq 'has("append")')" = true ]; then
@@ -105,11 +105,15 @@ while IFS= read -r step; do
     fi
     cmd=$(jq -r --arg ev "$ev" '.hooks[$ev][]?.hooks[]? | select(.command | contains("vibetrail-hook")) | .command' "$VIBETRAIL_CLAUDE_SETTINGS" | head -1)
     if [ -z "$cmd" ]; then printf '  %2d %-18s （没挂 vibetrail）\n' "$n" "$ev"; continue; fi
-    [ "$ev" = Stop ] && summary ""     # Claude Code 跑完 Stop hook 后写的「模型答完」标记（场景文件是 09-11 录的，那时还没这条）
+
     printf '%s' "$step" | jq -c --arg sid "$SID" --arg tp "$TR" --arg cwd "$REPO" \
         '.hook | .session_id = $sid | .transcript_path = $tp | .cwd = $cwd | if .prompt_id == null then del(.prompt_id) else . end' > "$D/payload.json"
     out=$(sh -c "$cmd" < "$D/payload.json" 2>&1); rc=$?
     printf '  %2d %-18s exit=%s stdout=%s  prompt_id=%s\n' "$n" "$ev" "$rc" "$( [ -z "$out" ] && echo 空 || echo "非空！" )" "$(jq -r '.prompt_id // "-"' "$D/payload.json")"
+    if [ "$ev" = Stop ]; then   # Stop hook 跑完才有的「答完」标记（desktop 等下一句人话才落盘；场景文件是 09-11 录的，那时还没这条）
+        summary ""
+        echo "     ↳ 这一轮的 turn.end：$(cat "$VIBETRAIL_HOME"/spool/*/*/*.jsonl | jq -s -r --arg p "$(jq -r .prompt_id "$D/payload.json")" '[.[] | select(.type == "turn.end" and .turn_id == $p)] | length') 条（Stop 时就写了，不等 summary）"
+    fi
 done < "$D/steps.jsonl"
 
 hr "3. 看采了什么"
@@ -120,6 +124,8 @@ hr "4. 自检"
 hr "5. 被观测仓里零写入（A8）"
 echo "git status --porcelain：$( [ -z "$(git -C "$REPO" status --porcelain)" ] && echo '空' || git -C "$REPO" status --porcelain)"
 echo "仓里的 .git/hooks：$(ls "$REPO/.git/hooks" | grep -v '\.sample$' | tr '\n' ' ')（只有 git 自带的 sample 就对了）"
+hr "6. markdown 报告（只供测试、演示）：每一轮的元数据 / 人机分歧 / commit ↔ 会话 三块分开"
+bash "$HERE/report.sh"
 echo
 echo "沙箱：$D"
 echo "  spool 文件：$VIBETRAIL_HOME/spool/   直接 cat 就能看，每行一条协议事件"

@@ -54,7 +54,7 @@ bash tools/vibetrail init
 - `vibetrail list` 列出 spool 里的每个块文件，文件在 `~/.vibetrail/spool/<项目>/<会话>/*.jsonl`，每行一条协议事件，直接 `cat` 就能看。
 - `vibetrail doctor` 自检；`vibetrail uninstall` 卸载（只去掉 settings 里自己的条目，spool 留着，`--purge` 才全删）。
 - 什么时候出现什么：说一句话就有 `turn.start`（带 HEAD）；模型答完（Stop）后，这一轮的 `turn.end`（状态、用量、本轮 commit）与分歧事件一起落盘。
-  答完的标记是 Claude Code 自己写的 `stop_hook_summary`；别的 Stop hook 把这次 Stop 拦下时，等它补完、真正结束再写（DESIGN D7）。
+  Stop hook 触发就是模型答完，当场写；别的 Stop hook 把这次 Stop 拦下时，模型补完再 Stop 会再写一条更新的（DESIGN D7）。
   你按停止打断的轮要等下一个 hook 才写（打断没有 hook，desktop 实测）；打断正在跑的工具现在会被记成「拒绝」，见 OPEN-ISSUES K7。
 
 ## 状态

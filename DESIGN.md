@@ -110,7 +110,7 @@ Pilot 的拦截器路线（[对比 §6.3](third-party/teamai-cli-vs-vibetrail.md
 |---|---|---|
 | `SessionStart` | 门控（按 scope，§5）→ 发 `session.start`（`source`、capabilities；model、git 状态进 extensions）→ **补做**：本仓（按 `git worktree list` 归属）所有 offset 落后于文件大小的 transcript，各补一次解析（分歧 + 轮次元数据）；同一会话 `resume`、别的会话空闲超过 `turn_idle_close`（默认 3600 s）时把它的最后一轮也关掉（D7）；然后 **push 全机待发、不看门槛**（只看退避期，§4；push 未做）。startup / resume / clear / compact 都触发，频率不低，是最靠得住的兜底：agent 崩溃、被杀、`-p` 模式下 Stop / SessionEnd 都不来，全靠这一步 | 同步 hook，但读完 stdin 就把门控、记录、补做全丢进脱离的后台进程，自己约 0.02 s 退出（09-15 实现时定：不让人等） |
 | `UserPromptSubmit` | 发 `turn.start`（`prompt_id` 作 turn_id、会话已知的 model、HEAD / 分支 / 脏否，提示来源 `source` 进 extensions），记轮起快照（§3.3 `turns/`）；上一轮没等到 Stop 的（打断、拒绝、崩溃），用此刻的快照给它补一份「止」（gap）。**不读 transcript**（U11，09-15 定）：这里解析的结果本来也不 push、云端看到的时间不变，同步 hook 却要让人等；Pilot、teamai 也都不在这里读 | 同上：丢后台、立刻退出；stdout 会进模型上下文，**必须为空** |
-| `Stop` | 记轮止快照与本轮 commit（§3.5；被别的 Stop hook 拦停后同一轮会再来一次 Stop，每次覆盖、`stops` 计次）→ **等 Claude Code 写下这次 Stop 的 `stop_hook_summary`**（别的同步 Stop hook 都跑完才写，最多 `stop_summary_wait` 秒，默认 20）→ 从本轮开头解析（§3.3）：分歧事件 + **本轮的 turn.end**——summary 之前没有拦停反馈就是模型答完了，当场关（D7）；被拦停就等下一条 summary → 落 spool，再**看门槛决定推不推**（D6，09-15 定，规则在 §4；push 未做）：全机最早待发事件超过 1 小时、或全机待发满 100 条，任一满足且不在退避期就推，推的是全机所有待发、不只本会话；都不满足就只落盘，本轮不发；端点未配置时只记账不发。同一会话一把 mkdir 锁（照 Pilot），已在跑就跳过，下一次 hook 补上；push 另持一把机器级锁（§4） | `async: true`：不阻塞、不计 timeout |
+| `Stop` | 记轮止快照与本轮 commit（§3.5；被别的 Stop hook 拦停后同一轮会再来一次 Stop，每次覆盖、`stops` 计次）→ 等 transcript 写稳 → 从本轮开头解析（§3.3）：分歧事件 + **本轮的 turn.end**——Stop 就是模型答完，当场关（D7；Claude Code 的答完标记 `stop_hook_summary` 要等下一句人话才落盘，不等它）；被别的 Stop hook 拦下时再来一次 Stop，再发一条更新的 → 落 spool，再**看门槛决定推不推**（D6，09-15 定，规则在 §4；push 未做）：全机最早待发事件超过 1 小时、或全机待发满 100 条，任一满足且不在退避期就推，推的是全机所有待发、不只本会话；都不满足就只落盘，本轮不发；端点未配置时只记账不发。同一会话一把 mkdir 锁（照 Pilot），已在跑就跳过，下一次 hook 补上；push 另持一把机器级锁（§4） | `async: true`：不阻塞、不计 timeout |
 | `SubagentStart` / `SubagentStop` | 发 `subagent.start` / `subagent.end`（`agent_id` 作实例 id、`agent_type`、父实例：一级是 `main`，被子 agent 派出的是 meta.json 的 `toolUseId` 所在的兄弟文件；`parent_call_id` 取 meta.json 的 `toolUseId`，09-15 实跑 SubagentStart 时 meta.json 已经在）；Stop 时再扫一遍 `subagents/` 目录——后台子 agent 在父 Stop 之后才结束 | 异步 |
 | `PostToolUseFailure` / `PermissionDenied` / `StopFailure` / `Notification`（`permission_prompt`、`idle_prompt`） | 只记事件头，发 `ext.claude.<事件名的 snake_case>`：`tool_use_id`、`tool_name`、`is_interrupt`、`reason`（≤ 1 KB）/ `error`（StopFailure 的错误类型）/ `notification_type`、时间。PostToolUseFailure 的 `error` 原文是工具输出，只记字节数（D5）。StopFailure 另记进本轮，关轮时 status 取 error。`is_interrupt` 为 true 时等打断记录落盘后当场解析（二进制里工具抛出中止错误的路径会置 true；desktop 里按停止**不走这条路**，实测没有触发，见 D7）。`idle_prompt` 不发事件，只补一次解析（CLI 交互界面空闲时发，desktop 实测不发）。类型化信号，见 §3.2 | 异步（09-15 实现时改：只记事件头，不必让工具调用等） |
 | `InstructionsLoaded` | 记 `file_path`、`memory_type`、`load_reason`、正文 sha256 与字节数；正文不传（D5，有必要再补） | 异步 |
@@ -240,7 +240,7 @@ flowchart LR
 | `classifier_blocked` | 同上，decided_by `policy` | 同上 |
 | `permission_infra_fail` | 同上，decision `error`，decided_by `system` | 同上 |
 | 子 agent 文件里的打断 | `subagent.end`，status `cancelled` | 父会话那条是 `turn.end`，两个事实，不去重（K1 关闭）；统计打断只数 `turn.end` |
-| 轮次 | `turn.start`（model、vcs）/ `turn.end`（status、usage、vcs、commits[]） | `turn.start`：UserPromptSubmit 当场发（provenance `hook`）；hook 没跑的轮由映射层按 promptId 补位（同一 event_id，先写的留下）。`turn.end`：**模型答完就发**（D7）——`stop_hook_summary` 之前没有拦停反馈即关（`closed_by` = `stop`）；拒绝后停下的在 for-tool-use 打断处关（`denied`）；打断的由分歧一路发 `interrupted`；没有标记的退到兜底：下一轮开始、会话结束（`session_end`）、同会话恢复（`resume`）、空闲超过 `turn_idle_close`（`idle`）。status：summary / hook 记到的 Stop / 最后一条回复 `end_turn` 是 `completed` / `success`，`preventedContinuation` 是 `hook_stopped` / `cancellation`，拒绝是 `denied` / `denial`，只有 StopFailure 是 `<错误类型>` / `error`，没有证据是 `unknown` / `unknown`；依据记在 `vibetrail.end_evidence`。usage 与打断同一定义（§4.2）；vcs、commits 取 hook 快照（Stop 优先，其次 gap）；打断的 turn.end 也补上这两样 |
+| 轮次 | `turn.start`（model、vcs）/ `turn.end`（status、usage、vcs、commits[]） | `turn.start`：UserPromptSubmit 当场发（provenance `hook`）；hook 没跑的轮由映射层按 promptId 补位（同一 event_id，先写的留下）。`turn.end`：**模型答完就发**（D7）——Stop hook 当场关（`closed_by` = `stop`），被拦下后再 Stop 时补发一条 `stops` 更大的；重读到 `stop_hook_summary` 且之前没有拦停反馈也关（`summary`）；拒绝后停下的在 for-tool-use 打断处关（`denied`）；打断的由分歧一路发 `interrupted`；没有标记的退到兜底：下一轮开始、会话结束（`session_end`）、同会话恢复（`resume`）、空闲超过 `turn_idle_close`（`idle`）。status：summary / hook 记到的 Stop / 最后一条回复 `end_turn` 是 `completed` / `success`，`preventedContinuation` 是 `hook_stopped` / `cancellation`，拒绝是 `denied` / `denial`，只有 StopFailure 是 `<错误类型>` / `error`，没有证据是 `unknown` / `unknown`；依据记在 `vibetrail.end_evidence`。usage 与打断同一定义（§4.2）；vcs、commits 取 hook 快照（Stop 优先，其次 gap）；打断的 turn.end 也补上这两样 |
 | 会话、子 agent | `session.start`（source、capabilities）/ `session.end`（reason、status）/ `subagent.start`（agent_type、父实例、`parent_call_id`）/ `subagent.end` | hook payload 直接给。capabilities 暂填我们会发的事件类型清单、session.end 的 status 填 `completed` / `success`、reason 按 code 规范化——都是自定义取值，接 collector 前确认（U13） |
 | hook 事件头 | `ext.claude.<事件名的 snake_case>`（如 `ext.claude.post_tool_use_failure`），provenance `hook` + `source_event` | `InstructionsLoaded` 只带路径、sha256 与字节数；PostToolUseFailure 的错误原文是工具输出，只带字节数 |
 
@@ -308,7 +308,7 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
   所以 turn.start / turn.end / 分歧事件的 turn_id 都对得上。只有 user 记录带 promptId（assistant、attachment、system 都不带），它们归当前轮。
   下次起读的 checkpoint 再退到还没关的那一轮的开头，关轮时用量才完整；fixtures 每个切点「前段 ∪ 从 checkpoint 起的后段 == 全量」在切轮打开时同样成立
   （09-15 临时跑过；test-map.sh 的 golden 只钉分歧，调用时带 `--no-turns`）。本机 3.3 MB 的真会话 15 轮，turn.start / turn.end 各 15 条，0.2 s。
-  关轮点（D7）：`stop_hook_summary` 前没有拦停反馈（`hook_blocking_error` / `hook_additional_context` 附件、「Stop hook feedback:」meta 人话）；拒绝的 for-tool-use 打断记录；
+  关轮点（D7）：Stop hook（`--close-last stop`）；`stop_hook_summary` 前没有拦停反馈（`hook_blocking_error` / `hook_additional_context` 附件、「Stop hook feedback:」meta 人话）；拒绝的 for-tool-use 打断记录；
   兜底时看最后一条回复的 `stop_reason`。本机 10 份真 transcript、30 个切点增量等价逐条一致（关轮点改到 summary 之后重跑）。
 - **人话里的 system-reminder**（09-15）。desktop 会把 `<system-reminder>…</system-reminder>` 和人打的字塞进同一个字符串——worktree 会话的第一句人话
   就是 `"<system-reminder>…</system-reminder>\n\npull main"`（本机实测），原先整条当注入。现在只剥完整的 reminder 块，剥完还有字就是人话；fixtures 与 golden 无变化。
@@ -407,7 +407,7 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
 
 ## 7. 决策记录
 
-### D7 — turn.end 在模型答完的那一刻写：认 Claude Code 自己写的 stop_hook_summary（2026-09-15，现行）
+### D7 — turn.end 在模型答完的那一刻写：Stop 时当场关轮，被别的 Stop hook 拦下时补发更新的一条（2026-09-15，现行）
 
 用户原话，按时间：「turn不是等模型完全回复完用户这个提问就算结束了吗」「模型完全回答完应该会有标记的吧。它不可能等下一个turn开始才知道结束」
 「按之前的设计会有一个问题，如果用户隔了很久才问新问题，那最后一个turn你会一直不push」「那排查的时候就会缺失最后一个turn」。
@@ -417,29 +417,34 @@ Claude 在同一个 promptId 下接着干活、再来一次 Stop（`stop_hook_ac
 用户指出的问题成立：用户隔很久才问下一句，最后一轮就一直缺着。
 
 **标记在哪**（2.1.266 二进制与本机语料核过）：Claude Code 内部会写 `system/turn_duration`，但它不落盘，本机 10 份 transcript 一条都没有；落盘的是
-`system/stop_hook_summary`——每次 Stop 跑完 hook 就写一条（`hookCount`、`hookErrors`、`hookAdditionalContext`、`preventedContinuation`）。
-被拦停时，拦停反馈（attachment `hook_blocking_error` / `hook_additional_context`，以及回灌给模型的 isMeta 人话「Stop hook feedback:\n<原因>」）
-写在这条 summary **之前**。本机真会话 15 轮：正常结束的 12 轮最后一条都是它，被打断、被拒绝停下的轮没有它（这两种 Stop 本来就不触发）。
+`system/stop_hook_summary`——每次 Stop 跑完 hook 生成一条（`hookCount`、`hookErrors`、`hookAdditionalContext`、`preventedContinuation`，异步 hook 也列在 `hookInfos` 里）。
+**但 desktop 要等下一句人话进来才把它写进文件**：本机三个版本（2.1.85 / 2.1.260 / 2.1.266）的全部会话里，每条 summary 都紧挨在下一句人话之前落盘，
+它自己的时间戳比前一条 queue-operation 还早。当天第二版按「读到 summary 就关」做，真实环境一跑，上一轮的 turn.end 照样拖到下一轮才出，被这条实测推翻。
+实时收到「模型答完了」的只有 Stop hook 本身。
 
 **定了什么**：
 
-- 映射层读到 `stop_hook_summary`、而它和上一条模型回复之间没有拦停反馈，这一轮当场关（`closed_by` = `stop`，status completed；`preventedContinuation` 为 true 是 `hook_stopped`）；
-  有拦停反馈就等下一条 summary。Stop hook 先等这条 summary 落盘（最多 `stop_summary_wait` 秒，默认 20，异步不卡人）再解析，所以 turn.end 在 Stop 时就写出。
+- Stop hook 解析时带 `--close-last stop --stop-turn <这次 Stop 的 prompt_id>`，读到文件末尾就把这一轮关掉（`closed_by` = `stop`，依据 `hook_stop`，status completed），
+  vcs 与 commits 取这次 Stop 的快照。只关这次 Stop 的那一轮，且它有过模型回复（`/model` 这类本地命令之后也会来一次 Stop，那一轮不关）。
+- 别的 Stop hook 拦下这次 Stop 时，同一轮会再来一次 Stop（`stop_hook_active` 为 true）：那次再发一条 turn.end，`_key` 带 `|stopN`、event_id 不同，
+  commits 与用量都从本轮开头累计，读的一方同一 turn_id 取 `vibetrail.stops` 最大的那条。拦停反馈（`hook_blocking_error` / `hook_additional_context` 附件、
+  「Stop hook feedback:」meta 人话）已经落盘时，第一次 Stop 就不关，只出一条。teamai 也是「后到的覆盖先到的」，只是它的单位是会话累计快照。
+- 之后重读到 summary、它前面没有拦停反馈时同样会关（`closed_by` = `summary`，与 Stop 时发的同一个 event_id，被 hook 按 id 拦下）——没装 hook 时的历史会话靠这条补齐。
 - 拒绝后停下的轮在 for-tool-use 打断记录处当场关（denied）；被打断的轮由分歧一路发 turn.end(interrupted)。
 - **打断没有自己的 hook**：33 个 hook 事件里没有「打断」，Stop 在打断时不来。二进制里工具抛出中止错误时 PostToolUseFailure 会带 `is_interrupt: true`，挂上了、收到就当场解析；
-  但09-15 在 desktop 2.1.266 里请用户按停止实测（本会话、项目级探针记下每个 hook 的原始 payload）：`sleep 120` 跑到第 52 秒时按停止，**没有任何 hook 触发**（PostToolUseFailure 没来、Stop 没来），停下后空闲两分钟也没有 `idle_prompt`；transcript 里写的是一条合成的工具结果——正文「The user doesn't want to proceed with this tool use…」、`toolUseResult`「User rejected tool use」、`toolDenialKind`「user-rejected」——再加「[Request interrupted by user for tool use]」，与拒绝权限一模一样（二进制里 `createSyntheticErrorMessage` 对 user_interrupted 就写这一套），所以现在被记成 permission.decision（人拒）+ turn.end(denied)，见 OPEN-ISSUES K7。Notification 的 `idle_prompt`（「Claude is waiting for your input」）由交互界面的空闲计时器发，也挂上，CLI 下发了就补一次解析。
+  但 09-15 在 desktop 2.1.266 里请用户按停止实测，**没有任何 hook 触发**，停下后空闲两分钟也没有 `idle_prompt`，而且打断正在跑的工具被写成了与拒绝一样的记录（OPEN-ISSUES K7）。
   所以打断收尾的那一轮，turn.end 要等下一个 hook（通常是人回来说的下一句之后的 Stop，或下一次开会话的补做）。
-- 兜底照旧：没有这些标记的轮，在下一轮开始、会话结束、同会话恢复、空闲超过 `turn_idle_close` 的补做时关。关轮时没有 summary 与 hook 的 Stop、但最后一条模型回复
-  `stop_reason` 是 `end_turn` 的，也记 completed（`vibetrail.end_evidence` 注明依据：stop_hook_summary / hook_stop / end_turn / stop_failure / denial / none）——
-  本机见过一次：模型答完了，会话紧接着被关，summary 没写。SessionStart 的补做扫所有登记过的仓，不只当前仓，人不回那个仓也能关掉。
+- 兜底照旧：没有这些标记的轮，在下一轮开始、会话结束、同会话恢复、空闲超过 `turn_idle_close` 的补做时关。关轮时没有 hook 的 Stop 与 summary、但最后一条模型回复
+  `stop_reason` 是 `end_turn` 的，也记 completed（`vibetrail.end_evidence` 注明依据：hook_stop / stop_hook_summary / end_turn / stop_failure / denial / none）。
+  SessionStart 的补做扫所有登记过的仓，不只当前仓，人不回那个仓也能关掉。
 
 **对照**（09-15 看的本机两个仓：teamai 6ae0619、Pilot 4e59a5bc）：两家都没处理 `stop_hook_active`。teamai 没有「一轮」的记录，每次 Stop 追加一条不带 prompt_id 的
 整份 transcript 累计快照，汇总时后到的覆盖先到的，所以同一轮多次 Stop 对它无害；它的打断、拒绝同样只在 Stop 时按字符串扫（`[Request interrupted by user`、
 两句拒绝文案），另有「Stop 后 60 秒内下一句含不对 / 错了 / 重来…」的纠正计数。Pilot 每次 Stop 当场导出上次读到之后的轮，轮 id 是会话 id 加递增序号：
 用它自己的解析器实测，被拦停后续上的一段成了单独的第 2 轮，而且把「Stop hook feedback」当成了这一轮用户说的话。
 
-验证：本机 10 份真 transcript、30 个切点，「前段 ∪ 从 checkpoint 起的后段 == 一次读全」逐条一致；demo.sh 加了一轮「第一次 Stop 被拦、补完再 Stop」，
-拦下时不出 turn.end，补完后只出一条、带两次提交、`stops` = 2。
+验证：本机 10 份真 transcript、30 个切点，「前段 ∪ 从 checkpoint 起的后段 == 一次读全」逐条一致；demo.sh 每轮在 Stop 之后才写 summary（照 desktop 的顺序），
+每轮的 turn.end 在 Stop 时就出；加的一轮「第一次 Stop 被拦、补完再 Stop」只出一条、带两次提交、`stops` = 2；拦停反馈没落盘时先出一条 `stops` = 1、第二次 Stop 再出一条 `stops` = 2（event_id 不同）。
 
 ### D6 — push 门槛：满 1 小时或 100 条才推，SessionEnd / SessionStart 兜底不看门槛（2026-09-15，现行）
 

@@ -65,7 +65,16 @@ bash tools/vibetrail init
 | 工具失败、权限弹框、CLAUDE.md 加载 | `ext.claude.*`，只有事件头 |
 | 会话结束 | `session.end` |
 
-## 5. 自检与卸载
+## 5. 生成一份 markdown 报告（只供测试、演示）
+
+```bash
+bash experiments/collect-demo/report.sh
+```
+
+把采到的事件分三块整理成 `~/.vibetrail/report.md`：每一轮的元数据（起止、用时、状态、token、HEAD 起止）、人机分歧（谁、对哪次调用、原文、之后人说了什么）、
+commit ↔ 会话（每个提交归到哪个会话哪一轮，提交说明现从本机 git 查）。`-o -` 打到终端，`--session <前缀>` 只看一个会话。这个脚本不装进产品，上线用不到。
+
+## 6. 自检与卸载
 
 ```bash
 ~/.vibetrail/bin/vibetrail doctor

@@ -61,7 +61,7 @@ full_map(){ bash "$SELF/vibetrail-map" "$TR" --no-turns --sid "$SID" --project-i
 echo "════ 0. 脚本里没有「变量名后直接跟非 ASCII 字符」，入口脚本都固定了 C locale ════"
 # macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟变量名的中文首字节算进变量名：变量名后紧跟「）」时，找的是「V 加上「）」的首字节」这个变量（用户 09-15 装机时踩到）。
 # 要把变量名用花括号包起来再接中文；入口脚本另在开头 export LC_ALL=C 兜底。.jq 文件不管：jq 的标识符只认 ASCII，不受 locale 影响
-SCRIPTS="$SELF/vibetrail $SELF/vibetrail-hook $SELF/vibetrail-lib.sh $SELF/vibetrail-map $SELF/test-map.sh $SELF/test-hook-flow.sh $SELF/test-extract.sh $SELF/../experiments/collect-demo/demo.sh"
+SCRIPTS="$SELF/vibetrail $SELF/vibetrail-hook $SELF/vibetrail-lib.sh $SELF/vibetrail-map $SELF/test-map.sh $SELF/test-hook-flow.sh $SELF/test-extract.sh $SELF/../experiments/collect-demo/demo.sh $SELF/../experiments/collect-demo/report.sh"
 bad_vars=$(perl -ne 'if (/\$[A-Za-z_][A-Za-z0-9_]*[\x80-\xff]/) { print "$ARGV:$.\n" } close ARGV if eof' $SCRIPTS)
 check "没有变量名后直接跟非 ASCII 的写法${bad_vars:+：$bad_vars}" '[ -z "$bad_vars" ]'
 no_c=$(for f in $SCRIPTS; do [ "$f" = "$SELF/vibetrail-lib.sh" ] || grep -q '^export LC_ALL=C$' "$f" || echo "$f"; done)

@@ -18,7 +18,9 @@
 #                      不给就当 {}（轮次事件照发，只是没有 HEAD、commit，status 多是 unknown）
 #   --no-turns         只出分歧事件，不切轮（默认切轮：主会话按 promptId 切，turn.start 补位、模型答完（stop_hook_summary 前没有拦停反馈）或拒绝停下时发 turn.end）；
 #                      分歧判据的回归 test-map.sh 用它，golden 只钉分歧那部分
-#   --close-last WHY   把文件里最后一轮也关掉（WHY = session_end / resume / idle，记进 vibetrail.closed_by）；默认不关：没有答完标记的轮等下一轮开始再关
+#   --close-last WHY   把文件里最后一轮也关掉（WHY = stop / session_end / resume / idle，记进 vibetrail.closed_by）；默认不关，等下一轮开始再关。
+#                      stop 要配 --stop-turn：只关这次 Stop 的那一轮，且它有过模型回复、没看到拦停反馈（Stop hook 用）
+#   --stop-turn ID     这次 Stop 的 prompt_id
 #   --ledger FILE  账本写到文件（默认写 stderr）：进出条数、反查方式、下次的 start / from 行、消费到的字节数
 #
 # 只读 transcript，不复制、不在它旁边写东西；产物只有 stdout 与账本。只解析到源文件最后一个换行符（源可能正在写半行）。
@@ -35,7 +37,7 @@ die(){ echo "✗ vibetrail-map: $*" >&2; exit 2; }
 isnum(){ case "$1" in ''|*[!0-9]*) return 1;; esac; }
 
 f=""; sid=""; start_line=1; start_byte=""; from_line=0; project_id=""; workspace_id=""; meta=""; parent=""; ledger=""; vt_version="$VT_RUNTIME_VERSION"
-seen_file=""; sources_out=""; hook_turns=""; close_last=""; turns=true
+seen_file=""; sources_out=""; hook_turns=""; close_last=""; turns=true; stop_turn=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --sid) sid=$2; shift 2;;
@@ -51,9 +53,10 @@ while [ $# -gt 0 ]; do
         --sources-out) sources_out=$2; shift 2;;
         --hook-turns) hook_turns=$2; shift 2;;
         --close-last) close_last=$2; shift 2;;
+        --stop-turn) stop_turn=$2; shift 2;;
         --no-turns) turns=false; shift;;
         --vt-version) vt_version=$2; shift 2;;
-        -h|--help) sed -n '2,27p' "$0"; exit 0;;
+        -h|--help) sed -n '2,29p' "$0"; exit 0;;
         -*) die "未知参数 $1";;
         *) [ -n "$f" ] && die "只接受一个 transcript"; f=$1; shift;;
     esac
@@ -62,7 +65,7 @@ done
 [ -f "$f" ] || die "文件不存在: $f"
 isnum "$from_line" || die "--from-line 要是非负整数"
 isnum "$start_line" && [ "$start_line" -ge 1 ] || die "--start-line 要是正整数"
-case "$close_last" in ''|session_end|resume|idle) ;; *) die "--close-last 只认 session_end / resume / idle";; esac
+case "$close_last" in ''|stop|session_end|resume|idle) ;; *) die "--close-last 只认 stop / session_end / resume / idle";; esac
 [ -z "$start_byte" ] || isnum "$start_byte" || die "--start-byte 要是非负整数"
 
 # ---- sid / meta：从路径推 ----
@@ -127,7 +130,7 @@ fi
 tail -c +$((start_byte + 1)) "$f" | head -c $((consumed - start_byte)) | $JQ -n -c -L "$SELF" \
     --arg sid "$sid" --arg project_id "$project_id" --arg workspace_id "$workspace_id" --arg parent_instance "$parent" \
     --argjson start_line "$start_line" --argjson from_line "$from_line" --argjson meta "$meta_json" --slurpfile seen_uuids "$tmp.seen" \
-    --slurpfile hook_turns "$tmp.turns" --arg close_last "$close_last" --argjson turns "$turns" \
+    --slurpfile hook_turns "$tmp.turns" --arg close_last "$close_last" --arg stop_turn "$stop_turn" --argjson turns "$turns" \
     --arg vt_version "$vt_version" --arg rule_version "diverge-v1" \
     -f "$SELF/map-events.jq" > "$tmp" 2>"$tmp.err"
 rc=$?

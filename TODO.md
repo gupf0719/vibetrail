@@ -44,9 +44,10 @@
     `test-hook-flow.sh` 25 项，含换 inode、原地改开头、什么都没变三个场景，去掉哈希的变异被抓到
   - push 的退避与永久失败记账随 push 一项做（D6 已写进 DESIGN §4）。
 - [x] 轮次元数据（09-15）：`turn.start`（hook 当场发；hook 没跑的轮由映射层按 promptId 补位）、`turn.end`（映射层按 promptId 切轮，**模型答完就发**：
-  认 Claude Code 自己写的 `stop_hook_summary`，之前没有拦停反馈即答完；拒绝停下在拒绝处发；打断的由分歧一路发（打断没有 hook，desktop 实测按停止什么 hook 都不来，要等下一个 hook）；
+  Stop hook 当场关轮，被别的 Stop hook 拦下后再 Stop 时补发一条 `stops` 更大的（Claude Code 的答完标记 `stop_hook_summary` desktop 要等下一句人话才落盘，09-15 真实环境实测，不能等它）；拒绝停下在拒绝处发；打断的由分歧一路发（打断没有 hook，desktop 实测按停止什么 hook 都不来，要等下一个 hook）；
   没有标记的退到下一轮开始 / 会话结束 / 空闲补做，补做扫所有登记的仓）、`InstructionsLoaded` 只记路径、sha256、字节数。上午第一版是「等轮确定结束才发」，
-  用户指出「如果用户隔了很久才问新问题，那最后一个turn你会一直不push」「排查的时候就会缺失最后一个turn」，下午改成现在这样（DESIGN D7）。
+  用户指出「如果用户隔了很久才问新问题，那最后一个turn你会一直不push」「排查的时候就会缺失最后一个turn」，下午先改成认 stop_hook_summary，
+  装到真实环境后发现它晚一轮才落盘，再改成 Stop 时当场关（DESIGN D7）。演示用的 markdown 报告 `experiments/collect-demo/report.sh`（三块：轮次元数据 / 人机分歧 / commit ↔ 会话，上线用不到）。
   hook 的 prompt_id 与记录的 promptId 是同一个值（探针实测）。本机 10 份真 transcript 30 个切点增量等价逐条一致；demo.sh 加了一轮「第一次 Stop 被拦、补完再 Stop」。
   09-15 请用户按停止实测：没有任何 hook、没有 `idle_prompt`；按停止打断正在跑的工具被记成拒绝（OPEN-ISSUES K7，区分方案待定）。
 - [x] commit ↔ 轮次推导（09-15）：轮起 / 轮止快照（`state/<sid>/turns/`），本轮 commit = `rev-list 起..止` + 本轮 reflog 里新建的提交，归因看 transcript 里 agent 有没有跑

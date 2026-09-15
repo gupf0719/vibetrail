@@ -5,9 +5,9 @@
 #                       同会话 resume、别的会话空闲超过 turn_idle_close（默认 1 小时）时把最后一轮也关掉
 #   UserPromptSubmit    发 turn.start（turn_id = prompt_id、model、HEAD / 分支 / 脏否），记轮起快照；上一轮没等到 Stop 的补一份「止」快照。
 #                       不读 transcript（U11）
-#   Stop                记轮止快照与本轮 commit（轮起 HEAD..现在 + reflog，DESIGN §3.5）→ 等 Claude Code 写下这次 Stop 的 stop_hook_summary
-#                       （别的同步 Stop hook 都跑完才写，最多 stop_summary_wait 秒）→ 从本轮开头解析主文件与 subagents/ 下全部文件：
-#                       分歧事件 + 本轮的 turn.end（summary 前没有拦停反馈就是答完了，DESIGN D7）（配 async: true）
+#   Stop                记轮止快照与本轮 commit（轮起 HEAD..现在 + reflog，DESIGN §3.5）→ 等 transcript 写稳 → 从本轮开头解析主文件与
+#                       subagents/ 下全部文件：分歧事件 + **本轮的 turn.end**（Stop 就是模型答完，DESIGN D7；Claude Code 自己的答完标记
+#                       stop_hook_summary 要等下一句人话才落盘，不能等它）。被别的 Stop hook 拦下后同一轮再来一次 Stop，再发一条更新后的 turn.end（配 async: true）
 #   SubagentStart/Stop  发 subagent.start / subagent.end（实例 = agent_id，父实例与派生调用取 meta.json）；Stop 时再扫一遍子 agent 文件
 #   SessionEnd          发 session.end（reason）→ 解析并关掉最后一轮
 #   PostToolUseFailure / PermissionDenied / StopFailure / Notification / InstructionsLoaded / CwdChanged
@@ -144,8 +144,8 @@ turn_fail(){ # StopFailure：API 错误结束了这一轮
 }
 
 # ---- 一份 transcript 文件：从 checkpoint 起映射 → 去重 → 写一块 spool → 推进 state ----
-process_file(){ # process_file <sid> <state 目录> <文件> <名> [close_last]
-    local sid=$1 sd=$2 f=$3 name=$4 close=${5:-} st="$2/$4.json" seen="$2/$4.seen"
+process_file(){ # process_file <sid> <state 目录> <文件> <名> [close_last] [stop_turn]
+    local sid=$1 sd=$2 f=$3 name=$4 close=${5:-} stop_turn=${6:-} st="$2/$4.json" seen="$2/$4.seen"
     local size lines=0 consumed=0 ckl=1 ckb=0 fp_old="" rewrites=0 ino tmp rc fp open closed
     local extra_args=()
     size=$(wc -c < "$f" 2>/dev/null | tr -d ' ') || return 0
@@ -171,6 +171,7 @@ process_file(){ # process_file <sid> <state 目录> <文件> <名> [close_last]
         vt_hook_turns "$sid" > "$tmp/turns"
         extra_args=(--hook-turns "$tmp/turns")
         [ -n "$close" ] && extra_args+=(--close-last "$close")
+        [ -n "$stop_turn" ] && extra_args+=(--stop-turn "$stop_turn")
     fi
     # bash 3.2 + set -u：空数组展开会报 unbound，写成 ${a[@]+"${a[@]}"}
     bash "$SELF/vibetrail-map" "$f" --sid "$sid" --project-id "$project" --workspace-id "$workspace" \
@@ -194,30 +195,15 @@ process_file(){ # process_file <sid> <state 目录> <文件> <名> [close_last]
     rm -rf "$tmp"
 }
 
-process_session(){ # process_session <sid> <主 transcript> [close_last]
-    local sid=$1 main_t=$2 close=${3:-} sd="$VT_HOME/state/$1" f
+process_session(){ # process_session <sid> <主 transcript> [close_last] [stop_turn]
+    local sid=$1 main_t=$2 close=${3:-} stop_turn=${4:-} sd="$VT_HOME/state/$1" f
     mkdir -p "$sd" || return 0
     vt_lock "$sd" || return 0                                      # 同一会话已在跑：跳过，下一次 hook 补上
-    [ -f "$main_t" ] && process_file "$sid" "$sd" "$main_t" main "$close"
+    [ -f "$main_t" ] && process_file "$sid" "$sd" "$main_t" main "$close" "$stop_turn"
     for f in "$(dirname "$main_t")/$sid/subagents"/agent-*.jsonl; do
         [ -f "$f" ] && process_file "$sid" "$sd" "$f" "$(basename "$f" .jsonl)"
     done
     vt_unlock "$sd"
-}
-
-tail_types(){ # tail_types <transcript>：末尾几十条完整记录的 "type:subtype"，一行一条（半行、超长行被截断的都丢掉）
-    tail -c 262144 "$1" 2>/dev/null | tail -n 40 | "$JQ" -R -r 'fromjson? | select(type == "object") | (.type // "") + ":" + (.subtype // "")' 2>/dev/null
-}
-
-wait_turn_end(){ # Stop 之后等「模型答完」的标记：最后一条 assistant 之后出现 stop_hook_summary（别的同步 Stop hook 都跑完才写）
-    # 找到就返回 0；等满 stop_summary_wait 秒（默认 20，异步 hook 不卡人）还没有就返回 1，解析照做，这一轮留给兜底去关
-    [ "${VIBETRAIL_STABLE_WAIT:-1}" = "0" ] && return 0
-    local max i; max=$(vt_conf stop_summary_wait 20); i=0
-    while [ "$i" -lt $((max * 5)) ]; do
-        tail_types "$1" | awk -F: '$1 == "assistant" { a = NR } $2 == "stop_hook_summary" { s = NR } END { exit !(s > a) }' && return 0
-        sleep 0.2; i=$((i + 1))
-    done
-    return 1
 }
 
 wait_interrupt_record(){ # 工具运行中被打断：等 transcript 里出现打断记录（它在 PostToolUseFailure 之后才写），最多 5 s
@@ -279,7 +265,7 @@ run(){ # 门控通过之后按事件干活
             turn_start ;;
         Stop|stop)
             turn_stop
-            [ -f "$tpath" ] && { wait_turn_end "$tpath" || wait_stable "$tpath"; process_session "$sid" "$tpath"; } ;;
+            [ -f "$tpath" ] && { wait_stable "$tpath"; process_session "$sid" "$tpath" stop "$prompt_id"; } ;;
         SubagentStart|subagent-start)
             [ -n "$agent_id" ] && emit_hook SubagentStart null "$(extra_subagent)" ;;
         SubagentStop|subagent-stop)

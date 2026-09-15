@@ -5,7 +5,7 @@
 #   jq -n -c -L tools --arg sid … --arg project_id … --arg workspace_id … --arg parent_instance main \
 #         --argjson start_line S --argjson from_line N --argjson meta <子 agent 的 meta.json 或 null> \
 #         --slurpfile seen_uuids <前几次记下的 [uuid, 行号] 数组> --slurpfile hook_turns <hook 记的轮次证据> \
-#         --argjson turns <true|false> --arg close_last <""|session_end|resume|idle> \
+#         --argjson turns <true|false> --arg close_last <""|stop|session_end|resume|idle> --arg stop_turn <Stop 的 prompt_id> \
 #         --arg vt_version … --arg rule_version diverge-v1 -f map-events.jq < 从第 S 行起的 transcript
 # 输出：每行一个协议事件（event_id 为 null、多一个 _key，由 vibetrail-map 算 UUIDv5 后填上并删掉 _key），
 #      最后一行 {"_ledger": …} 账本（进出条数、反查方式、跳过的记录、下次的起读行 checkpoint_line）。
@@ -31,11 +31,14 @@
 # 轮次元数据（DESIGN §3.1、§4.1，09-15 加；与分歧同一条事件流，$turns 默认 true，只有分歧判据的回归传 false）：
 #      主会话文件按 promptId 切轮——hook 的 prompt_id 与记录的 promptId 是同一个值
 #      （09-15 本机探针实测），轮中插话不换 promptId。每轮开头发 turn.start（hook 已经发过的同 event_id 在写 spool 前被拦下，
-#      这里是 hook 没跑时的补位）。**turn.end 在模型答完的那一刻发**（DESIGN D7，09-15 按用户意见改）：Claude Code 每次 Stop 跑完 hook 都写一条
-#      system/stop_hook_summary；别的 Stop hook 拦停时，拦停反馈（attachment hook_blocking_error、hook_additional_context，或 isMeta 的
-#      「Stop hook feedback:」人话）写在这条 summary **之前**，模型随后在同一个 promptId 下接着干。所以：读到 summary、而它和上一条模型回复之间
-#      没有拦停反馈，这一轮就结束了（closed_by = stop）；有反馈就等下一条 summary。拒绝后停下的轮在 for-tool-use 打断记录处关（denied）；
-#      被打断的轮由分歧一路发 turn.end(interrupted)。没有这些标记时退到兜底：下一轮开始、或 $close_last（会话结束 / 恢复 / 空闲）。
+#      这里是 hook 没跑时的补位）。**turn.end 在模型答完的那一刻发**（DESIGN D7，09-15 按用户意见改）：Stop hook 解析时带 $close_last = stop
+#      与 $stop_turn = 这次 Stop 的 prompt_id，读到文件末尾就把这一轮关掉——Claude Code 自己的答完标记 system/stop_hook_summary 虽然也有，
+#      但 desktop 要等下一句人话进来才把它写进文件（09-15 本机三个版本、全部会话核过），等它就晚一轮。别的 Stop hook 拦停时同一轮会再来一次 Stop：
+#      那次再发一条 turn.end，_key 带 |stopN（event_id 不同），commits 与用量都从本轮开头累计，同一 turn_id 取 vibetrail.stops 最大的那条。
+#      拦停反馈（attachment hook_blocking_error、hook_additional_context，或 isMeta 的「Stop hook feedback:」人话）已经落盘时，这次 Stop 不关。
+#      之后重读到 summary、它前面没有拦停反馈时也会关（closed_by = summary，与 Stop 时发的同一个 event_id，被 hook 按 id 拦下）。
+#      拒绝后停下的轮在 for-tool-use 打断记录处关（denied）；被打断的轮由分歧一路发 turn.end(interrupted)。没有这些标记时退到兜底：
+#      下一轮开始、或 $close_last（会话结束 / 恢复 / 空闲）。只跑了本地命令（/model 之类，没有模型回复）的轮不在 Stop 时关。
 #      status：summary 或 hook 记到的 Stop 是 completed；summary 里 preventedContinuation 是 hook_stopped；只有 StopFailure 是 error；
 #      什么证据都没有是 unknown。vcs / commits 来自 $hook_turns（Stop 时 hook 按轮起 HEAD 算好的，DESIGN §3.5）；
 #      用量是本轮 assistant 记录按 message.id 去重求和（与打断同一定义）。子 agent 文件不切轮：子 agent 的起止由 SubagentStart / SubagentStop hook 发。
@@ -205,8 +208,9 @@ def mainRec($r): ($r.isSidechain != true) and ($r.agentId == null);
 
 # ---------- 轮次元数据：开轮 / 关轮 / 累计（DESIGN §3.1、§4.1） ----------
 def openTurn($s):
-  .pturn = {id: $s.promptId, line: $s.ln, last_ts: $s.ts, usage: {}, model: null,
-            interrupted: false, denied: false, git_commit: false, closed: false, end_turn: false, stop_blocked: false, summary: null}
+  .pturn = {id: $s.promptId, line: $s.ln, last_ts: $s.ts, usage: {}, model: null, answered: false,
+            interrupted: false, denied: false, git_commit: false, closed: false, end_turn: false, stop_blocked: false,
+            block_pending: false, summary: null}
   | (if $s.ln > $from_line then .ledger.turns.started += 1 else . end)
   | hookTurn($s.promptId) as $h | vcsMerge(.branch; $h.start.vcs) as $vcs
   | emit( base($s; "turn.start"; $s.uuid; $s.ts; {id: $s.promptId, inferred: false})
@@ -221,7 +225,7 @@ def closeTurn($how; $s; $eof):
     | ($eof or .ln > $from_line) as $new
     # 结束的依据按强弱排：stop_hook_summary（Claude Code 自己写的答完标记）> hook 记到的 Stop > 最后一条模型回复 stop_reason 是 end_turn
     # （模型自己说完了，但 Stop hook 的判定没落盘，比如会话紧接着被关掉，09-15 本机语料里见过）
-    | (if $pt.summary != null then "stop_hook_summary" elif $stop != null then "hook_stop"
+    | (if $how == "stop" and $stop != null then "hook_stop" elif $pt.summary != null then "stop_hook_summary" elif $stop != null then "hook_stop"
      elif $h.fail != null then "stop_failure" elif $pt.end_turn then "end_turn" else "none" end) as $evidence
     | (if $pt.denied then {code: "denied", category: "denial", detail: "turn stopped by a permission denial"}
        elif $pt.summary.prevented == true then {code: "hook_stopped", category: "cancellation", detail: (($pt.summary.reason // "") | .[0:4096])}
@@ -241,7 +245,8 @@ def closeTurn($how; $s; $eof):
           else . end)
        | .extensions += ({"vibetrail.closed_by": $how, "vibetrail.end_evidence": (if $pt.denied then "denial" else $evidence end),
                           "vibetrail.stops": ($stop.stops // 0)} + opt("vibetrail.dirty_files"; $end.vcs.dirty_files))
-       | ._key = ($pt.id + "|turn.end")) as $e
+       # 被别的 Stop hook 拦停、同一轮第 N 次 Stop 时发的那条换一个 event_id（|stopN），读的一方同一 turn_id 取 vibetrail.stops 最大的
+       | ._key = ($pt.id + "|turn.end" + (if (($stop.stops // 0) > 1) then "|stop" + ($stop.stops | tostring) else "" end))) as $e
     | (if $eof then emitAlways($e) else emit($e) end)
     | (if $new then .ledger.turns.ended[$status.code] += 1 else . end)
     | .pturn.closed = true
@@ -376,16 +381,17 @@ def stopFeedback($r; $s):
 # 模型答完的标记：Claude Code 跑完这次 Stop 的 hook 写的 stop_hook_summary。前面没有拦停痕迹就当场关轮
 def turnStopMarker($r; $s):
   if .pturn != null and (.pturn.closed | not) and mainRec($r) and $r.type == "system" and $r.subtype == "stop_hook_summary"
-  then if (.pturn.stop_blocked // false) then .pturn.stop_blocked = false
+  then if (.pturn.stop_blocked // false) then .pturn.stop_blocked = false | .pturn.block_pending = true   # 这次 Stop 被拦下，模型要接着干
        else .pturn.summary = {uuid: $s.uuid, ts: $s.ts, prevented: ($r.preventedContinuation == true), reason: ($r.stopReason // "")}
-            | closeTurn("stop"; $s; false) end
+            | closeTurn("summary"; $s; false) end
   else . end;
 
 def turnAccumulate($r; $s):
   if .pturn == null or (mainRec($r) | not) then .
   else .pturn.last_ts = ($s.ts // .pturn.last_ts)
     | (if $s.type == "assistant" and ($s.synthetic | not)
-       then .pturn.stop_blocked = false | .pturn.end_turn = (($r.message | if type == "object" then .stop_reason else null end) == "end_turn")
+       then .pturn.stop_blocked = false | .pturn.block_pending = false | .pturn.answered = true
+            | .pturn.end_turn = (($r.message | if type == "object" then .stop_reason else null end) == "end_turn")
        else . end)
     | (if stopFeedback($r; $s) then .pturn.stop_blocked = true else . end)
     | (if $s.type == "assistant" and $s.usage != null and ($s.synthetic | not)
@@ -439,7 +445,11 @@ def checkpoint: turnStart as $ts
 # 文件末尾：$close_last 非空（会话结束 / 恢复 / 空闲）就把最后一轮也关掉
 def atEof:
   .out = []
-  | if $close_last != "" and .pturn != null then closeTurn($close_last; {agent: null, uuid: null, ts: null}; true) else . end;
+  | if $close_last == "" or .pturn == null then .
+    elif $close_last == "stop" then   # Stop hook：这次 Stop 的那一轮、有过模型回复、没看到拦停反馈，就当场关
+      (if .pturn.id == $stop_turn and .pturn.answered and (.pturn.block_pending | not) and (.pturn.stop_blocked | not)
+       then closeTurn("stop"; {agent: null, uuid: null, ts: null}; true) else . end)
+    else closeTurn($close_last; {agent: null, uuid: null, ts: null}; true) end;
 
 foreach (inputs, {"__vibetrail_eof__": true}) as $r (init;
   if $r == {"__vibetrail_eof__": true} then atEof else step($r) end;
