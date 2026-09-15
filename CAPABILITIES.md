@@ -15,8 +15,10 @@
 
 | 功能 | 状态 | 实现 |
 |---|---|---|
-| 人机分歧判据 | ✅ 已实现，755 会话实测精确率 100% | `tools/extract-diverge.jq`，规范 [spec/diverge-v1.md](spec/diverge-v1.md) |
-| 判据回归 | ✅ | `tools/fixtures.jsonl` + `tools/test-extract.sh`（26 条正负例，比对整条输出并查 jq 报错） |
+| 人机分歧判据 | ✅ 已实现，755 会话实测精确率 100% | `tools/diverge-rules.jq`（jq 模块）+ 入口 `tools/extract-diverge.jq`（调用要带 `-L tools`），规范 [spec/diverge-v1.md](spec/diverge-v1.md) |
+| 判据回归 | ✅ | `tools/fixtures.jsonl` + `tools/test-extract.sh`（27 条正负例，比对整条输出并查 jq 报错） |
+| 协议映射（分歧一路） | ✅ 2026-09-15 | `tools/map-events.jq`（include 判据模块）+ `tools/vibetrail-map`（`event_id` UUIDv5、账本、只读到最后一个换行）；五类 kind → `permission.decision` / `turn.end(interrupted)` / `subagent.end(cancelled)`，带被拒调用的 `tool.request`、被打断的回复、之后人的下一句；规则 [DESIGN §4.2](DESIGN.md) |
+| 映射回归 | ✅ | `tools/test-map.sh`：8 份 fixtures（`tools/fixtures-map/`，golden 在 `expect/`）+ scenario 回放；断言 + golden + 每条过协议 schema（`tools/schema-check.py`，python3 + jsonschema，只在测试用）+ A2 对账（提取器命中数 == 事件数）+ 每个切点的增量等价 + 半行 + 幂等，89 项 |
 | hook 机制探针 | ✅ | `experiments/hook-probe.sh`（DESIGN §6.1 的实证来源） |
 | 采集回放样本 | ✅ | `experiments/collect-demo/scenario.json`：同一段示例会话，Pilot / teamai 实跑样例就是用它截的；G7 的回归输入 |
 
@@ -27,12 +29,12 @@
 | `vibetrail init` / `uninstall` | ❌ | 机器级装一次：`~/.vibetrail/bin`、HOME settings 条目（带 marker）、scope 配置、登记；DESIGN §5 |
 | hook 分发入口 `vibetrail-hook <事件>` | ❌ | 读 stdin、按 scope 门控、发 session / turn / subagent 起止事件与 `ext.claude.*` 事件头，写 `events.jsonl`；DESIGN §3.1、§4.1 |
 | 增量解析 | ❌ | 每个 transcript 文件一个 byte offset、截到最后一个换行、子 agent 按目录扫、原子写；不复制文件；DESIGN §3.3 |
-| 分歧提取挂 hook + 协议映射 | ❌ | 现有 jq 在 UserPromptSubmit / Stop / SessionEnd / SessionStart 补做时跑；命中映射成 `permission.decision` / `turn.end(interrupted)` / `subagent.end(cancelled)`，`tool_name` / `input` 按 `tool_use_id` 反查（G5）；DESIGN §4.1 |
+| 分歧提取挂 hook | ❌ | `vibetrail-map` 在 UserPromptSubmit / Stop / SessionEnd / SessionStart 补做时跑，按行号门控（DESIGN §4.2）；子 agent 按目录扫；`vibetrail-sync` 退役。大文件的同步代价先定 U11 |
 | commit ↔ session 推导 | ❌ | 每轮起止 HEAD + `rev-list`；DESIGN §3.5 |
 | `vibetrail push [--list \| --show]` | ❌ | 端点没配不发；配了按协议打批、每条过 schema、`event_id` 幂等、ack 即删；DESIGN §4 |
 | doctor 扩展 | 🔁 | 现有 `tools/vibetrail-doctor` 查的是退役的 git hook 与仓内 vendor，要改成 DESIGN §5 的自检项 |
 | 本地预览 | 🔁 | 现有 `tools/vibetrail`（show / log / session / diverge）读仓内 `sessions/` 与 `Claude-Session` trailer，两者都退役；只留 push 前预览（`push --list / --show`），读取与分析不归本项目（D5） |
-| 完整性钉子 | ❌ | 每类记录条数进出相等、映射后事件全部过 schema、超 1 MiB 被拒计数、未知类型 / 事件名告警（G10、G6） |
+| 完整性钉子 | 🔁 | 映射后事件全部过 schema、每类命中数 == 事件数已在 `test-map.sh` 钉住（测试期）；运行时的条数进出、超 1 MiB 被拒计数、未知类型 / 事件名告警待做（G10、G6） |
 
 ### 退役（2026-09-14，D4；代码在 G7 落地时删）
 
@@ -69,7 +71,7 @@
 
 ### 2.2 回归保护
 
-`tools/test-extract.sh` 跑 26 条正负例，比对的是**整条输出**（含 `human` 与全部字段名），不只比 kind——否则 `human` 翻转、字段名漂移都抓不到
+`tools/test-extract.sh` 跑 27 条正负例，比对的是**整条输出**（含 `human` 与全部字段名），不只比 kind——否则 `human` 翻转、字段名漂移都抓不到
 （实测变异全绿）。判据依赖英文消息串、Claude Code 改文案即静默失效，**这个测试是唯一的哨兵**。
 
 它检查两件事：判定结果是否符合预期，**以及 jq 是否报错**。后者是补上去的——jq 在某条规则上抛错时，该记录之后的规则不再求值、之前的命中照常输出，
@@ -82,8 +84,20 @@
 
 `experiments/collect-demo/scenario.json` 是一段编出来的示例会话的回放脚本，25 步：三轮对话、一次 Edit、一次被拒的 Bash、一次输出里带假密钥的 Bash、
 一次打断；没有子 agent。Pilot 与 teamai 的实跑样例
-（[third-party/](third-party/)）就是拿它喂出来的，同一份输入三家对比。G7 的回归要在它上面补：SessionStart 补做、打断后无 Stop、后台子 agent
-晚于父 Stop、一轮多 commit、端点未配置 / 配置后断网。
+（[third-party/](third-party/)）就是拿它喂出来的，同一份输入三家对比。映射层的回归已用它（`test-map.sh` 第 1 段：1 条拒绝 + 被拒命令 + 人的纠正）；
+hook 层的回归要在它上面补：SessionStart 补做、打断后无 Stop、后台子 agent 晚于父 Stop、一轮多 commit、端点未配置 / 配置后断网。
+
+### 2.4 协议映射
+
+`tools/map-events.jq` 把一份 transcript（主会话或子 agent 文件）一次读完，只对新的触发记录发协议 1.0 事件：`permission_denied` /
+`classifier_blocked` / `permission_infra_fail` → `permission.decision`（decided_by user / policy / system），并按 `tool_use_id` 反查被拒调用发
+`tool.request`；`interrupt` → `turn.end(interrupted)`（子 agent 文件里 → `subagent.end(cancelled)`），沿 `parentUuid` 回溯到被打断的回复发
+`message.assistant` / `tool.request`；分歧之后人的下一句发 `message.user`。`interrupt_for_tool_use` 吸收进同一轮的拒绝、不另发。
+`tools/vibetrail-map` 包一层：从路径推 sid 与 meta、只读到最后一个换行、算 UUIDv5 的 `event_id`、出账本（进出条数、反查来路、消费到的行号与字节）。
+
+两条经验：① `emit(base(…) | .payload = …)` 里管道之后的 `.` 已经是事件不是状态——状态里的值先绑成变量再用，第一次跑真语料就在这里炸；
+② 同一个 `tool_use` 会被两次分歧各派生一次（拒绝之后紧接打断），去重必须**不看门控**登记，否则分段扫比全量扫多一条——
+fixtures 里没有这个形态时变异测试恒绿，是 106 MB 真语料照出来的，补了 `denied-then-interrupt`。
 
 ## 3. 还缺什么
 

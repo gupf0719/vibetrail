@@ -1,6 +1,7 @@
 # vibetrail 设计：用 hook 把 Claude Code 会话的两路数据传上云
 
-> **状态**（2026-09-15）：需求与设计定稿，未开工。已实现且沿用的只有人机分歧判据（[spec/diverge-v1.md](spec/diverge-v1.md)）。
+> **状态**（2026-09-15）：需求与设计定稿；第 1 步「提取器扩展与协议映射」已做（`tools/map-events.jq` + `tools/vibetrail-map`，细则 §4.2），
+> hook 分发、安装、push 未开工。沿用的判据见 [spec/diverge-v1.md](spec/diverge-v1.md)。
 > 上一版设计（留痕数据投影进被观测仓、git hook 写 `Claude-Session` trailer）已于 2026-09-14 退役，见 §7 D4；仍在用的审计记录线见 §8。
 > 2026-09-15 D5：不传 transcript 原文件，正文只随人机分歧事件走，云端定为 paas-coding-hook 事件协议 1.0，索引保留 30 天够用。
 >
@@ -89,7 +90,7 @@ Claude Code 2.1.142–2.1.266，入口全是 claude-desktop），标出人类侧
 | 被拒与执行失败分不开 | 拒绝正文在 `is_error` 块里，判据在 diverge-v1 | 人拒 / 分类器拦 / 链路故障进 `permission.decision`（decided_by 区分），执行失败才是 `tool.end(failed)`；hook 侧另有类型化的 `PostToolUseFailure`（不含权限拒绝）与 `PermissionDenied`（只在 auto mode），见 §3.2 |
 | 被拒调用的输入（命令 / 编辑内容） | 前一条 assistant 记录的 `tool_use` 块，按 `tool_use_id` 反查 | 进被拒调用的 `tool.request.input`，同时得到 `tool_name`（G5 前置） |
 | Edit 的 `structuredPatch` / `originalFile`，Bash 的 `stdout` / `stderr` | `toolUseResult` | **不传**（非分歧正文） |
-| `uuid` / `promptId` / `requestId` | 有 | `event_id` 从记录 uuid 派生，`turn_id` = promptId；打断记录常没有 promptId，按位置推、provenance 标 inferred |
+| `uuid` / `promptId` / `requestId` | 有 | `event_id` 从记录 uuid 派生（§4.2），`turn_id` = promptId。打断记录也带 promptId（09-15 抽样 277 条全带，原以为「常没有」是错的）；缺失时按位置推、provenance 标 inferred，fixture 钉着 |
 | system prompt、CLAUDE.md 正文 | ≥ 2.1.258 有 `prompt_snapshot`；`InstructionsLoaded` hook 给路径 | **不传**；`InstructionsLoaded` 只记路径与 sha 的事件头。「有必要再补充」 |
 | **git 状态**（HEAD、工作树） | **没有** | hook 侧富化：UserPromptSubmit / Stop 各记一次 HEAD、分支、脏否，进 `turn.start` / `turn.end` 的 vcs；worktree 根与脏文件数放 extensions。逐次工具调用的工作树是 G11 的事 |
 
@@ -129,7 +130,8 @@ hook payload 里的 `tool_input` / `tool_response` 也不另存一份——trans
 
 ### 3.3 增量解析与本机 outbox
 
-- 每个 transcript 文件一个 byte offset，存 `~/.vibetrail/state/<sid>.json`；每次只解析到源文件**最后一个换行符**为止（源可能正在写半行）。不复制文件。
+- 每个 transcript 文件记消费到的 byte offset 与行号，存 `~/.vibetrail/state/<sid>.json`；每次只解析到源文件**最后一个换行符**为止（源可能正在写半行）。不复制文件。
+  映射层按行号门控、整文件重读（§4.2）：索引每次重建，只对新触发记录发事件。
 - 源文件长度 < offset 时从 0 重读（重写守卫）。transcript 目前是 append-only，但 `file-history-snapshot` 带 `isSnapshotUpdate` 字段，不能假设永远是。
 - 首次全读、无单次上限。Pilot 首次只读最后一轮、单次超过 50 MB 只读尾部，那份 111 MB 的会话前段整个丢掉，4 条拒绝没了。
 - 子 agent 文件按 `<sid>/subagents/` 目录扫，不只信 hook 递来的那一个路径——teamai 栽在这里，58% 的人拒在子 agent 文件里
@@ -194,8 +196,8 @@ flowchart LR
 
 | 我们的 | 协议事件 | 关键字段 |
 |---|---|---|
-| `interrupt` | `turn.end`，status code `interrupted` / category `cancellation` | `turn_id` 必填：打断记录常没有 promptId，按位置推、provenance 标 inferred。正文：被打断的那条 `message.assistant` 与打断后的 `message.user`（delivery `direct`）随同发 |
-| `interrupt_for_tool_use` + 配对的 `permission_denied`（计一次） | `permission.decision`，decision `deny`，decided_by `user` | `tool_name` 必填：`The user doesn't want to proceed` 形态里没有工具名，用 `is_error` 块的 `tool_use_id` 反查 `tool_use` 块的 `name`（G5 前置）。正文：同一次反查取 `input`，发一条 `tool.request`；拒绝原文放 `reason` |
+| `interrupt` | `turn.end`，status code `interrupted` / category `cancellation`，detail 是标记原文 | `turn_id` = promptId（打断记录带；缺失才按位置推、provenance 标 inferred）。正文：沿 `parentUuid` 回溯到最近的 assistant 记录——有 text 块发 `message.assistant`，有 `tool_use` 块发 `tool.request`（在跑的调用）；打断后人的下一句发 `message.user`（delivery `direct`）。payload 另带 model、本轮 usage、vcs.branch |
+| `permission_denied`（+ 伴随的 `interrupt_for_tool_use`，n:1，计一次） | `permission.decision`，decision `deny`，decided_by `user`，`permission_id` = `call_id` | `tool_name` 必填：`The user doesn't want to proceed` 形态里没有工具名，用 `is_error` 块的 `tool_use_id` 反查 `tool_use` 块的 `name`（G5 已关）→ 反查不到退 `Permission to use (\S+)` 捕获 → 再退 `unknown`，来路记 `extensions.vibetrail.tool_lookup`。正文：反查到的 `input` 发一条 `tool.request`；拒绝原文放 `reason`（≤ 4096）；拒绝后人的下一句也发 `message.user`（与打断同款——判责要的就是这一句，比 §2 多带一句）。for-tool-use 记录被吸收不另发；同一轮没有拒绝可配的按打断发、detail 标 unpaired |
 | `classifier_blocked` | 同上，decided_by `policy` | 同上 |
 | `permission_infra_fail` | 同上，decision `error`，decided_by `system` | 同上 |
 | 子 agent 文件里的打断 | `subagent.end`，status `cancelled` | 父会话那条是 `turn.end`，两个事实，不去重（K1 关闭）；统计打断只数 `turn.end` |
@@ -208,6 +210,34 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
 `target` / `read`，说「改了」要 `tool_result` 或 `before_after`；路径必须在工作区根内、不能 `..`（跨仓改动 K2 没有表达法）；`commits` 只能挂 `turn.end`、
 非空、完整 sha；`ext.*` 必带 `provenance.source_event`；thinking 不能当 assistant 文本。`client.name` 是 const `paas-coding-hook`，先照填（已提意见），vibetrail 自己的版本放 `extensions.vibetrail.version`；`policy_version` 填 `none-0` 表示暂不脱敏（两个默认值用户 09-15 认可）。
 `workspace_id` 取主 checkout（`git worktree list` 第一条），与 G8 的分区键一致，worktree 路径放 extensions。
+
+### 4.2 映射细则
+
+实现 `tools/map-events.jq`（include 判据模块 `diverge-rules.jq`），驱动 `tools/vibetrail-map`（填 `event_id`、出账本），
+回归 `tools/test-map.sh`（8 份 fixtures + scenario 回放；断言 + golden + schema + A2 对账 + 每个切点的增量等价）。
+
+- **触发与派生。** 每条分歧命中是一个触发记录；它派生出的事件（被拒调用的 `tool.request`、被打断的回复、之后人的下一句）
+  都挂在触发记录上：`extensions.vibetrail.trigger` / `vibetrail.after` 指回触发记录的 uuid，`vibetrail.kind` 记原始 kind，
+  `raw` 保留提取器的原始命中（A3 对账用），`provenance.source_event_id` 是事件自己来源记录的 uuid。
+- **增量按行号门控、整文件重读。** 每次从文件头读到最后一个换行符，只对**触发记录**行号 > 上次消费行号的分歧发事件；
+  索引（tool_use、`parentUuid` 链、当前轮）每次重建。派生事件按 `_key` 去重，**登记不看门控**——「先扫到一半、再扫全文」发出的
+  集合与一次扫全文相同（test-map.sh 对每个切点钉着；两种变异各被抓到一次）。账本记 `consumed_bytes` 与 `lines`。
+  代价：106 MB / 4.9 万行的 transcript 纯映射 10.5 s，5.8 MB 0.7 s（09-15，C02FM）——挂 UserPromptSubmit 前要定（U11）。
+- **`event_id`** = UUIDv5(固定命名空间 uuid5(NS_URL, "vibetrail"), "`<sid>|<记录 uuid>|<事件类型>|<限定符>`")，限定符是 `call_id` / kind；
+  同一输入重跑同一个 id，重发幂等靠它。SHA-1 用 `shasum` / `sha1sum`，不引入 python。
+- **`turn_id`** = 记录的 promptId；没有就取最近见到的 promptId，再没有就用记录 uuid，后两种 provenance.kind 标 `inferred`（带 `rule_version`）。
+  派生事件跟触发记录的轮次走。
+- **实例。** 主会话 `agent_instance_id` = `main`；子 agent 文件里 = `agentId`（每条记录都带），`parent_agent_instance_id` = `main`，
+  `parent_call_id` = 同名 `meta.json` 的 `toolUseId`，`agent_type` 取 `agentType`；`session_id` 都是父会话 id（文件名 / 上两级目录名）。
+  子 agent 文件里的 user 记录是父 agent 派活或注入，不算「人的下一句」。
+- **正文取法。** 回复正文 = text 块拼接（不含 thinking）；人话 = 字符串正文或 text 块，去掉 `<system-reminder>` 块；
+  以 `<system-reminder>` / `<local-command-*>` / `<command-name>` / `<task-notification>` / `<bash-*>` 开头的、`isMeta`、`isCompactSummary` 都不算人话
+  （09-15 抽样：`system-reminder` 是 `isMeta:false` 的字符串，`local-command-caveat` 才是 `isMeta:true`，所以不能只看 isMeta）。
+- **`turn.end(interrupted)` 的 usage** = 本轮 assistant 记录按 `message.id` 去重后求和（同一 id 的 4 条记录 usage 相同）：
+  input = `input_tokens` + `cache_creation_input_tokens`，cached = `cache_read_input_tokens`，reasoning = `thinking_tokens`，total = 三者之和。
+  vcs 只有 branch——transcript 里没有 HEAD，hook 侧补。Stop 路径的 `turn.end` 用同一定义。
+- **状态有上界**：tool_use 索引 500 条、记录链 400 条；分歧引用的永远是最近几条记录。多态字段一律先判 type（判据的铁律照用）。
+- **默认值**：`project_id` / `workspace_id` 没传就取 transcript 第一条记录的 `cwd`，hook 分发入口会传真值；`vibetrail.version` 先填 `0.2.0-dev`。
 
 ## 5. 安装与范围
 

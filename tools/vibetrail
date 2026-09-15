@@ -39,10 +39,10 @@ cmd_show(){
             echo "  transcript: $tp ($(du -h "$tp" | cut -f1))"
             echo
             echo "── 该会话的人机分歧 ──────────────────────────"
-            local n; n=$(jq -c -f "$JQF" "$tp" 2>/dev/null | wc -l | tr -d ' ')
+            local n; n=$(jq -c -L "$SELF" -f "$JQF" "$tp" 2>/dev/null | wc -l | tr -d ' ')
             if [ "$n" = "0" ]; then echo "  无"
             else
-                jq -c -f "$JQF" "$tp" 2>/dev/null \
+                jq -c -L "$SELF" -f "$JQF" "$tp" 2>/dev/null \
                   | jq -rc '"  \(.at[0:19])  \(if .human then "人" else "机" end)  \(.kind)"' | head -20
                 [ "$n" -gt 20 ] && echo "  … 共 $n 条"
             fi
@@ -105,7 +105,7 @@ cmd_session(){
     [ -z "$tp" ] && return 0
     echo
     echo "  人机分歧:"
-    jq -c -f "$JQF" "$tp" 2>/dev/null | jq -rc '"    \(.at[0:19])  \(if .human then "人" else "机" end)  \(.kind)"'
+    jq -c -L "$SELF" -f "$JQF" "$tp" 2>/dev/null | jq -rc '"    \(.at[0:19])  \(if .human then "人" else "机" end)  \(.kind)"'
 }
 
 cmd_diverge(){
@@ -114,7 +114,7 @@ cmd_diverge(){
     git log -"$n" --format='%(trailers:key=Claude-Session,valueonly,separator=)' 2>/dev/null \
       | grep . | sort -u | while read -r sid; do
             local tp; tp=$(tpath "$sid"); [ -z "$tp" ] && continue
-            jq -c -f "$JQF" "$tp" 2>/dev/null
+            jq -c -L "$SELF" -f "$JQF" "$tp" 2>/dev/null
         done | jq -rc 'select(.human) | .kind' | sort | uniq -c | sort -rn | sed 's/^/   /'
 }
 

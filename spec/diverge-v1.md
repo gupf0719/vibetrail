@@ -1,7 +1,10 @@
 # 人机分歧判据 v1
 
 > 从 transcript 里判定「人在哪一步不同意机器」的规则。**判据只在本文维护一份**：实现在
-> `tools/extract-diverge.jq`，正负例在 `tools/fixtures.jsonl`，由 `tools/test-extract.sh` 跑。
+> `tools/diverge-rules.jq`（jq 模块，只有函数定义），命令行入口 `tools/extract-diverge.jq`
+> （`jq -c -L tools -f tools/extract-diverge.jq <transcript>`，jq 1.6 按 cwd 找模块，`-L` 不能省），
+> 正负例在 `tools/fixtures.jsonl`，由 `tools/test-extract.sh` 跑。把命中映射成协议事件是它之后的一步
+> （`tools/map-events.jq`，规则见 [DESIGN.md §4.2](../DESIGN.md)），本文不管。
 > 本文原是 [trace-v1.md](trace-v1.md) §3，2026-09-14 随 G7 独立成文；仓内 `sessions/` 那个落点已退役
 > （[DESIGN.md D4](../DESIGN.md)），判据与实测数字不变。
 
@@ -19,13 +22,16 @@ SpecStory 只认 interrupt（一行前缀匹配），git-ai 与 claude-story 一
 
 ```json
 {"t":"diverge","kind":"interrupt","at":"…","turn":"<uuid>","human":true,"branch":"main","sid":"<sessionId>"}
+{"t":"diverge","kind":"permission_denied","at":"…","turn":"<uuid>","human":true,"branch":"main","sid":"<sessionId>","call_id":"toolu_…"}
 ```
 
 - `turn`：transcript 里那条消息的 `uuid`——**指针，不是内容**。transcript 在就能跳回去看上下文，不在就只剩「某时刻发生过一次中断」。
 - `human`：`true` 才计入人机分歧，`false` 是机器 / 基础设施行为。混在一起统计会让「人拒了多少次」被分类器和链路故障污染。
 - `branch`：事件发生时的 `gitBranch`，可选。
 - `sid`：所属会话，路由键。
-- `tool`（被拒的工具名）**尚未产出**；可从 `Permission to use (\S+)` 捕获，加上时属可选字段，不升版本（OPEN-ISSUES G5）。
+- `call_id`：三类 `is_error` kind 带，是命中块的 `tool_use_id`（块没带就是 null）。2026-09-15 起产出，可选字段，不升版本。
+  被拒工具的 `name` / `input` **不在本记录里**——映射层按 `call_id` 反查前面 assistant 记录的 `tool_use` 块
+  （OPEN-ISSUES G5 已关）；反查不到时退回 `Permission to use (\S+)` 捕获，再不行标 `unknown`，来路记在事件的 extensions 里。
 
 ## 2. `kind` 取值与判据
 
@@ -40,6 +46,10 @@ SpecStory 只认 interrupt（一行前缀匹配），git-ai 与 claude-story 一
 ⚠️ **两个 interrupt 变体必须分开，否则一次「拒绝工具调用」被记两条。** 实测全语料：`for tool use` 变体 **35** 次，
 而「同一会话同一秒同时命中 `permission_denied` 与 `interrupt`」也恰是 **35** 次——精确对上。两者是**同一个人类动作的两条记录**
 （turn uuid 不同）。统计「人机分歧总数」时，`interrupt_for_tool_use` 应与其配对的 `permission_denied` 计为一次。
+
+配对是 **n:1** 不是 1:1：并行发出的几个调用一起被拒时，`permission_denied` 各一条、`interrupt_for_tool_use` 只一条
+（2026-09-15 实测 3:1，for-tool-use 记录的 `parentUuid` 指向最后一条拒绝）。映射层把 for-tool-use 记录吸收进同一轮前面的拒绝、
+不另发事件；同一轮里没有拒绝可配的 for-tool-use（语料未见）按打断发、不丢。
 
 判据全部**只读 JSON 字段**，不 grep 整行原文。`interrupt` 只认 user 消息的 text 块或字符串正文，**不认** `tool_result` 块；
 其余三类**只认** `is_error == true` 的块正文（Claude Code 里只有 `tool_result` 块带 `is_error`，判据不另查 `type`）。原因见 §4。
@@ -103,6 +113,8 @@ G7 的 hook 事件流会记下它们的 `tool_use_id`，与本文的字符串判
    这条留给将来加规则的人。同理 `message.content[]` 的元素先过 `objects`，`.text` 缺失时用 `// ""` 兜底。
 5. **`is_error` 块的 `content` 可能是数组**（`[{"type":"text","text":…}]`）。直接 `tostring` 会以 `[` 开头，而 jq 的 `^` 在任何标志下都只匹配串首，
    锚定判据永远不命中。提取器先把数组展开成各段 text 再匹配。09-09 量过：1145 个 `is_error` 块全部字符串形态、数组形态 0 个，这条是纯防御。
+6. **`.message` 也是多态的。** 一律经 `msg`（`type=="object"` 才取）读 `content` / `id` / `usage`，别直接 `.message.content`——
+   `.message` 是字符串时抛错，后果同第 4 条。语料里未见非对象（09-15 抽 8 个文件），纯防御；fixture n11 钉着。
 
 回归测试比对的是**整条输出**（含 `human` 与全部字段名），不只比 kind；并且检查 jq 有没有报错——只比对输出抓不到「末尾规则抛错」（实测假绿）。
 
@@ -132,7 +144,7 @@ G7 的 hook 事件流会记下它们的 `tool_use_id`，与本文的字符串判
 ## 6. 稳定面与版本
 
 - `kind` 的取值集合可增补，不升版本；消费方遇到不认识的 kind **应保留并跳过，不得报错**。
-- 记录里的新增可选字段不升版本；消费方必须忽略不认识的字段。
+- 记录里的新增可选字段不升版本；消费方必须忽略不认识的字段。`call_id`（09-15 加）就是这样的字段，缺失当 null。
 - 字段名一旦发布就**不再改拼写**，哪怕拼错了（git-ai 的 `overriden_lines` 就是这样成了既成事实）。
 - 判据依赖英文消息串，Claude Code 改文案即**静默失效**。缓解只能是：判据集中在本文与提取器一处、配正负例回归、语料数字突变时当作信号
   而非当作事实；每次上游升级先查一遍有没有新增的类型化字段可以替换掉硬编码串（§2.2、OPEN-ISSUES G6）。
@@ -140,7 +152,8 @@ G7 的 hook 事件流会记下它们的 `tool_use_id`，与本文的字符串判
 ## 7. 已知不解决
 
 - 依赖英文串（上）。
-- transcript 丢失后 `turn` 指针悬空——G7 把原样副本传上云之后，这条才真正解掉。
+- transcript 丢失后 `turn` 指针悬空。D5 后不传原样副本，分歧事件自带判责用的最小正文（被拒调用的输入、被打断的回复、之后人的下一句），
+  指针只用于本机 30 天内与 transcript 对账。
 - 子 agent 与父会话的传播重复（13/277），去重见 OPEN-ISSUES K1。
 - 召回率绝对基线未测（OPEN-ISSUES M2）。
 - `userModified` 在别的客户端（提供「修改提案」能力的 IDE 扩展一类）会不会置真，超出本环境可验范围；本判据不依赖它。

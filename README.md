@@ -31,7 +31,8 @@ vibetrail init（每台机器一次）
 
 ## 状态
 
-2026-09-14 需求与设计定稿、09-15 定不传 transcript 原文件并选定云端协议（DESIGN D5），未开工。已有并沿用的是人机分歧判据（755 会话实测精确率 100%，裸 grep 只有 10.5%）。
+2026-09-14 需求与设计定稿、09-15 定不传 transcript 原文件并选定云端协议（DESIGN D5）；同日做完第 1 步：分歧命中映射成协议 1.0 事件
+（`tools/vibetrail-map`，回归 `tools/test-map.sh`），hook 分发、安装、push 未开工。已有并沿用的是人机分歧判据（755 会话实测精确率 100%，裸 grep 只有 10.5%）。
 上一版设计（留痕投影进被观测仓、git hook 写 trailer）已退役，理由与替代见 [DESIGN.md §7](DESIGN.md)。
 
 已实测确立的地基（`experiments/` 可复现）：Claude Code 的 hook 在 **desktop app 下正常触发且热加载**，stdin 直接给出 `transcript_path`；

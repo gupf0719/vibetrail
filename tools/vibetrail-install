@@ -54,7 +54,7 @@ echo "✓ .claude/trace/ 就绪"
 # 会 fail open —— 比没有闸门更糟。vendor 后仓库自给自足。
 # 版本漂移由 doctor 校验（同 hook 的做法），不靠人记得同步。
 VD=.claude/vibetrail; mkdir -p "$VD"
-VT_FILES="vibetrail vibetrail-audit vibetrail-sync vibetrail-doctor vibetrail-install prepare-commit-msg extract-diverge.jq"
+VT_FILES="vibetrail vibetrail-audit vibetrail-sync vibetrail-doctor vibetrail-install prepare-commit-msg extract-diverge.jq diverge-rules.jq"
 for f in $VT_FILES; do
     [ -f "$SELF_DIR/$f" ] || continue
     cp "$SELF_DIR/$f" "$VD/$f"

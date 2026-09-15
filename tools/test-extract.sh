@@ -16,8 +16,8 @@ while IFS= read -r line; do
     n=$((n+1))
     uuid=$(printf '%s' "$line" | jq -r '.uuid')
     want=$(printf '%s' "$line" | jq -S -c '._expect | select(. != null)')
-    err=$(printf '%s' "$line" | jq -c -f extract-diverge.jq 2>&1 >/dev/null)
-    got=$(printf '%s' "$line" | jq -c -f extract-diverge.jq 2>/dev/null | jq -S -c '.')
+    err=$(printf '%s' "$line" | jq -c -L . -f extract-diverge.jq 2>&1 >/dev/null)
+    got=$(printf '%s' "$line" | jq -c -L . -f extract-diverge.jq 2>/dev/null | jq -S -c '.')
     if [ -n "$err" ]; then
         printf '  ✗ %-6s jq 报错（该记录抛错点之后的规则全部丢失）: %s\n' "$uuid" "${err:0:60}"
         fail=$((fail+1))

@@ -1,0 +1,141 @@
+#!/bin/bash
+# 回归：协议映射（分歧一路）。钉四件事——
+#   1. 每份 fixture 的事件与 golden（fixtures-map/expect/<名>.jsonl）整条一致；关键字段另有显式断言，golden 漂了也说得出是哪一项
+#   2. 每条事件过协议 1.0 schema（schema-check.py，仓内原件）；event_id 唯一且两次运行一致
+#   3. A2 进出对账：提取器单独跑出的每类命中数 == 映射出的对应事件数（人拒 → decided_by user，分类器 → policy，
+#      链路 → system，打断 → turn.end / subagent.end，for-tool-use → 吸收 + 未配对）
+#   4. 增量等价：对每个切点 L，「前 L 行全量扫」∪「全文从 L 起扫」== 「全文全量扫」——派生事件跟触发记录走、去重不看门控，
+#      这两条不成立时这里会红
+# 用法：test-map.sh [--update]   --update 重新生成 golden（先看 diff 再提交）
+set -uo pipefail
+cd "$(dirname "$0")"; SELF=$PWD; FX=$SELF/fixtures-map
+T=$(mktemp -d "${TMPDIR:-/tmp}/vibetrail-test-map.XXXXXX"); trap 'rm -rf "$T"' EXIT
+update=0; [ "${1:-}" = "--update" ] && update=1
+fail=0; pass=0
+ok(){ pass=$((pass+1)); }
+ko(){ fail=$((fail+1)); printf '  ✗ %s\n' "$*"; }
+# 断言：jq 表达式对 events 文件（-s 整体）求值必须是 true
+check(){ local r; r=$(jq -s "$2" "$3" 2>&1); if [ "$r" = "true" ]; then ok; else ko "$1 （得到 $r）"; fi; }
+run(){ # run <名> <transcript> [额外参数…] → $T/<名>.events / .ledger；stderr 必须为空
+    local n=$1 f=$2; shift 2
+    bash "$SELF/vibetrail-map" "$f" --ledger "$T/$n.ledger" "$@" > "$T/$n.events" 2> "$T/$n.err" \
+        || { ko "$n: vibetrail-map 退出码非零: $(head -c 200 "$T/$n.err")"; return 1; }
+    [ -s "$T/$n.err" ] && ko "$n: stderr 非空: $(head -c 200 "$T/$n.err")"
+    return 0
+}
+sids(){ jq -r '.event_id' "$1" | sort; }
+
+echo "════ 1. scenario.json 回放（CAPABILITIES §2.3 那段示例会话）════"
+jq -c '.steps[] | select(.append) | .append' "$SELF/../experiments/collect-demo/scenario.json" > "$T/scenario.jsonl"
+if run scenario "$T/scenario.jsonl" --sid 11111111-2222-4333-8444-555555555555 --project-id demo --workspace-id /tmp/demo-proj; then
+    e=$T/scenario.events
+    check "scenario: 恰好 3 条事件" 'length == 3' "$e"
+    check "scenario: 被拒的 Bash 带原命令" '[.[] | select(.type=="tool.request")] | length == 1 and .[0].payload.tool_name == "Bash" and (.[0].payload.input.command | startswith("sed -i"))' "$e"
+    check "scenario: permission.decision 人拒、拒绝原文、call_id 对上" '[.[] | select(.type=="permission.decision")][0] | .payload.decided_by == "user" and .payload.decision == "deny" and .payload.call_id == "toolu_demo_bash_2" and (.payload.reason | startswith("The user doesn'"'"'t want to proceed"))' "$e"
+    check "scenario: 拒绝后人的下一句带上，指回拒绝与打断两条记录" '[.[] | select(.type=="message.user")][0] | .payload.text == "别改 add，那是故意留的" and .payload.author_type == "user" and (.extensions["vibetrail.after"] | length == 2) and .turn_id == "prompt-3"' "$e"
+    check "scenario: 会话 / 项目 / 工作区 id 照传入" 'all(.[]; .session_id == "11111111-2222-4333-8444-555555555555" and .project_id == "demo" and .workspace_id == "/tmp/demo-proj")' "$e"
+    check "scenario: for-tool-use 被吸收、不另发事件" '.[0]' <(jq -c '.absorbed_for_tool_use == 1 and .unpaired_for_tool_use == 0 and (.events["turn.end"] // 0) == 0' "$T/scenario.ledger")
+    python3 "$SELF/schema-check.py" < "$e" > "$T/schema.out" && ok || ko "scenario: $(cat "$T/schema.out")"
+fi
+
+echo "════ 2. fixtures：断言 + schema + golden ════"
+for f in "$FX"/*.jsonl "$FX"/fx-sub/subagents/agent-a1.jsonl; do
+    n=$(basename "$f" .jsonl)
+    run "$n" "$f" || continue
+    e=$T/$n.events; lg=$T/$n.ledger
+    python3 "$SELF/schema-check.py" < "$e" > "$T/schema.out" && ok || ko "$n: $(cat "$T/schema.out")"
+    # event_id 唯一、且是 v5 形状
+    check "$n: event_id 唯一且为 UUIDv5" '(map(.event_id) | length == (unique | length)) and all(.[]; .event_id | test("^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))' "$e"
+    # golden
+    g=$FX/expect/$n.jsonl; mkdir -p "$FX/expect"
+    jq -S -c . "$e" > "$T/$n.norm"
+    if [ $update -eq 1 ]; then cp "$T/$n.norm" "$g"; echo "  ↻ 已更新 $(basename "$g")"
+    elif [ ! -f "$g" ]; then ko "$n: 缺 golden $(basename "$g")（跑 --update 生成）"
+    elif ! cmp -s "$T/$n.norm" "$g"; then ko "$n: 与 golden 不一致："; diff "$g" "$T/$n.norm" | head -6 | sed 's/^/      /'
+    else ok; fi
+done
+
+# 逐份的显式断言（golden 之外，说得出是哪一项漂了）
+e=$T/interrupt-text.events
+check "interrupt-text: 三条——被打断的回复、turn.end、人的下一句" 'map(.type) == ["message.assistant","turn.end","message.user"]' "$e"
+check "interrupt-text: 回复正文与 model，指回打断记录" '.[0].payload.text == "我看了一下，问题在 div：" and .[0].payload.model == "claude-opus-5" and .[0].payload.author_type == "agent" and .[0].extensions["vibetrail.trigger"] == "i1" and .[0].content_state == "included"' "$e"
+check "interrupt-text: turn.end 状态、用量按 message.id 去重、分支" '.[1].payload.status == {code:"interrupted",category:"cancellation",detail:"[Request interrupted by user]"} and .[1].payload.usage == {input_tokens:15,cached_input_tokens:100,output_tokens:20,reasoning_tokens:8,total_tokens:135} and .[1].payload.vcs.branch == "main" and .[1].turn_id == "p1" and .[1].provenance == {kind:"transcript",rule_version:"diverge-v1",source_event_id:"i1"}' "$e"
+check "interrupt-text: 人的下一句去掉 system-reminder 块，只留人写的" '.[2].payload.text == "先别看 div" and .[2].extensions["vibetrail.after"] == ["i1"] and .[2].extensions["vibetrail.after_kind"] == "interrupt"' "$e"
+check "interrupt-text: raw 里保留提取器原始命中" '.[1].raw.event_name == "diverge.interrupt" and .[1].raw.data.kind == "interrupt" and .[1].raw.data.turn == "i1"' "$e"
+e=$T/interrupt-tool.events
+check "interrupt-tool: 在跑的工具调用进 tool.request，没有 message.assistant" 'map(.type) == ["tool.request","turn.end","message.user"] and .[0].payload.input.command == "sleep 100" and .[0].payload.call_id == "toolu_1" and .[0].extensions["vibetrail.kind"] == "interrupt"' "$e"
+check "interrupt-tool: 沿 parentUuid 越过 tool_result 与 attachment 找到回复" '.[1].extensions["vibetrail.interrupted_uuid"] == "a1" and .[1].payload.model == "claude-opus-5"' "$e"
+e=$T/denials.events
+check "denials: 8 条 permission.decision——人拒 6、分类器 1、链路 1" '[.[] | select(.type=="permission.decision") | .payload.decided_by] | (map(select(.=="user"))|length) == 6 and (map(select(.=="policy"))|length) == 1 and (map(select(.=="system"))|length) == 1' "$e"
+check "denials: 链路故障 decision=error，其余 deny" 'all(.[] | select(.type=="permission.decision"); (.payload.decided_by == "system") == (.payload.decision == "error"))' "$e"
+check "denials: 6 个 tool_use 各一条 tool.request，含多行命令" '[.[] | select(.type=="tool.request")] | length == 6 and any(.[]; .payload.input.command == "git push\n# 注释\ngit push --force")' "$e"
+check "denials: tool_name 三种来路——索引 6、regex 1（Edit）、缺失 1（unknown）" '[.[] | select(.type=="permission.decision")] | (map(select(.extensions["vibetrail.tool_lookup"]=="index"))|length) == 6 and any(.[]; .extensions["vibetrail.tool_lookup"]=="regex" and .payload.tool_name=="Edit") and any(.[]; .extensions["vibetrail.tool_lookup"]=="missing" and .payload.tool_name=="unknown")' "$e"
+check "denials: 三条并行拒绝配一条 for-tool-use，人的下一句指回四条记录" '[.[] | select(.type=="message.user")] | length == 2 and .[0].payload.text == "别开 agent，自己做" and .[0].extensions["vibetrail.after"] == ["d1","d2","d3","f1"] and .[1].payload.text == "对，不要 push" and .[1].extensions["vibetrail.after"] == ["d4"] and .[1].extensions["vibetrail.after_kind"] == "permission_denied"' "$e"
+check "denials: 没有 turn.end（for-tool-use 被吸收）" 'all(.[]; .type != "turn.end")' "$e"
+check "denials: surface 取自 entrypoint" 'all(.[]; .agent == {name:"claude-code",version:"2.1.260",surface:"claude-desktop"})' "$e"
+check "denials: 账本" '.[0]' <(jq -c '.absorbed_for_tool_use == 1 and .lookup == {index:6,regex:1,missing:1} and .in == {permission_denied:6,interrupt_for_tool_use:1,classifier_blocked:1,permission_infra_fail:1}' "$T/denials.ledger")
+e=$T/agent-a1.events
+check "subagent: 会话 id 取自路径、实例 id 是 agentId、父实例 main、parent_call_id 取 meta" 'all(.[]; .session_id == "fx-sub" and .agent_instance_id == "a1" and .parent_agent_instance_id == "main" and .parent_call_id == "toolu_parent_1")' "$e"
+check "subagent: 打断映射成 subagent.end(cancelled)，带 agent_type，不带 usage / vcs" '[.[] | select(.type=="subagent.end")] | length == 1 and .[0].payload == {status:{code:"cancelled",category:"cancellation",detail:"[Request interrupted by user]"},agent_type:"general-purpose"}' "$e"
+check "subagent: 拒绝 + 被拒命令 + 被打断的回复都在；派活与注入消息不算人的下一句" 'map(.type) == ["tool.request","permission.decision","message.assistant","subagent.end"] and (.[2].payload.text == "测试跑不了，我读代码。")' "$e"
+e=$T/no-promptid.events
+check "no-promptid: 没有 promptId 的打断按位置推轮次，provenance 标 inferred" '[.[] | select(.type=="turn.end")] | length == 2 and .[0].turn_id == "i0" and .[0].provenance.kind == "inferred" and .[1].turn_id == "p1" and .[1].provenance.kind == "inferred" and .[1].provenance.rule_version == "diverge-v1"' "$e"
+check "no-promptid: 派生事件跟触发记录的轮次走" '[.[] | select(.type=="message.assistant")][0] | .turn_id == "p1" and .provenance.kind == "inferred"' "$e"
+check "no-promptid: 两句人话各指回各自的打断" '[.[] | select(.type=="message.user")] | map(.extensions["vibetrail.after"]) == [["i0"],["i1"]]' "$e"
+e=$T/unpaired.events
+check "unpaired: 没配对的 for-tool-use 不丢——按打断发 turn.end，detail 标明" '[.[] | select(.type=="turn.end")] | length == 1 and (.[0].payload.status.detail | startswith("unpaired interrupt_for_tool_use")) and .[0].extensions["vibetrail.kind"] == "interrupt_for_tool_use"' "$e"
+check "unpaired: 账本" '.[0]' <(jq -c '.unpaired_for_tool_use == 1 and .absorbed_for_tool_use == 0' "$T/unpaired.ledger")
+e=$T/denied-then-interrupt.events
+check "denied-then-interrupt: 拒绝后紧接打断，同一个 tool_use 只发一条 tool.request（去重），回复正文照发" 'map(.type) == ["tool.request","permission.decision","message.assistant","turn.end","message.user"] and .[0].extensions["vibetrail.trigger"] == "d1" and .[2].payload.text == "推了。" and .[3].extensions["vibetrail.interrupted_uuid"] == "a1"' "$e"
+check "denied-then-interrupt: 人的下一句指回拒绝与打断" '.[4].extensions["vibetrail.after"] == ["d1","i1"] and .[4].extensions["vibetrail.after_kind"] == "interrupt"' "$e"
+check "denied-then-interrupt: 账本记到 1 次去重" '.[0]' <(jq -c '.dedup == 1' "$T/denied-then-interrupt.ledger")
+e=$T/noise.events
+check "noise: 非对象行、字符串 message、缺字段的块都不炸；只出一条 turn.end" 'length == 1 and .[0].type == "turn.end" and .[0].turn_id == "p1"' "$e"
+check "noise: 账本计数" '.[0]' <(jq -c '.skipped_non_object == 3 and .skipped_no_uuid == 1 and .records == 5' "$T/noise.ledger")
+
+echo "════ 3. A2 对账：提取器单独跑 == 映射出的事件 ════"
+for f in "$FX"/*.jsonl "$FX"/fx-sub/subagents/agent-a1.jsonl "$T/scenario.jsonl"; do
+    n=$(basename "$f" .jsonl); e=$T/$n.events; lg=$T/$n.ledger
+    hits=$(jq -c -L "$SELF" -f "$SELF/extract-diverge.jq" "$f" 2>/dev/null | jq -S -s -c 'group_by(.kind) | map({key: .[0].kind, value: length}) | from_entries')
+    got=$(jq -S -s -c --argjson lg "$(cat "$lg")" '{
+        permission_denied: ([.[] | select(.type=="permission.decision" and .payload.decided_by=="user")] | length),
+        classifier_blocked: ([.[] | select(.type=="permission.decision" and .payload.decided_by=="policy")] | length),
+        permission_infra_fail: ([.[] | select(.type=="permission.decision" and .payload.decided_by=="system")] | length),
+        interrupt: ([.[] | select((.type=="turn.end" or .type=="subagent.end") and .extensions["vibetrail.kind"]=="interrupt")] | length),
+        interrupt_for_tool_use: ($lg.absorbed_for_tool_use + $lg.unpaired_for_tool_use)
+      } | with_entries(select(.value > 0))' "$e")
+    if [ "$hits" = "$got" ]; then ok; else ko "$n: 提取器 $hits ≠ 映射 $got"; fi
+    # 提取器命中与 raw.data 逐字一致（A3）
+    raws=$(jq -c 'select(.raw != null) | .raw.data' "$e" | jq -s -c 'unique_by(.turn) | sort_by(.turn)')
+    want=$(jq -c -L "$SELF" -f "$SELF/extract-diverge.jq" "$f" 2>/dev/null | jq -s -c --argjson lg "$(cat "$lg")" '[.[] | select(.kind != "interrupt_for_tool_use" or $lg.unpaired_for_tool_use > 0)] | sort_by(.turn)')
+    if [ "$raws" = "$want" ]; then ok; else ko "$n: raw.data 与提取器输出不一致"; fi
+done
+
+echo "════ 4. 增量等价：每个切点 L，前 L 行 ∪ 从 L 起 == 全量 ════"
+for f in "$FX"/*.jsonl "$FX"/fx-sub/subagents/agent-a1.jsonl "$T/scenario.jsonl"; do
+    n=$(basename "$f" .jsonl); N=$(wc -l < "$f" | tr -d ' '); full=$T/$n.norm
+    [ -f "$full" ] || jq -S -c . "$T/$n.events" > "$full"
+    bad=0
+    sid=$(jq -r .sid "$T/$n.ledger"); pid=$(jq -r '.[0].project_id // "x"' -s "$T/$n.events"); wid=$(jq -r '.[0].workspace_id // "x"' -s "$T/$n.events")
+    meta=(); [ -f "${f%.jsonl}.meta.json" ] && meta=(--meta "${f%.jsonl}.meta.json")
+    for L in $(seq 1 $((N-1))); do
+        head -n "$L" "$f" > "$T/cut.jsonl"
+        bash "$SELF/vibetrail-map" "$T/cut.jsonl" --sid "$sid" ${meta[@]+"${meta[@]}"} --ledger "$T/cut.ledger" --project-id "$pid" --workspace-id "$wid" > "$T/a.events" 2> "$T/a.err" || { echo "    $n 切点 $L：前段失败 $(head -c 120 "$T/a.err")"; }
+        bash "$SELF/vibetrail-map" "$f" --sid "$sid" ${meta[@]+"${meta[@]}"} --from-line "$L" --ledger "$T/b.ledger" --project-id "$pid" --workspace-id "$wid" > "$T/b.events" 2> "$T/b.err" || { echo "    $n 切点 $L：后段失败 $(head -c 120 "$T/b.err")"; }
+        cat "$T/a.events" "$T/b.events" | jq -S -c . | sort > "$T/ab.norm"; sort "$full" > "$T/full.sorted"
+        if ! cmp -s "$T/ab.norm" "$T/full.sorted"; then bad=$((bad+1)); [ $bad -le 2 ] && { echo "    $n 切点 $L："; diff "$T/full.sorted" "$T/ab.norm" | head -4 | cut -c1-160 | sed 's/^/      /'; }; fi
+    done
+    if [ $bad -eq 0 ]; then ok; else ko "$n: $bad 个切点不等价（共 $((N-1)) 个）"; fi
+done
+
+echo "════ 5. 尾部半行、幂等 ════"
+f=$FX/interrupt-text.jsonl
+{ cat "$f"; printf '{"type":"user","uuid":"half","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]},"promptId":"p9"'; } > "$T/half.jsonl"
+run half "$T/half.jsonl" --sid interrupt-text && {
+    check "半行: 只解析到最后一个换行，consumed < file" '.[0]' <(jq -c '.consumed_bytes < .file_bytes and .lines == 9' "$T/half.ledger")
+    if cmp -s <(jq -S -c . "$T/half.events") "$T/interrupt-text.norm"; then ok; else ko "半行: 事件应与整行文件一致"; fi
+}
+run again "$FX/denials.jsonl" && { if cmp -s <(sids "$T/again.events") <(sids "$T/denials.events"); then ok; else ko "幂等: 两次运行 event_id 不同"; fi; }
+
+echo
+if [ $fail -eq 0 ]; then echo "  ✅ $pass/$pass 通过"; else echo "  ❌ $fail 失败 / $pass 通过"; exit 1; fi
