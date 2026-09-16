@@ -280,6 +280,20 @@ check "doctor：同一份 settings 里同一事件挂了两条（同 matcher）�
     'jq ".hooks.Stop += .hooks.Stop" "$IS/.claude/settings.json" > "$IS/.claude/s.tmp" && cp "$IS/.claude/settings.json" "$IS/.claude/s.bak" \
      && mv "$IS/.claude/s.tmp" "$IS/.claude/settings.json"; o=$(vdoc); mv "$IS/.claude/s.bak" "$IS/.claude/settings.json"
      printf "%s" "$o" | grep -q "hook 重复挂载：Stop（2 条"'
+# 全局开关：这两个为真时 hook 一次都不触发，而且从我们这边看不出来（spool 不涨、也没有错误日志）
+check "doctor：用户设置里 disableAllHooks: true → 致命项" \
+    'cp "$IS/.claude/settings.json" "$IS/.claude/s.bak" && jq ". + {disableAllHooks: true}" "$IS/.claude/s.bak" > "$IS/.claude/settings.json"
+     o=$(vdoc); cp "$IS/.claude/s.bak" "$IS/.claude/settings.json"; rm -f "$IS/.claude/s.bak"
+     printf "%s" "$o" | grep -q "本机 hook 被全局关掉" && printf "%s" "$o" | grep -q "有致命项"'
+printf '{"allowManagedHooksOnly": true}\n' > "$T/fake-managed.json"
+check "doctor：企业托管设置里 allowManagedHooksOnly: true → 致命项（HOME 里的条目一律被忽略）" \
+    'o=$( cd "$REPO" && VIBETRAIL_HOME=$IS/.vibetrail VIBETRAIL_CLAUDE_SETTINGS=$IS/.claude/settings.json \
+          VIBETRAIL_CLAUDE_MANAGED=$T/fake-managed.json bash "$SELF/vibetrail" doctor 2>&1 )
+     printf "%s" "$o" | grep -q "只跑托管 hook" && printf "%s" "$o" | grep -q "有致命项"'
+# 判据一律先把输出接住再 grep：写成 `vdoc | grep -q …` 的话，grep -q 命中就提前关掉管道，
+# doctor 吃到 SIGPIPE 非零退出，pipefail 下整条被判成失败（先踩了一次）
+check "doctor：两个开关都没设时说「没有全局开关挡着」，且退出码为 0" \
+    'o=$(vdoc); rc=$?; printf "%s" "$o" | grep -q "没有全局开关挡着" && [ "$rc" = 0 ]'
 vcli uninstall
 check "uninstall 之后回到原样，原样那份备份没被覆盖" 'jq -e ". == {model: \"opus\"}" "$IS/.claude/settings.json" >/dev/null && jq -e ". == {model: \"opus\"}" "$IS/.vibetrail/backup/settings.json.before-vibetrail" >/dev/null 2>&1'
 

@@ -118,7 +118,7 @@ bash experiments/collect-demo/report.sh -o experiments/collect-demo/out/report.m
 ~/.vibetrail/bin/vibetrail uninstall
 ```
 
-`doctor` 查运行时、jq 版本与**映射器在这个 jq 上跑不跑得通**（拿一条假记录真跑一遍：jq 的语法错是整份文件级的，编译不过的话 transcript 那一路一条都不出，而 hook 仍然全部 exit 0）、hook 条目（包括命令指向的脚本在不在）、有没有重复挂载（同一事件挂在 HOME 与项目两处会触发两遍）、登记表、有没有落后没采的会话、错误日志（映射失败单独点出条数）。
+`doctor` 查运行时、jq 版本与**映射器在这个 jq 上跑不跑得通**（拿一条假记录真跑一遍：jq 的语法错是整份文件级的，编译不过的话 transcript 那一路一条都不出，而 hook 仍然全部 exit 0）、hook 条目（包括命令指向的脚本在不在）、hook 有没有被全局开关关掉（`disableAllHooks` / 企业策略的 `allowManagedHooksOnly`）、有没有重复挂载（同一事件挂在 HOME 与项目两处会触发两遍）、登记表、有没有落后没采的会话、错误日志（映射失败单独点出条数）。
 卸载只去掉 settings 里自己的条目和运行时，已采的数据、配置、登记表留着；加 `--purge` 连 `~/.vibetrail` 整个删掉。
 
 ## 演示时要说清楚的
@@ -128,5 +128,8 @@ bash experiments/collect-demo/report.sh -o experiments/collect-demo/out/report.m
   挂上 PermissionRequest 之后按这次调用弹没弹过权限框分，之前的按这一轮的权限模式粗分——auto 模式几乎不弹框，那里的「拒绝」按停止算（DESIGN D9）。
   desktop 里 PermissionRequest 会不会触发还没实测：要在 default 模式的会话里弹一次框、点一次拒绝。
 - **desktop 续接会话**会把之前的历史复制进新会话文件，这部分会按新会话再报一遍（OPEN-ISSUES K8）；报告里已按记录合并显示，并注明「也在哪些会话」。
+- **在别人公司的机器上演示**：企业托管设置（`/Library/Application Support/ClaudeCode/managed-settings.json`）里 `allowManagedHooksOnly: true` 会让 HOME 里的条目
+  一律被忽略，用户设置里 `disableAllHooks: true` 则是所有 hook 都不跑（安全模式同理）。两种情况下 hook 一次都不触发，而且**看不出异常**——
+  spool 不涨、也没有错误日志。先跑一次 `vibetrail doctor`，它会直接点名是哪份文件里的哪个键。
 - **只采登记过的仓**：没登记的仓里开会话什么都不采；要采就 `projects pick` 选上。
 - **还没有 push**：数据只在本机 spool，端点配置之后才会发。

@@ -18,7 +18,7 @@
 #   vibetrail show [--session SID] [--type 前缀] [--last N] [--json]
 #       把采到的事件按会话、按时间列成人能读的一行一条；--json 原样输出协议事件
 #   vibetrail sync                                            立刻把登记过的仓里没采完的 transcript 补一遍（平时开会话时的 SessionStart 会做）
-#   vibetrail doctor                                          自检：运行时、jq 与映射器、settings 条目与重复挂载、scope 与登记、采集证据、落后、错误日志
+#   vibetrail doctor                                          自检：运行时、jq 与映射器、settings 条目 / 全局开关 / 重复挂载、scope 与登记、采集证据、落后、错误日志
 #   vibetrail version
 #
 # 环境变量：VIBETRAIL_HOME（默认 ~/.vibetrail）、VIBETRAIL_CLAUDE_SETTINGS（默认 ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json）、
@@ -489,9 +489,14 @@ cmd_sync(){ # 与 SessionStart 的补做相同：本仓与所有登记过的仓�
     say "✓ 补采完：spool 从 $before 块到 $after 块（vibetrail show / list 看结果）"
 }
 
+managed_settings(){ # 企业托管设置（org policy）：macOS 与 Linux 各一处，路径在 2.1.270 的二进制里核过。VIBETRAIL_CLAUDE_MANAGED 覆盖（冒号分隔，测试用）
+    if [ -n "${VIBETRAIL_CLAUDE_MANAGED:-}" ]; then printf '%s\n' "$VIBETRAIL_CLAUDE_MANAGED" | tr ':' '\n' | grep -v '^$'; return; fi
+    printf '%s\n' "/Library/Application Support/ClaudeCode/managed-settings.json" "/etc/claude-code/managed-settings.json"
+}
+
 settings_layers(){ # 本机所有可能挂着 vibetrail hook 的 settings：HOME 两份、企业策略、当前仓与登记过的仓（连同各自 worktree）的项目级两份
-    printf '%s\n' "$SETTINGS" "${SETTINGS%.json}.local.json" \
-        "/Library/Application Support/ClaudeCode/managed-settings.json" "/etc/claude-code/managed-settings.json"
+    printf '%s\n' "$SETTINGS" "${SETTINGS%.json}.local.json"
+    managed_settings
     local a d wt
     { vt_main_checkout "$PWD" 2>/dev/null; for a in "$VT_HOME/projects"/*; do [ -f "$a" ] && head -1 "$a"; done; } | sort -u \
       | while IFS= read -r d; do
@@ -568,6 +573,22 @@ cmd_doctor(){
             fi
         fi
     else bad "读不了 $SETTINGS"; fi
+    # 全局开关：这两个为真时，条目挂得再对也一条都不触发，而且从我们这边完全看不出来（spool 不涨、也没有错误日志）。
+    # 2.1.270 的二进制里核过原文：disableAllHooks —— "All hooks are switched off in your user settings or --settings file"，
+    # 另有 org policy 版；allowManagedHooksOnly —— "Only managed hooks run on this machine (an org policy, or safe mode);
+    # hooks from your own settings are not offered"。只查 HOME 两份与托管两处（项目级认不认没实测，不拿它判死）
+    local sw k
+    sw=$( { printf '%s\n' "$SETTINGS" "${SETTINGS%.json}.local.json"; managed_settings; } | sort -u | while IFS= read -r k; do
+              [ -f "$k" ] || continue
+              "$JQ" -r --arg f "$k" '(if .disableAllHooks == true then "disableAllHooks：\($f)" else empty end),
+                                     (if .allowManagedHooksOnly == true then "allowManagedHooksOnly：\($f)" else empty end)' "$k" 2>/dev/null
+          done )
+    if [ -n "$sw" ]; then
+        while IFS= read -r k; do case "$k" in
+            disableAllHooks*) bad "本机 hook 被全局关掉（${k}）——条目挂得再对也一条都不触发，spool 不会涨、也不会有错误日志";;
+            *) bad "只跑托管 hook（${k}）——HOME 里的条目一律被忽略；要采得让管理员把 vibetrail 的条目写进托管设置。安全模式（safe mode）是同样的效果，从文件上看不出来";;
+        esac; done <<< "$sw"
+    else ok "没有全局开关挡着（disableAllHooks / allowManagedHooksOnly）"; fi
     # 重复挂载：Claude Code 把 HOME / 项目 / 企业策略几层的 hooks 合起来跑，同一事件挂在两处就触发两遍。
     # teamai 踩过同一个坑（它的 src/hooks.ts:1009：老版本在 HOME 之外还往项目目录写过一份，升级后两份都活着，每次会话开始触发两次），
     # 它的对策是安装期清扫，我们先做检查。照它的经验，这里不按「当前登记的事件」过滤——早先写下的副本挂的可能是别的事件名
