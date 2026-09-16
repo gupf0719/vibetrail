@@ -188,7 +188,13 @@ const SIZE_CAP = 1048576 - 1024;   // 协议单条 1 MiB，留 1 KiB 余量（�
 // 不得改写已经接收的历史事件」——event_id 不含它，重读出来的 event_id 不变、云端按重复收下，所以升版本不改写历史。
 // 09-16 push 前统一升到 v2 定成基线（09-15 定 v1 之后改过 K8 / K12 / K13 / D13 / K15② / 全采 / K18 / U12 / K20–K23，版本号一直没动）。
 // 之后每改一次映射规则就升对应的一路；test-map.sh 钉着：golden 变了而版本号没升就红
-export const RULE_VERSIONS = { diverge: 'diverge-v2', turn: 'turn-v2', call: 'call-v2', ext: 'ext-v2' };
+// 09-16 第二批（同日）：子 agent 自己改的文件进 subagent.end / 被打断的 subagent.end / 那一轮的 files[]、workflow agent 挂回主会话、
+// 同步 agent 按 meta 的 toolUseId 认结束 → turn-v3、diverge-v3；cwd_changed / instructions_loaded 的路径改相对 → ext-v3。call 没变
+export const RULE_VERSIONS = { diverge: 'diverge-v3', turn: 'turn-v3', call: 'call-v2', ext: 'ext-v3' };
+// 调用方（hook.mjs 的 mapFile）按物理行喂记录：解析不了的行、空行也占一个位置，行号才与字节 checkpoint 对得上（以前直接丢掉，
+// 中间出现坏行时 checkpoint 换算成字节会错位，下次从错的地方读）；坏行计进 A11 的 bad_json
+export const BAD_LINE = Symbol.for('vibetrail.bad_line');
+export const BLANK_LINE = Symbol.for('vibetrail.blank_line');
 
 // K22：turn.end.files[] 的路径要相对工作区根、不能 .. 、不能以 / 开头、不能有 \ 与控制字符（schema 的 path 正则）
 const PATH_OK = /^(?!\/)(?![A-Za-z]:)(?!.*\\)(?!.*(?:^|\/)\.{1,2}(?:\/|$))(?!.*\/\/)(?![\s\S]*[\x00-\x1f])[^/]+(?:\/[^/]+)*$/;
@@ -282,8 +288,10 @@ export function mapRecords(records, args) {
       in: {}, in_total: {}, out: {}, events: {}, absorbed_for_tool_use: 0, unpaired_for_tool_use: 0,
       lookup: { index: 0, regex: 0, missing: 0 }, stop_press: 0, dedup: 0, records: 0, skipped_no_uuid: 0, skipped_non_object: 0,
       sentinel: { marker: 0, marker_without_hit: 0 }, replayed: 0, inherited: 0, turns: { started: 0, ended: {} }, sources: [],
-      // A11：只数这次新读到的行（ln > from_line），调用方按会话累计进 state、doctor 汇总。恒等式：seen = records + skipped_non_object + skipped_no_uuid + replayed + inherited
-      new: { seen: 0, records: 0, skipped_non_object: 0, skipped_no_uuid: 0, replayed: 0, inherited: 0, content_dropped: 0,
+      // A11：只数这次新读到的行（ln > from_line），调用方按会话累计进 state、doctor 汇总。
+      // 恒等式：seen = records + bad_json + skipped_non_object + skipped_no_uuid + replayed + inherited（空行不算 seen）
+      bad_json: 0,
+      new: { seen: 0, records: 0, bad_json: 0, skipped_non_object: 0, skipped_no_uuid: 0, replayed: 0, inherited: 0, content_dropped: 0,
         sentinel: { marker: 0, marker_without_hit: 0 }, unknown_types: {} },
     },
     out: [],
@@ -1123,7 +1131,9 @@ export function mapRecords(records, args) {
     const ln = st.ln;
     const isNew = ln > from_line;
     const NEW = st.ledger.new;
+    if (r === BLANK_LINE) return;
     if (isNew) NEW.seen += 1;
+    if (r === BAD_LINE) { st.ledger.bad_json += 1; if (isNew) NEW.bad_json += 1; return; }
     if (!isObj(r)) { st.ledger.skipped_non_object += 1; if (isNew) NEW.skipped_non_object += 1; return; }
     // A11：清单之外的记录类型 / 附件类型 / system 子类型只计数（doctor 告警），照常往下走
     if (isNew) {

@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
-import { mapRecords, RULE_VERSIONS } from './map.mjs';
+import { mapRecords, RULE_VERSIONS, displayDir, BAD_LINE, BLANK_LINE } from './map.mjs';
 
 export const VT_RUNTIME_VERSION = '0.2.0-dev';
 const VT_NS = '6c90e594-0cb4-59d0-9186-740d215c8b7f';   // uuid5(NS_URL, "vibetrail")，DESIGN §4.2
@@ -289,39 +289,159 @@ export function vtSplitsSave(sid, fresh) {
 // 09-16 起子 agent 的起止从 transcript 推（不再挂 SubagentStart / SubagentStop）。state/<sid>/agents.json：
 //   launched   {agentId: {call_id, agent_type}}：后台派出的 agent（很多没有自己的 transcript 文件，之后的 <task-notification> 靠它认）
 //   done       {agentId: 完成信号的时间}；calls_done {派它的调用 id: 调用结果的时间}（同步 agent 出错时拿不到 agentId）
-// 只增不改：launched 已有的不覆盖，时间取较晚的
+//   workflows  {runId: {call_id, task_id}}：Workflow 调用的启动结果（K11），workflow 起的 agent 靠它挂回主会话那次调用
+//   files      {agentId: {相对路径: create|modify|read}}、files_outside {agentId: 根外的次数}：子 agent 自己改读的文件（K22 子 agent 部分）
+// 只增不改：launched / workflows 已有的不覆盖，时间取较晚的，文件取最重的操作
 const objOr = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
+const OP_RANK = { create: 3, modify: 2, read: 1 };
 export const vtAgents = (sid) => {
   const v = objOr(readJson(path.join(VT_HOME, 'state', sid, 'agents.json'), {}));
-  return { launched: objOr(v.launched), done: objOr(v.done), calls_done: objOr(v.calls_done) };
+  return { launched: objOr(v.launched), done: objOr(v.done), calls_done: objOr(v.calls_done), workflows: objOr(v.workflows),
+    files: objOr(v.files), files_outside: objOr(v.files_outside) };
 };
-export function vtAgentsSave(sid, fresh) {
-  if (!fresh) return true;
+export function vtAgentsSave(sid, fresh, agentFiles = null, agentFilesOutside = null) {
+  if (!fresh && !agentFiles) return true;
   const cur = vtAgents(sid);
   let changed = false;
-  for (const [k, v] of Object.entries(objOr(fresh.launched))) if (!(k in cur.launched)) { cur.launched[k] = v; changed = true; }
+  for (const m of ['launched', 'workflows']) {
+    for (const [k, v] of Object.entries(objOr(fresh?.[m]))) if (!(k in cur[m])) { cur[m][k] = v; changed = true; }
+  }
   for (const m of ['done', 'calls_done']) {
-    for (const [k, v] of Object.entries(objOr(fresh[m]))) if (typeof v === 'string' && !(typeof cur[m][k] === 'string' && cur[m][k] >= v)) { cur[m][k] = v; changed = true; }
+    for (const [k, v] of Object.entries(objOr(fresh?.[m]))) if (typeof v === 'string' && !(typeof cur[m][k] === 'string' && cur[m][k] >= v)) { cur[m][k] = v; changed = true; }
+  }
+  for (const [aid, files] of Object.entries(objOr(agentFiles))) {
+    const have = objOr(cur.files[aid]);
+    for (const [p, op] of Object.entries(objOr(files))) {
+      if (OP_RANK[op] === undefined) continue;
+      if (have[p] === undefined || OP_RANK[op] > OP_RANK[have[p]]) { have[p] = op; changed = true; }
+    }
+    if (Object.keys(have).length > 0) cur.files[aid] = have;
+  }
+  for (const [aid, n] of Object.entries(objOr(agentFilesOutside))) {
+    if (typeof n === 'number' && n > (cur.files_outside[aid] ?? 0)) { cur.files_outside[aid] = n; changed = true; }
   }
   if (!changed) return true;
   try { vtWriteJson(path.join(VT_HOME, 'state', sid, 'agents.json'), cur); return true; } catch { return false; }
 }
-// 一个 subagents 目录里的子 agent：{agentId: {call_id, agent_type}}（meta.json 里的 toolUseId / agentType；没有 meta 的只有 id）
-export function vtKnownAgents(subDir) {
+
+// 子 agent 的 transcript：<sid>/subagents/agent-<id>.jsonl；workflow 起的在 <sid>/subagents/workflows/<runId>/agent-<id>.jsonl（K11，09-16 用 Workflow 实测；
+// 同目录还有 journal.jsonl，不是 transcript）。被子 agent 派出的子 agent 与一级的同层，meta 里 spawnDepth = 2、parentAgentId 是派它的 agent
+export const subagentRootOf = (file) => { const i = String(file).lastIndexOf('/subagents/'); return i >= 0 ? String(file).slice(0, i + '/subagents'.length) : ''; };
+export const workflowRunOf = (file) => { const m = String(file).match(/\/subagents\/workflows\/([^/]+)\/agent-[^/]+\.jsonl$/); return m ? m[1] : null; };
+const readMeta = (jsonl) => objOr(readJson(jsonl.replace(/\.jsonl$/, '.meta.json'), {}));
+// 一个会话的全部子 agent 文件（递归，最多往下 3 层），[{file, name, aid, depth, run}]：深的在前——父 agent 映射时要用到子 agent 已经记下的文件与结束
+export function vtSubagentFiles(subRoot) {
+  const out = [];
+  const walk = (dir, level) => {
+    if (level > 3) return;
+    let names = []; try { names = fs.readdirSync(dir); } catch { return; }
+    for (const f of names.sort()) {
+      const p = path.join(dir, f);
+      if (/^agent-.+\.jsonl$/.test(f)) {
+        if (!isFile(p)) continue;
+        const meta = readMeta(p);
+        out.push({ file: p, name: f.replace(/\.jsonl$/, ''), aid: f.replace(/^agent-/, '').replace(/\.jsonl$/, ''),
+          depth: Number(meta.spawnDepth) > 0 ? Number(meta.spawnDepth) : 1, run: workflowRunOf(p) });
+      } else if (!f.endsWith('.json') && !f.endsWith('.jsonl') && isDir(p)) walk(p, level + 1);
+    }
+  };
+  walk(subRoot, 0);
+  return out.sort((a, b) => b.depth - a.depth || (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+}
+// 一个会话里的子 agent：{agentId: {call_id, agent_type, parent_agent, workflow_run}}（meta.json 的 toolUseId / agentType / parentAgentId；没有 meta 的只有 id）
+export function vtKnownAgents(subRoot) {
   const out = {};
-  let names = [];
-  try { names = fs.readdirSync(subDir); } catch { return out; }
-  for (const f of names.sort()) {
-    const m = f.match(/^agent-(.+)\.(jsonl|meta\.json)$/);
-    if (!m) continue;
-    out[m[1]] ||= {};
-    if (m[2] !== 'meta.json') continue;
-    const mm = objOr(readJson(path.join(subDir, f), {}));
-    if (typeof mm.toolUseId === 'string' && mm.toolUseId) out[m[1]].call_id = mm.toolUseId;
-    if (typeof mm.agentType === 'string' && mm.agentType) out[m[1]].agent_type = mm.agentType;
+  const walk = (dir, level) => {
+    if (level > 3) return;
+    let names = []; try { names = fs.readdirSync(dir); } catch { return; }
+    for (const f of names.sort()) {
+      const p = path.join(dir, f);
+      const m = f.match(/^agent-(.+)\.(jsonl|meta\.json)$/);
+      if (!m) { if (!f.includes('.') && isDir(p)) walk(p, level + 1); continue; }
+      const a = (out[m[1]] ||= {});
+      const run = workflowRunOf(p.replace(/\.meta\.json$/, '.jsonl'));
+      if (run) a.workflow_run = run;
+      if (m[2] !== 'meta.json') continue;
+      const mm = objOr(readJson(p, {}));
+      if (typeof mm.toolUseId === 'string' && mm.toolUseId) a.call_id = mm.toolUseId;
+      if (typeof mm.agentType === 'string' && mm.agentType) a.agent_type = mm.agentType;
+      if (typeof mm.parentAgentId === 'string' && mm.parentAgentId) a.parent_agent = mm.parentAgentId;
+    }
+  };
+  walk(subRoot, 0);
+  return out;
+}
+// 一个会话的 workflow run：{runId: {task_id, agents: {agentId: {status, result, label, phase, agent_type}}}}。
+// 每个 agent 跑完没有看 journal.jsonl（started / result 两种行，实测）：有 result 是 completed；带 agentId 的其他终态行按名字归到 failed / cancelled；
+// 只有 started 的是还在跑（status 为 null）。taskId 在 <sid>/workflows/<runId>.json（与 subagents 同级）
+export function vtWorkflowRuns(subRoot) {
+  const out = {};
+  const wfDir = path.join(subRoot, 'workflows');
+  let runs = []; try { runs = fs.readdirSync(wfDir).filter((d) => isDir(path.join(wfDir, d))); } catch { return out; }
+  for (const rid of runs.sort()) {
+    const run = { agents: {} };
+    const rj = objOr(readJson(path.join(path.dirname(subRoot), 'workflows', `${rid}.json`), {}));
+    if (typeof rj.taskId === 'string' && rj.taskId) run.task_id = rj.taskId;
+    for (const line of (readText(path.join(wfDir, rid, 'journal.jsonl')) || '').split('\n')) {
+      if (!line) continue;
+      let j; try { j = JSON.parse(line); } catch { continue; }
+      if (!j || typeof j.agentId !== 'string' || !j.agentId) continue;
+      const a = (run.agents[j.agentId] ||= { status: null });
+      if (typeof j.label === 'string') a.label = j.label;
+      if (typeof j.phase === 'string') a.phase = j.phase;
+      const t = String(j.type ?? '');
+      if (t === 'started' || t === 'launched') continue;
+      if (t === 'result') {
+        a.status = 'completed';
+        if (j.result !== undefined && j.result !== null) a.result = typeof j.result === 'string' ? j.result : JSON.stringify(j.result);
+      } else a.status = /cancel|skip|abort|kill|stop/i.test(t) ? 'cancelled' : /error|fail/i.test(t) ? 'failed' : 'unknown';
+    }
+    for (const [aid, a] of Object.entries(run.agents)) {
+      const meta = readMeta(path.join(wfDir, rid, `agent-${aid}.jsonl`));
+      if (typeof meta.agentType === 'string' && meta.agentType) a.agent_type = meta.agentType;
+    }
+    out[rid] = run;
   }
   return out;
 }
+// workflow agent 文件比主会话先映射（为了让主会话收到通知时已经知道子 agent 改了哪些文件），第一次见到一个 run 时 agents.json 里还没有它的启动结果：
+// 直接在主会话 transcript 里找 "runId":"<runId>" 那一行，取它的 tool_use_id。只在第一次找，找到就存进 agents.json
+export function vtWorkflowLaunch(mainT, runId) {
+  const txt = readText(mainT);
+  if (!txt) return null;
+  const at = txt.indexOf(`"runId":"${runId}"`);
+  if (at < 0) return null;
+  const line = txt.slice(txt.lastIndexOf('\n', at) + 1, (txt.indexOf('\n', at) + 1 || txt.length + 1) - 1);
+  let r; try { r = JSON.parse(line); } catch { return null; }
+  const block = (Array.isArray(r?.message?.content) ? r.message.content : []).find((b) => b && b.type === 'tool_result');
+  const tres = objOr(r?.toolUseResult);
+  if (!block || typeof block.tool_use_id !== 'string') return null;
+  return { call_id: block.tool_use_id, ...(typeof tres.taskId === 'string' ? { task_id: tres.taskId } : {}) };
+}
+
+// A11 完整性钉子的运行时部分：每份 transcript 新读到的记录走到了哪（映射账本的 new 计数），按会话累计在 state/<sid>/integrity.json，doctor 汇总。
+// 与 main.json 一样随 uninstall 删、文件被重写时这份文件的计数清零（从头重读，不重复计）。恒等式：seen = records + bad_json + skipped_non_object + skipped_no_uuid + replayed + inherited
+const INTEGRITY_KEYS = ['seen', 'records', 'bad_json', 'skipped_non_object', 'skipped_no_uuid', 'replayed', 'inherited', 'content_dropped', 'marker', 'marker_without_hit', 'truncated_bytes'];
+export const vtIntegrity = (sid) => objOr(readJson(path.join(VT_HOME, 'state', sid, 'integrity.json'), {}));
+export function vtIntegrityAdd(sid, name, nw, { reset = false, truncatedBytes = 0 } = {}) {
+  try {
+    const cur = vtIntegrity(sid);
+    const files = objOr(cur.files);
+    const f = reset ? {} : objOr(files[name]);
+    const n = objOr(nw);
+    const add = (k, v) => { if (typeof v === 'number' && v > 0) f[k] = (f[k] ?? 0) + v; };
+    for (const k of ['seen', 'records', 'bad_json', 'skipped_non_object', 'skipped_no_uuid', 'replayed', 'inherited', 'content_dropped']) add(k, n[k]);
+    add('marker', objOr(n.sentinel).marker); add('marker_without_hit', objOr(n.sentinel).marker_without_hit);
+    add('truncated_bytes', truncatedBytes);
+    const ut = objOr(f.unknown_types);
+    for (const [k, v] of Object.entries(objOr(n.unknown_types))) if (typeof v === 'number') ut[k] = (ut[k] ?? 0) + v;
+    if (Object.keys(ut).length > 0) f.unknown_types = ut;
+    files[name] = f;
+    vtWriteJson(path.join(VT_HOME, 'state', sid, 'integrity.json'), { files, updated_at: nowIso() });
+    return true;
+  } catch { return false; }
+}
+export const integrityKeys = INTEGRITY_KEYS;
 
 export function vtPruneRemoved() {             // projects remove --drop 挪出去的数据留一天
   const dir = path.join(VT_HOME, 'removed');
@@ -373,8 +493,10 @@ const CAPABILITIES = ['session.start', 'session.end', 'turn.start', 'turn.end', 
 // 原来的 SubagentStart / SubagentStop / PostToolUseFailure / Notification / PermissionDenied / StopFailure / InstructionsLoaded / CwdChanged
 // 能给的都改从 transcript 推（map.mjs），这里不再为它们出事件
 export function hookEvents(event, p, ctx) {    // → [事件…]（0 或 1 条），形状与 hook-events.jq 逐字段一致
-  const { project_id, workspace_id, vt_version, agent_version, surface, now, vcs, extra = {} } = ctx;
+  const { project_id, workspace_id, vt_version, agent_version, surface, now, vcs, extra = {}, roots = null } = ctx;
   const hname = p.hook_event_name || event;
+  // 本机路径不出本机（用户 09-16 定相对路径）：worktree 与 cwd 相对主 checkout（主 checkout 本身是 .，desktop 的 worktree 是 .claude/worktrees/<名>），其余换成 ~ 形
+  const dir = (v) => (typeof v === 'string' && v !== '' ? displayDir(v, roots) : null);
   const b = {
     event_id: null, occurred_at: now, type: null,
     agent: { name: 'claude-code', ...opt('version', agent_version), ...(codeOk(surface) ? { surface } : {}) },
@@ -382,7 +504,7 @@ export function hookEvents(event, p, ctx) {    // → [事件…]（0 或 1 条�
     agent_instance_id: p.agent_id ?? 'main',
     provenance: { kind: 'hook', source_event: hname },
     payload: {},
-    extensions: { 'vibetrail.version': vt_version, ...opt('vibetrail.worktree', extra.worktree ?? (vcs && vcs.worktree) ?? null) },
+    extensions: { 'vibetrail.version': vt_version, ...opt('vibetrail.worktree', dir(extra.worktree ?? (vcs && vcs.worktree) ?? null)) },
   };
   const withTurn = (e) => {
     if (typeof p.prompt_id === 'string' && p.prompt_id !== '') { e.turn_id = p.prompt_id; }
@@ -400,7 +522,7 @@ export function hookEvents(event, p, ctx) {    // → [事件…]（0 或 1 条�
       e = { ...b, type: 'session.start', payload: { source: codeify(p.source ?? 'startup'), capabilities: CAPABILITIES } };
       e.agent_instance_id = 'main';
       e.extensions = { ...e.extensions, ...opt('claude.model', p.model ?? extra.model ?? null), ...opt('claude.agent_type', p.agent_type ?? null),
-        ...opt('vibetrail.vcs', vcsOf(vcs)), ...opt('vibetrail.cwd', p.cwd ?? null) };
+        ...opt('vibetrail.vcs', vcsOf(vcs)), ...opt('vibetrail.cwd', dir(p.cwd ?? null)) };
       e._key = `session.start|${codeify(p.source ?? 'startup')}|${now}`;
       return [e];
     case 'UserPromptSubmit':
@@ -429,24 +551,27 @@ export function hookEvents(event, p, ctx) {    // → [事件…]（0 或 1 条�
 // ---------- 一份 transcript：从 checkpoint 起映射（原 vibetrail-map 的编排） ----------
 export function mapFile(file, opts) {
   // sid / meta / 父实例从路径推（原 vibetrail-map 的这一段）：
-  // 子 agent 文件是 …/<sid>/subagents/agent-<id>.jsonl，meta 是同名 .meta.json；
-  // 被子 agent 派出的子 agent（spawnDepth ≥ 2），派它的调用在上一层子 agent 的文件里
-  const subdir = file.includes('/subagents/') ? path.dirname(file) : '';
-  if (!opts.sid) opts = { ...opts, sid: subdir ? path.basename(path.dirname(subdir)) : path.basename(file).replace(/\.jsonl$/, '') };
+  // 子 agent 文件是 …/<sid>/subagents/agent-<id>.jsonl，workflow 起的在 …/<sid>/subagents/workflows/<runId>/agent-<id>.jsonl（K11），meta 是同名 .meta.json；
+  // 被子 agent 派出的子 agent（spawnDepth ≥ 2）：新版 meta 直接给 parentAgentId（09-16 实测），老版本没有就去别的子 agent 文件里找派它的那次调用
+  const subRoot = subagentRootOf(file);
+  if (!opts.sid) opts = { ...opts, sid: subRoot ? path.basename(path.dirname(subRoot)) : path.basename(file).replace(/\.jsonl$/, '') };
+  const run = workflowRunOf(file);
   if (opts.meta === undefined || opts.meta === null) {
     const mf = file.replace(/\.jsonl$/, '') + '.meta.json';
     const m = isFile(mf) ? readJson(mf, null) : null;
     opts = { ...opts, meta: m !== null && typeof m === 'object' && !Array.isArray(m) ? m : null };
   }
+  if (run) opts = { ...opts, meta: { ...(opts.meta ?? {}), workflowRunId: run } };
   if (!opts.parent_instance) {
     let parent = 'main';
     const tid = opts.meta?.toolUseId ?? '';
-    if (subdir && tid) {
-      let names = [];
-      try { names = fs.readdirSync(subdir).filter((f) => /^agent-.*\.jsonl$/.test(f) && path.join(subdir, f) !== file); } catch {}
-      for (const f of names.sort()) {
-        const txt = readText(path.join(subdir, f));
-        if (txt && txt.includes(`"id":"${tid}"`)) { parent = f.replace(/^agent-/, '').replace(/\.jsonl$/, ''); break; }
+    const depth = Number(opts.meta?.spawnDepth);
+    if (typeof opts.meta?.parentAgentId === 'string' && opts.meta.parentAgentId) parent = opts.meta.parentAgentId;
+    else if (subRoot && tid && !run && depth !== 1) {
+      for (const x of vtSubagentFiles(subRoot)) {
+        if (x.file === file) continue;
+        const txt = readText(x.file);
+        if (txt && txt.includes(`"id":"${tid}"`)) { parent = x.aid; break; }
       }
     }
     opts = { ...opts, parent_instance: parent };
@@ -475,8 +600,10 @@ export function mapFile(file, opts) {
     perm_since = '', perm_periods = null, split_decisions = {}, close_last = '', stop_turn = '', turns = true, capture_content = '1', vt_version = VT_RUNTIME_VERSION,
     done_ts = null,
   } = opts;
-  // 这个会话已知的子 agent：没给就看同目录（子 agent 文件）或 <sid>/subagents（主文件）
-  const known_agents = opts.known_agents ?? vtKnownAgents(subdir || path.join(path.dirname(file), sid, 'subagents'));
+  // 这个会话已知的子 agent 与 workflow run：没给就看这个会话的 subagents 目录（递归）
+  const sessionSubRoot = subRoot || path.join(path.dirname(file), sid, 'subagents');
+  const known_agents = opts.known_agents ?? vtKnownAgents(sessionSubRoot);
+  const workflow_runs = opts.workflow_runs ?? (subRoot ? {} : vtWorkflowRuns(sessionSubRoot));
   const total = fs.statSync(file).size;
 
   // 只读到最后一个换行符
@@ -525,17 +652,21 @@ export function mapFile(file, opts) {
     firstLine = start_line + dropped + 1;
   }
 
+  // 按物理行喂：坏行、空行也占位（BAD_LINE / BLANK_LINE），映射器的行号才与这里按换行符换算的字节 checkpoint 一致（09-16 修：以前直接丢，
+  // 中间一出现坏行，checkpoint 换算成字节就错位一行）。text 停在最后一个换行符之后，split 出来的最后一段是空串，不是一行
   const records = [];
-  for (const line of text.split('\n')) {
-    if (line.trim() === '') continue;
-    try { records.push(JSON.parse(line)); } catch { /* 半行 / 坏行：整条跳过，账本按跳过计 */ }
+  const parts = text.split('\n');
+  if (parts.length > 0 && parts[parts.length - 1] === '') parts.pop();
+  for (const line of parts) {
+    if (line.trim() === '') { records.push(BLANK_LINE); continue; }
+    try { records.push(JSON.parse(line)); } catch { records.push(BAD_LINE); }
   }
   const { events, ledger } = mapRecords(records, {
     sid, project_id, workspace_id, workspace_roots, parent_instance, start_line: firstLine, from_line, meta,
     seen_uuids: seenFile && isFile(seenFile)
       ? readText(seenFile).split('\n').filter(Boolean).map((l) => { const [u, n] = l.split('\t'); return [u, Number(n)]; })
       : [],
-    hook_turns, hook_perms, perm_since, perm_periods, split_decisions, known_agents, done_ts, close_last, stop_turn, turns, vt_version, rule_version: RULE_VERSIONS.diverge, capture_content,
+    hook_turns, hook_perms, perm_since, perm_periods, split_decisions, known_agents, workflow_runs, done_ts, close_last, stop_turn, turns, vt_version, rule_version: RULE_VERSIONS.diverge, capture_content,
   });
 
   // 下次的起读字节：checkpoint 行的偏移
@@ -589,7 +720,7 @@ export function runHook(event, payload) {
 
   const emitHook = (name, vcs, extra = {}) => {
     const events = hookEvents(name, p, { project_id: ctx.project_id, workspace_id: ctx.workspace_id, vt_version: VT_RUNTIME_VERSION,
-      agent_version: agentVersion, surface, now: nowIso(), vcs, extra });
+      agent_version: agentVersion, surface, now: nowIso(), vcs, extra, roots: ctx.roots });
     if (events.length === 0) return;
     let filled;
     try { filled = vtFillIds(sid, events); } catch { vtLogError(ev, sid, 'event_id', 1); return; }
@@ -633,24 +764,37 @@ export function runHook(event, payload) {
       stop_hook_active: p.stop_hook_active === true, vcs: snap ?? null, ...(c ? { commits: c.commits, commit_method: c.method } : {}) });
   };
   // ---- 一份 transcript：映射 → 去重 → 写一块 spool → 推进 state ----
-  const processFile = (s2, sd, f, name, close = '', stopTurn = '') => {
+  const processFile = (s2, sd, f, name, close = '', stopTurn = '', subRoot = '', mainT = '') => {
     let size;
     try { size = fs.statSync(f).size; } catch { return; }
     const stFile = path.join(sd, `${name}.json`), seenFile = path.join(sd, `${name}.seen`);
     // 子 agent 文件只在它结束后才把最后一次调用写出。结束信号（09-16 起）在父文件里：同步 agent 的调用结果、后台 agent 的
     // <task-notification>，映射父文件时记进 agents.json；映射器拿它与这份文件最后一条记录的时间比（close_last = if_done）。
-    // <name>.done 是老版本 SubagentStop hook 留下的（记的是当时的文件大小），升级过渡期照认
+    // workflow 起的 agent（K11）看同目录 journal.jsonl 里它有没有终态行；<name>.done 是老版本 SubagentStop hook 留下的（记的是当时的文件大小），升级过渡期照认
     const aid = name.replace(/^agent-/, '');
-    const subDir = path.dirname(f);
-    const known = name === 'main' || subDir.endsWith('/subagents') ? { ...vtKnownAgents(name === 'main' ? path.join(path.dirname(f), s2, 'subagents') : subDir) } : {};
-    for (const [k, v] of Object.entries(vtAgents(s2).launched)) known[k] = { ...objOr(v), ...objOr(known[k]) };
-    let doneTs = null;
+    const ag = vtAgents(s2);
+    const known = subRoot ? vtKnownAgents(subRoot) : {};
+    for (const [k, v] of Object.entries(ag.launched)) known[k] = { ...objOr(v), ...objOr(known[k]) };
+    for (const [k, v] of Object.entries(ag.files)) known[k] = { ...objOr(known[k]), files: objOr(v), files_outside: ag.files_outside[k] ?? 0 };
+    const runs = subRoot ? vtWorkflowRuns(subRoot) : {};
+    for (const [rid, w] of Object.entries(ag.workflows)) if (runs[rid]) runs[rid] = { ...objOr(w), ...runs[rid], ...(w.call_id ? { call_id: w.call_id } : {}) };
+    const run = workflowRunOf(f);
+    let doneTs = null, meta;
     if (name !== 'main') {
-      const ag = vtAgents(s2);
       const tid = known[aid]?.call_id;
       doneTs = [ag.done[aid], tid ? ag.calls_done[tid] : null].filter((x) => typeof x === 'string').sort().pop() ?? null;
       if (!['session_end', 'resume', 'idle'].includes(close)) {
-        close = (readText(path.join(sd, `${name}.done`)) || '').trim() === String(size) ? 'stop' : doneTs ? 'if_done' : '';
+        const wfDone = run && typeof runs[run]?.agents?.[aid]?.status === 'string';
+        close = (readText(path.join(sd, `${name}.done`)) || '').trim() === String(size) || wfDone ? 'stop' : doneTs ? 'if_done' : '';
+      }
+      if (run) {
+        // workflow agent 的 meta 没有 toolUseId：补上那次 Workflow 调用的 id（agents.json 里没有就去主会话找一次、存下来）
+        let w = objOr(ag.workflows[run]);
+        if (!w.call_id && mainT) {
+          const found = vtWorkflowLaunch(mainT, run);
+          if (found) { vtAgentsSave(s2, { workflows: { [run]: found } }); w = found; }
+        }
+        meta = { ...readMeta(f), ...(w.call_id ? { toolUseId: w.call_id } : {}) };
       }
     }
     let ino = null; try { ino = fs.statSync(f).ino; } catch {}
@@ -667,10 +811,11 @@ export function runHook(event, payload) {
       if ((!open || closed) && !callOpen) return;
       if (close === 'if_done' && typeof lastTs === 'string' && !(doneTs >= lastTs)) return;   // 续上之后还没有新的完成信号
     }
+    let rewritten = false;
     if (consumed > 0 && (size < consumed || (fpOld !== '' && vtFprint(f, consumed) !== fpOld))) {
       try { fs.unlinkSync(stFile); } catch {}
       try { fs.unlinkSync(seenFile); } catch {}
-      lines = 0; consumed = 0; ckl = 1; ckb = 0; rewrites += 1;
+      lines = 0; consumed = 0; ckl = 1; ckb = 0; rewrites += 1; rewritten = true;
     }
     let out;
     try {
@@ -679,11 +824,12 @@ export function runHook(event, payload) {
         hook_turns: name === 'main' ? vtHookTurns(s2) : {},
         hook_perms: vtHookPerms(s2), perm_periods: vtPermPeriods(), split_decisions: vtSplits(s2),
         close_last: name === 'main' || close ? close : '', stop_turn: name === 'main' ? stopTurn : '',
-        known_agents: known, done_ts: doneTs, capture_content: vtConf('capture_content', '1') });
+        known_agents: known, workflow_runs: name === 'main' ? runs : {}, ...(meta ? { meta } : {}),
+        done_ts: doneTs, capture_content: vtConf('capture_content', '1') });
     } catch (e) { vtLogError(ev, s2, `map:${name}`, 2); return; }
     // 结论先落盘再写 spool：反过来的话，spool 写进去了、结论没存上，下次重读就可能判出另一种、发出矛盾的事件
     if (!vtSplitsSave(s2, out.ledger.split_decisions_new)) { vtLogError(ev, s2, `splits:${name}`, 1); return; }
-    if (!vtAgentsSave(s2, out.ledger.agents)) vtLogError(ev, s2, `agents:${name}`, 1);
+    if (!vtAgentsSave(s2, out.ledger.agents, out.ledger.agent_files, out.ledger.agent_files_outside)) vtLogError(ev, s2, `agents:${name}`, 1);
     if (!vtSpoolWrite(ctx.pkey, s2, name, out.events)) { vtLogError(ev, s2, `spool:${name}`, 1); return; }
     const srcLines = (out.ledger.sources || []).map(([u, n]) => `${u}\t${n}`).join('\n');
     if (srcLines) { try { fs.appendFileSync(seenFile, srcLines + '\n'); } catch {} }
@@ -693,7 +839,10 @@ export function runHook(event, payload) {
       parent_instance: out.ledger.parent_instance, fprint: fp, rewrites,
       turn_open: out.ledger.turns.open ?? null, turn_closed: out.ledger.turns.closed ?? false,
       call_open: out.ledger.trace?.call_open ?? false, last_ts: out.ledger.last_ts ?? null, updated_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z') };
-    try { fs.writeFileSync(stFile + '.tmp', JSON.stringify(stNew) + '\n'); fs.renameSync(stFile + '.tmp', stFile); } catch {}
+    let stateOk = true;
+    try { fs.writeFileSync(stFile + '.tmp', JSON.stringify(stNew) + '\n'); fs.renameSync(stFile + '.tmp', stFile); } catch { stateOk = false; }
+    // A11：state 推进了才记这次新读到的行（写不进 state 的话下次会重读，先记就重复计）；文件被重写从头读的，先把这份文件的计数清零
+    if (stateOk && !vtIntegrityAdd(s2, name, out.ledger.new, { reset: rewritten, truncatedBytes: out.ledger.truncated_bytes ?? 0 })) vtLogError(ev, s2, `integrity:${name}`, 1);
     if (name === 'main') {
       const model = out.ledger.turns?.model;
       if (model) vtWriteJson(path.join(sd, 'session.json'), { ...readJson(path.join(sd, 'session.json'), {}), model });
@@ -705,14 +854,16 @@ export function runHook(event, payload) {
     if (!mkdirp(sd)) return;
     if (!vtLock(sd)) return;                       // 同一会话已在跑：跳过，下一次 hook 补上
     try {
-      if (isFile(mainT)) processFile(s2, sd, mainT, 'main', close, stopTurn);
-      const subDir = path.join(path.dirname(mainT), s2, 'subagents');
-      let names = [];
-      try { names = fs.readdirSync(subDir).filter((f) => /^agent-.*\.jsonl$/.test(f)); } catch {}
-      const before = JSON.stringify(vtAgents(s2));
-      for (const f of names.sort()) processFile(s2, sd, path.join(subDir, f), f.replace(/\.jsonl$/, ''), close);
-      if (names.length > 1 && JSON.stringify(vtAgents(s2)) !== before) {
-        for (const f of names.sort()) processFile(s2, sd, path.join(subDir, f), f.replace(/\.jsonl$/, ''), close);
+      // 顺序（09-16 改）：子 agent 文件先（深的在前），再主会话，信号变了再把子 agent 文件过一遍——
+      // 父文件发子 agent 的 subagent.end、关这一轮时要用到子 agent 自己改了哪些文件（K22）；子 agent「写完了」又要看父文件里的结束信号，所以最后补一遍（没变的文件直接跳过）
+      const subRoot = path.join(path.dirname(mainT), s2, 'subagents');
+      const subs = vtSubagentFiles(subRoot);
+      const signals = () => { const a = vtAgents(s2); return JSON.stringify([a.launched, a.done, a.calls_done, a.workflows]); };
+      const before = signals();
+      for (const x of subs) processFile(s2, sd, x.file, x.name, close, '', subRoot, mainT);
+      if (isFile(mainT)) processFile(s2, sd, mainT, 'main', close, stopTurn, subRoot, mainT);
+      if (subs.length > 0 && signals() !== before) {
+        for (const x of subs) processFile(s2, sd, x.file, x.name, close, '', subRoot, mainT);
       }
     } finally { vtUnlock(sd); }
   };

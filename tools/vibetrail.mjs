@@ -93,6 +93,9 @@ if (cmd === 'map') {
       case '--project-id': o.project_id = v; i++; break;
       case '--workspace-id': o.workspace_id = v; i++; break;
       case '--workspace-roots': o.workspace_roots = String(v).split(',').map((x) => x.trim()).filter(Boolean); i++; break;
+      // 测试用：hook 侧从 agents.json / journal.jsonl 凑出来传给映射器的两样，命令行直接给 JSON 文件
+      case '--known-agents': o.known_agents = v ? JSON.parse(readFileSync(v, 'utf8')) : undefined; i++; break;
+      case '--workflow-runs': o.workflow_runs = v ? JSON.parse(readFileSync(v, 'utf8')) : undefined; i++; break;
       case '--parent-instance': o.parent_instance = v; i++; break;
       case '--start-line': o.start_line = Number(v); i++; break;
       case '--start-byte': startByte = v === '' ? null : Number(v); i++; break;

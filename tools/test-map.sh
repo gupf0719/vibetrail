@@ -363,19 +363,23 @@ check "出错之后同一轮里又有真回复：算缓过来了，照常 comple
   AT c4 c3 s8c cp1 '{"type":"nested_memory","path":"/tmp/fx/sub/CLAUDE.md","content":{"path":"/tmp/fx/sub/CLAUDE.md","type":"Project","content":"子目录规则"}}' '{"cwd":"/tmp/fx/sub"}'
   R c5 c4  s8c cp2 user '"回去"'
 } > "$T/m8c.jsonl"
-M8 "$T/m8c.jsonl" --sid s8c --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 1 > "$T/m8c.events"
-check "CLAUDE.md 加载：一次 attachment 一条 ext.claude.instructions_loaded，payload 逐个文件 path / type / bytes / sha256，正文进 extensions" \
+M8 "$T/m8c.jsonl" --sid s8c --project-id /tmp/fx --workspace-id /tmp/fx --workspace-roots /tmp/fx --capture-content 1 > "$T/m8c.events"
+# 路径不出本机（用户 09-16 定相对路径）：仓里的 CLAUDE.md 相对工作区根，~/.claude 下的换成 ~ 形；cwd 相对主 checkout（本身是 .）
+check "CLAUDE.md 加载：一次 attachment 一条 ext.claude.instructions_loaded，payload 逐个文件 path（相对 / ~ 形）/ type / bytes / sha256，正文进 extensions" \
     '[.[] | select(.type=="ext.claude.instructions_loaded")] as $l | ($l | length) == 2
-     and ($l[0].payload.files | map(.path)) == ["/tmp/fx/CLAUDE.md","/Users/x/.claude/memory/MEMORY.md"] and $l[0].payload.reason == "session_start"
+     and ($l[0].payload.files | map(.path)) == ["CLAUDE.md","~/.claude/memory/MEMORY.md"] and $l[0].payload.reason == "session_start"
      and ($l[0].payload.files[0] | .type == "Project" and .bytes == ("# 规则\n别删文件" | utf8bytelength) and (.sha256 | test("^[0-9a-f]{64}$")))
+     and ($l[0].extensions["vibetrail.instructions"] | map(.path)) == ["CLAUDE.md","~/.claude/memory/MEMORY.md"]
      and $l[0].extensions["vibetrail.instructions"][1].content == "- 记住的事" and $l[0].content_state == "included"
-     and $l[1].payload.reason == "nested_traversal" and $l[1].payload.files[0].path == "/tmp/fx/sub/CLAUDE.md"
+     and $l[1].payload.reason == "nested_traversal" and $l[1].payload.files[0].path == "sub/CLAUDE.md"
      and all($l[]; .provenance.source_event == "instructions")' "$T/m8c.events"
-check "切目录：cwd 变一次一条 ext.claude.cwd_changed（第一条记录不算），old / new 都对" \
+check "切目录：cwd 变一次一条 ext.claude.cwd_changed（第一条记录不算），old / new 相对主 checkout" \
     '[.[] | select(.type=="ext.claude.cwd_changed") | [.payload.old_cwd, .payload.new_cwd, .provenance.source_event_id, .provenance.source_event]]
-     == [["/tmp/fx","/tmp/fx/sub","c3","cwd"],["/tmp/fx/sub","/tmp/fx","c5","cwd"]]' "$T/m8c.events"
+     == [[".","sub","c3","cwd"],["sub",".","c5","cwd"]]' "$T/m8c.events"
+check "路径不出本机：这两类事件里一个以 / 开头的路径都没有" \
+    '[.[] | select(.type=="ext.claude.cwd_changed" or .type=="ext.claude.instructions_loaded") | (.payload, .extensions["vibetrail.instructions"]) | .. | strings | select(startswith("/"))] == []' "$T/m8c.events"
 schema_check < "$T/m8c.events" > "$T/schema.m8c" && ok || ko "instructions / cwd: $(cat "$T/schema.m8c")"
-M8 "$T/m8c.jsonl" --sid s8c --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 > "$T/m8c0.events"
+M8 "$T/m8c.jsonl" --sid s8c --project-id /tmp/fx --workspace-id /tmp/fx --workspace-roots /tmp/fx --capture-content 0 > "$T/m8c0.events"
 check "CLAUDE.md 加载：关掉全采只剩元数据（路径、大小、哈希），不带正文" \
     '[.[] | select(.type=="ext.claude.instructions_loaded")] | length == 2 and all(.[]; .extensions["vibetrail.instructions"] == null and .content_state == null)' "$T/m8c0.events"
 
@@ -431,11 +435,14 @@ check "子 agent（后台）：启动结果出 subagent.start（没给 subagent_
      and ([.[] | select(.type=="subagent.end" and .agent_instance_id=="abg1")] | length == 1 and (.[0] | .parent_call_id == "toolu_bg"
        and .payload.status == {code: "killed", category: "cancellation"} and .payload.last_message == "跑到一半被停了"
        and .extensions["vibetrail.agent"] == {duration_ms: 60000, total_tokens: 900, tool_use_count: 7}))' "$T/m8s.events"
-check "后台 shell 任务的通知不算子 agent；同步 agent 出错拿不到 agentId，不凭空发 subagent.end" \
-    'all(.[]; (.agent_instance_id | IN("bsh1","aerr1")) | not)' "$T/m8s.events"
-check "账本：后台启动记下（之后的通知靠它认），完成信号按 agentId 与调用 id 各记一份（出错的同步 agent 靠调用 id）" \
+check "后台 shell 任务的通知不算子 agent" 'all(.[]; .agent_instance_id != "bsh1")' "$T/m8s.events"
+# 09-16 第二批：同步 agent 出错拿不到 agentId，但它的 meta 里有 toolUseId（真起过），调用结果就是它的结束——以前不发，现在发 failed
+check "同步 agent 出错：按 meta 的 toolUseId 认出是 aerr1，发 subagent.end（failed / failure，不带最后的回答）" \
+    '[.[] | select(.type=="subagent.end" and .agent_instance_id=="aerr1")] | length == 1
+     and (.[0] | .parent_call_id == "toolu_err" and .payload.status == {code: "failed", category: "failure"} and (.payload | has("last_message") | not) and .payload.agent_type == "general-purpose")' "$T/m8s.events"
+check "账本：后台启动记下（之后的通知靠它认），完成信号按 agentId 与调用 id 各记一份（出错的同步 agent 也有了 agentId）" \
     '.[0].agents.launched == {abg1: {call_id: "toolu_bg", agent_type: "general-purpose"}}
-     and .[0].agents.done == {asy1: "2026-09-16T04:00:06.000Z", abg1: "2026-09-16T04:01:00.000Z"}
+     and .[0].agents.done == {asy1: "2026-09-16T04:00:06.000Z", aerr1: "2026-09-16T04:00:07.000Z", abg1: "2026-09-16T04:01:00.000Z"}
      and .[0].agents.calls_done == {toolu_sync: "2026-09-16T04:00:06.000Z", toolu_err: "2026-09-16T04:00:07.000Z", toolu_bg: "2026-09-16T04:01:00.000Z"}' "$T/m8s.ledger"
 schema_check < "$T/m8s.events" > "$T/schema.m8s" && ok || ko "subagent: $(cat "$T/schema.m8s")"
 M8 "$PJ/s8s.jsonl" --sid s8s --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 > "$T/m8s0.events"
@@ -561,13 +568,150 @@ check "K22: 打断结束的轮 turn.end(interrupted) 也带 files[]" \
     '[.[] | select(.type=="turn.end")][0] | .payload.status.code == "interrupted" and (.files | map(.path)) == ["src/a.js", "docs/new.md"]' "$T/k22i.events"
 if [ ! -s "$T/m9.err" ]; then ok; else ko "这一节的映射有报错: $(head -c 300 "$T/m9.err")"; fi
 
+echo "════ 9b. 09-16 第二批：A11 计数、坏行占位、子 agent 自己改的文件、workflow 子 agent（K11）════"
+: > "$T/m9b.err"
+M9B(){ bash "$SELF/vibetrail-map" "$@" 2>>"$T/m9b.err"; }
+# A11：一份什么都有的 transcript——不是对象、坏行、空行、不认识的记录 / 附件 / system 类型、没 uuid、复制来的历史、判据没认出的拒绝标记、回放副本
+{ printf '[1,2]\n'; printf 'not json at all\n'; printf '\n'
+  R a1 ""  s9a ap1 user '"说一句"' "$(TS 09:00:00.000Z)"
+  jq -n -c '{type: "brand-new-type", uuid: "nt1", sessionId: "s9a", timestamp: "2026-09-16T09:00:01.000Z"}'
+  AT a2 a1 s9a ap1 '{"type":"shiny_new_attachment"}' "$(TS 09:00:02.000Z)"
+  jq -n -c '{type: "system", subtype: "new_subtype", uuid: "ns1", sessionId: "s9a", timestamp: "2026-09-16T09:00:03.000Z"}'
+  jq -n -c '{type: "user", sessionId: "s9a", message: {role: "user", content: "no uuid"}}'
+  R x1 ""  other-sess op1 user '"复制来的"' "$(TS 09:00:04.000Z)"
+  R a3 a1  s9a ap1 user '[{"type":"tool_result","tool_use_id":"t9","content":"a brand new rejection wording","is_error":true}]' '{"timestamp":"2026-09-16T09:00:05.000Z","toolUseResult":"User rejected tool use"}'
+  R a1 ""  s9a ap1 user '"说一句"' "$(TS 09:00:06.000Z)"
+} > "$T/a11.jsonl"
+M9B "$T/a11.jsonl" --sid s9a --project-id fx --workspace-id ws --workspace-roots /tmp/fx --capture-content 0 --ledger "$T/a11.ledger" > "$T/a11.events"
+check "A11: 新读到的记录全部有去处——seen 10 = 进映射 5 + 坏行 1 + 不是对象 1 + 没 uuid 1 + 复制来的 1 + 回放副本 1（空行不算）" \
+    '.[0].new | .seen == 10 and .records == 5 and .bad_json == 1 and .skipped_non_object == 1 and .skipped_no_uuid == 1 and .inherited == 1 and .replayed == 1
+     and .seen == (.records + .bad_json + .skipped_non_object + .skipped_no_uuid + .inherited + .replayed)' "$T/a11.ledger"
+check "A11: 不认识的记录类型、附件类型、system 子类型各计一次；判据没认出的拒绝标记计进 marker_without_hit" \
+    '.[0].new | .unknown_types == {"type:brand-new-type": 1, "attachment:shiny_new_attachment": 1, "system:new_subtype": 1} and .sentinel == {marker: 1, marker_without_hit: 1}' "$T/a11.ledger"
+check "坏行、空行占行号：账本的 lines 是物理行数 11" '.[0].lines == 11' "$T/a11.ledger"
+M9B "$T/a11.jsonl" --sid s9a --project-id fx --workspace-id ws --workspace-roots /tmp/fx --capture-content 0 --from-line 4 --ledger "$T/a11b.ledger" > "$T/a11b.events"
+check "A11: 只数 from_line 之后的——第 5～11 行：seen 7 = 进映射 4 + 没 uuid 1 + 复制来的 1 + 回放副本 1" \
+    '.[0].new | .seen == 7 and .records == 4 and .bad_json == 0 and .skipped_non_object == 0 and .skipped_no_uuid == 1 and .inherited == 1 and .replayed == 1' "$T/a11b.ledger"
+# 坏行夹在中间时的增量等价：以前坏行不占行号，checkpoint 换算成字节会错位一行；这里前段 + 从 checkpoint 起的后段 == 全量
+{ R b1 ""  s9c bp1 user '"第一轮"' "$(TS 09:10:00.000Z)"
+  R b2 b1  s9c bp1 assistant '[]' "$(AM bm1 '[{"type":"text","text":"一"}]' | with_ts 09:10:01.000Z)"
+  printf '{"type":"user","uuid":"broken\n'
+  R b3 b2  s9c bp2 user '"第二轮"' "$(TS 09:10:02.000Z)"
+  R b4 b3  s9c bp2 assistant '[]' "$(AM bm2 '[{"type":"text","text":"二"}]' | with_ts 09:10:03.000Z)"
+  R b5 b4  s9c bp3 user '"第三轮"' "$(TS 09:10:04.000Z)"
+  R b6 b5  s9c bp3 assistant '[]' "$(AM bm3 '[{"type":"text","text":"三"}]' | with_ts 09:10:05.000Z)"
+} > "$T/badmid.jsonl"
+BM=(--sid s9c --project-id fx --workspace-id ws --workspace-roots /tmp/fx --capture-content 1)
+M9B "$T/badmid.jsonl" "${BM[@]}" --ledger /dev/null | jq -S -c . | sort > "$T/badmid.full"
+head -n 4 "$T/badmid.jsonl" > "$T/badmid-a.jsonl"
+M9B "$T/badmid-a.jsonl" "${BM[@]}" --ledger "$T/badmid-a.ledger" --sources-out "$T/badmid-a.src" > "$T/badmid-a.events"
+M9B "$T/badmid.jsonl" "${BM[@]}" --start-line "$(jq -r .checkpoint_line "$T/badmid-a.ledger")" --start-byte "$(jq -r .checkpoint_byte "$T/badmid-a.ledger")" \
+    --from-line 4 --seen-uuids "$T/badmid-a.src" --ledger /dev/null > "$T/badmid-b.events"
+check "坏行夹在中间：前段 + 从 checkpoint 起读的后段 == 全量（checkpoint 行号与字节对得上）" \
+    '[ "$(cat "$T/badmid-a.events" "$T/badmid-b.events" | jq -S -c . | sort)" = "$(cat "$T/badmid.full")" ] && [ "$(wc -l < "$T/badmid.full" | tr -d " ")" -gt 0 ]'
+
+# K22 子 agent 部分（按 09-16 真跑的子 agent 仿的形态：子 agent 文件里没有 toolUseResult，Write 新建只能看结果正文）
+SFP=$T/sf-proj; mkdir -p "$SFP/s9s/subagents"
+printf '%s\n' '{"agentType":"general-purpose","description":"改两个文件","toolUseId":"toolu_sf1","spawnDepth":1}' > "$SFP/s9s/subagents/agent-sf1.meta.json"
+printf '%s\n' '{"agentType":"Explore","description":"写文档","toolUseId":"toolu_nest","parentAgentId":"sf1","spawnDepth":2}' > "$SFP/s9s/subagents/agent-np2.meta.json"
+SUBX='{"agentId":"sf1","isSidechain":true}'
+{ R s1 ""  s9s sp1 user '"改两个文件"' "$(printf '%s' "$SUBX" | jq -c '. + {timestamp: "2026-09-16T10:00:00.000Z"}')"
+  R s2 s1  s9s sp1 assistant '[]' "$(AM sm1 '[{"type":"tool_use","id":"st_r","name":"Read","input":{"file_path":"/tmp/fx/README.md"}},{"type":"tool_use","id":"st_e","name":"Edit","input":{"file_path":"/tmp/fx/src/a.js","old_string":"1","new_string":"2"}},{"type":"tool_use","id":"st_w","name":"Write","input":{"file_path":"/tmp/fx/src/new.js","content":"x"}},{"type":"tool_use","id":"st_o","name":"Write","input":{"file_path":"/Users/x/elsewhere/o.txt","content":"x"}}]' | jq -c --argjson x "$SUBX" '. + $x + {timestamp: "2026-09-16T10:00:01.000Z"}')"
+  R s3 s2  s9s sp1 user '[{"type":"tool_result","tool_use_id":"st_r","content":"# fx"},{"type":"tool_result","tool_use_id":"st_e","content":"The file /tmp/fx/src/a.js has been updated successfully."},{"type":"tool_result","tool_use_id":"st_w","content":"File created successfully at: /tmp/fx/src/new.js"},{"type":"tool_result","tool_use_id":"st_o","content":"File created successfully at: /Users/x/elsewhere/o.txt"}]' "$(printf '%s' "$SUBX" | jq -c '. + {timestamp: "2026-09-16T10:00:02.000Z"}')"
+  R s4 s3  s9s sp1 assistant '[]' "$(AM sm2 '[{"type":"tool_use","id":"toolu_nest","name":"Agent","input":{"description":"写文档","prompt":"写"}}]' | jq -c --argjson x "$SUBX" '. + $x + {timestamp: "2026-09-16T10:00:03.000Z"}')"
+  R s5 s4  s9s sp1 user '[{"type":"tool_result","tool_use_id":"toolu_nest","content":[{"type":"text","text":"写好了 docs/n.md"}]}]' "$(printf '%s' "$SUBX" | jq -c '. + {timestamp: "2026-09-16T10:00:09.000Z"}')"
+  R s6 s5  s9s sp1 assistant '[]' "$(AM sm3 '[{"type":"text","text":"两个文件都改了"}]' | jq -c --argjson x "$SUBX" '. + $x + {timestamp: "2026-09-16T10:00:10.000Z"}')"
+} > "$SFP/s9s/subagents/agent-sf1.jsonl"
+jq -n -c '{np2: {call_id: "toolu_nest", agent_type: "Explore", parent_agent: "sf1", files: {"docs/n.md": "create"}}}' > "$T/sf-known-sub.json"
+M9B "$SFP/s9s/subagents/agent-sf1.jsonl" --project-id fx --workspace-id ws --workspace-roots /tmp/fx --capture-content 1 --close-last stop \
+    --known-agents "$T/sf-known-sub.json" --ledger "$T/sf-sub.ledger" > "$T/sf-sub.events"
+check "子 agent 文件：自己改读的文件记成集合（Write 新建靠结果正文认出 create），根外的只计数；被它派出的 np2 的文件并进来" \
+    '.[0].agent_files == {sf1: {"README.md": "read", "src/a.js": "modify", "src/new.js": "create", "docs/n.md": "create"}} and .[0].agent_files_outside == {sf1: 1}' "$T/sf-sub.ledger"
+check "子 agent 文件里没有 toolUseResult：被它派出的同步 agent np2 按 meta 的 toolUseId 认出结束——subagent.end 父实例 sf1、completed、带 np2 自己的文件与最后的回答" \
+    '[.[] | select(.type=="subagent.end" and .agent_instance_id=="np2")] | length == 1
+     and (.[0] | .parent_agent_instance_id == "sf1" and .parent_call_id == "toolu_nest" and .payload.status.code == "completed"
+       and .payload.last_message == "写好了 docs/n.md" and .payload.agent_type == "Explore" and .files == [{path: "docs/n.md", operation: "create", evidence: "tool_result"}])' "$T/sf-sub.events"
+check "子 agent 文件：session_id 取路径上 subagents 的上一层，subagent.start 父 main、调用取 meta" \
+    '[.[] | select(.type=="subagent.start")] | length == 1 and (.[0] | .session_id == "s9s" and .agent_instance_id == "sf1" and .parent_agent_instance_id == "main" and .parent_call_id == "toolu_sf1")' "$T/sf-sub.events"
+jq -c '.[0] | {sf1: {call_id: "toolu_sf1", agent_type: "general-purpose", files: .agent_files.sf1, files_outside: .agent_files_outside.sf1}}' -s "$T/sf-sub.ledger" > "$T/sf-known-main.json"
+{ R m1 ""  s9s mp1 user '"派一个 agent 改文件，我自己也改一个"' "$(TS 10:00:00.000Z)"
+  R m2 m1  s9s mp1 assistant '[]' "$(AM mm1 '[{"type":"tool_use","id":"toolu_sf1","name":"Agent","input":{"description":"改两个文件","prompt":"改"}},{"type":"tool_use","id":"toolu_me","name":"Edit","input":{"file_path":"/tmp/fx/src/main.js","old_string":"a","new_string":"b"}}]' | with_ts 10:00:00.500Z)"
+  R m3 m2  s9s mp1 user '[{"type":"tool_result","tool_use_id":"toolu_me","content":"ok"}]' '{"timestamp":"2026-09-16T10:00:01.000Z","toolUseResult":{"filePath":"/tmp/fx/src/main.js"}}'
+  R m4 m3  s9s mp1 user '[{"type":"tool_result","tool_use_id":"toolu_sf1","content":[{"type":"text","text":"两个文件都改了"}]}]' '{"timestamp":"2026-09-16T10:00:11.000Z","toolUseResult":{"status":"completed","agentId":"sf1","agentType":"general-purpose","content":[{"type":"text","text":"两个文件都改了"}],"totalDurationMs":11000,"totalTokens":900,"totalToolUseCount":6}}'
+  R m5 m4  s9s mp1 assistant '[]' "$(AM mm2 '[{"type":"text","text":"都改好了"}]' | with_ts 10:00:12.000Z)"
+} > "$SFP/s9s.jsonl"
+M9B "$SFP/s9s.jsonl" --project-id fx --workspace-id ws --workspace-roots /tmp/fx --capture-content 0 --close-last session_end \
+    --known-agents "$T/sf-known-main.json" --ledger /dev/null > "$T/sf-main.events"
+check "主会话：sf1 的 subagent.end 带它（连同 np2）改读的文件，根外的计在 files_dropped" \
+    '[.[] | select(.type=="subagent.end" and .agent_instance_id=="sf1")] | length == 1
+     and ((.[0].files | map([.path, .operation]) | sort) == [["README.md","read"],["docs/n.md","create"],["src/a.js","modify"],["src/new.js","create"]])
+     and .[0].extensions["vibetrail.files_dropped"] == {outside_workspace: 1}' "$T/sf-main.events"
+check "主会话：这一轮的 turn.end.files[] 包括自己改的 src/main.js 与子 agent 改读的全部" \
+    '[.[] | select(.type=="turn.end")] | length == 1 and ((.[0].files | map([.path, .operation]) | sort) == [["README.md","read"],["docs/n.md","create"],["src/a.js","modify"],["src/main.js","modify"],["src/new.js","create"]])' "$T/sf-main.events"
+schema_check < <(cat "$T/sf-sub.events" "$T/sf-main.events") > "$T/schema.sf" && ok || ko "子 agent 文件: $(cat "$T/schema.sf")"
+# 被打断的子 agent：subagent.end(cancelled) 也带它自己改过的文件
+{ head -n 3 "$SFP/s9s/subagents/agent-sf1.jsonl"
+  R s9 s3 s9s sp1 user '[{"type":"text","text":"[Request interrupted by user]"}]' "$(printf '%s' "$SUBX" | jq -c '. + {timestamp: "2026-09-16T10:00:03.000Z"}')"
+} > "$SFP/s9s/subagents/agent-sfi.jsonl.tmp"
+mkdir -p "$SFP/s9i/subagents"; sed 's/"sessionId":"s9s"/"sessionId":"s9i"/g' "$SFP/s9s/subagents/agent-sfi.jsonl.tmp" > "$SFP/s9i/subagents/agent-sf1.jsonl"; rm -f "$SFP/s9s/subagents/agent-sfi.jsonl.tmp"
+cp "$SFP/s9s/subagents/agent-sf1.meta.json" "$SFP/s9i/subagents/agent-sf1.meta.json"
+M9B "$SFP/s9i/subagents/agent-sf1.jsonl" --project-id fx --workspace-id ws --workspace-roots /tmp/fx --capture-content 0 --ledger /dev/null > "$T/sf-parent.events"
+check "被打断的子 agent：subagent.end(cancelled) 带它打断前改读的文件" \
+    '[.[] | select(.type=="subagent.end")] | length == 1 and .[0].payload.status.code == "cancelled"
+     and ((.[0].files | map([.path, .operation]) | sort) == [["README.md","read"],["src/a.js","modify"],["src/new.js","create"]])' "$T/sf-parent.events"
+
+# K11：workflow 起的 agent（按 09-16 用 Workflow 真跑的形态仿：meta 没有 toolUseId，有 workflowPhase；主会话里启动结果带 runId / taskId，完成是 task-notification）
+WFP=$T/wf-proj; WD=$WFP/s9w/subagents/workflows/wf_abc; mkdir -p "$WD"
+printf '%s\n' '{"agentType":"workflow-subagent","description":"wf-label","workflowPhase":"Build","spawnDepth":1}' > "$WD/agent-w1.meta.json"
+WX='{"agentId":"w1","isSidechain":true}'
+{ R w1u "" s9w wp1 user '"按脚本改 README"' "$(printf '%s' "$WX" | jq -c '. + {timestamp: "2026-09-16T11:00:01.000Z"}')"
+  R w1a w1u s9w wp1 assistant '[]' "$(AM wm1 '[{"type":"tool_use","id":"wt_e","name":"Edit","input":{"file_path":"/tmp/fx/README.md","old_string":"a","new_string":"b"}}]' | jq -c --argjson x "$WX" '. + $x + {timestamp: "2026-09-16T11:00:02.000Z"}')"
+  R w1r w1a s9w wp1 user '[{"type":"tool_result","tool_use_id":"wt_e","content":"The file /tmp/fx/README.md has been updated successfully."}]' "$(printf '%s' "$WX" | jq -c '. + {timestamp: "2026-09-16T11:00:03.000Z"}')"
+  R w1b w1r s9w wp1 assistant '[]' "$(AM wm2 '[{"type":"text","text":"改好了"}]' | jq -c --argjson x "$WX" '. + $x + {timestamp: "2026-09-16T11:00:04.000Z"}')"
+} > "$WD/agent-w1.jsonl"
+M9B "$WD/agent-w1.jsonl" --project-id fx --workspace-id ws --workspace-roots /tmp/fx --capture-content 0 --close-last stop --ledger "$T/wf-sub.ledger" > "$T/wf-sub.events"
+check "K11: workflow agent 文件（subagents/workflows/<runId>/ 下）——session_id 取 subagents 的上一层，subagent.start 父 main、带 vibetrail.workflow（run_id、phase），文件照记" \
+    '([.[] | select(.type=="subagent.start")] | length == 1 and (.[0] | .session_id == "s9w" and .agent_instance_id == "w1" and .parent_agent_instance_id == "main"
+       and .payload.agent_type == "workflow-subagent" and .extensions["vibetrail.workflow"] == {run_id: "wf_abc", phase: "Build"}))
+     and all(.[]; .session_id == "s9w")' "$T/wf-sub.events"
+check "K11: workflow agent 自己改的文件进账本" '.[0].agent_files == {w1: {"README.md": "modify"}}' "$T/wf-sub.ledger"
+jq -n -c '{wf_abc: {task_id: "wtask1", agents: {w1: {status: "completed", result: "改好了", label: "wf-label", phase: "Build", agent_type: "workflow-subagent"}}}}' > "$T/wf-runs.json"
+jq -n -c '{w1: {agent_type: "workflow-subagent", workflow_run: "wf_abc", files: {"README.md": "modify"}}}' > "$T/wf-known.json"
+NOTE_WF=$(jq -n -c '"<task-notification>\n<task-id>wtask1</task-id>\n<tool-use-id>toolu_wf</tool-use-id>\n<status>completed</status>\n<summary>Dynamic workflow \"x\" completed</summary>\n</task-notification>"')
+{ R n1 ""  s9w wp1 user '"跑个 workflow"' "$(TS 11:00:00.000Z)"
+  R n2 n1  s9w wp1 assistant '[]' "$(AM nm1 '[{"type":"tool_use","id":"toolu_wf","name":"Workflow","input":{"script":"…"}}]' | with_ts 11:00:00.200Z)"
+  R n3 n2  s9w wp1 user '[{"type":"tool_result","tool_use_id":"toolu_wf","content":"Workflow launched in background. Task ID: wtask1"}]' '{"timestamp":"2026-09-16T11:00:00.500Z","toolUseResult":{"status":"async_launched","taskId":"wtask1","taskType":"local_workflow","workflowName":"x","runId":"wf_abc"}}'
+  R n4 n3  s9w wp1 assistant '[]' "$(AM nm2 '[{"type":"text","text":"等它跑完"}]' | with_ts 11:00:01.000Z)"
+  AT n5 n4 s9w wp1 "$(jq -n -c --argjson p "$NOTE_WF" '{type: "queued_command", commandMode: "task-notification", prompt: $p}')" "$(TS 11:00:05.000Z)"
+  R n6 n5  s9w wp1 assistant '[]' "$(AM nm3 '[{"type":"text","text":"跑完了"}]' | with_ts 11:00:06.000Z)"
+} > "$WFP/s9w.jsonl"
+M9B "$WFP/s9w.jsonl" --project-id fx --workspace-id ws --workspace-roots /tmp/fx --capture-content 1 --close-last session_end \
+    --known-agents "$T/wf-known.json" --workflow-runs "$T/wf-runs.json" --ledger "$T/wf-main.ledger" > "$T/wf-main.events"
+check "K11: 主会话收到 workflow 的通知——给 run 里跑完的 w1 发 subagent.end：父 main、派它的调用是那次 Workflow 调用、completed、最后的回答、文件、vibetrail.workflow" \
+    '[.[] | select(.type=="subagent.end" and .agent_instance_id=="w1")] | length == 1
+     and (.[0] | .parent_agent_instance_id == "main" and .parent_call_id == "toolu_wf" and .payload.status == {code: "completed", category: "success"}
+       and .payload.last_message == "改好了" and .payload.agent_type == "workflow-subagent"
+       and .files == [{path: "README.md", operation: "modify", evidence: "tool_result"}]
+       and .extensions["vibetrail.workflow"] == {run_id: "wf_abc", phase: "Build", label: "wf-label"})' "$T/wf-main.events"
+check "K11: workflow 的通知不被当成子 agent 或后台 shell（task-id 不是 agentId，不冒出实例 wtask1）；这一轮的 files[] 并进 w1 改的 README.md" \
+    'all(.[]; .agent_instance_id != "wtask1") and ([.[] | select(.type=="turn.end")][0].files == [{path: "README.md", operation: "modify", evidence: "tool_result"}])' "$T/wf-main.events"
+check "K11: 账本记下 run → 派它的调用与 taskId" '.[0].agents.workflows == {wf_abc: {call_id: "toolu_wf", task_id: "wtask1"}}' "$T/wf-main.ledger"
+schema_check < <(cat "$T/wf-sub.events" "$T/wf-main.events") > "$T/schema.wf" && ok || ko "workflow: $(cat "$T/schema.wf")"
+# 还在跑的 workflow agent（journal 里没有终态）：通知里不给它发 subagent.end
+jq -n -c '{wf_abc: {task_id: "wtask1", agents: {w1: {status: null, label: "wf-label"}}}}' > "$T/wf-runs-open.json"
+M9B "$WFP/s9w.jsonl" --project-id fx --workspace-id ws --workspace-roots /tmp/fx --capture-content 0 --close-last session_end \
+    --known-agents "$T/wf-known.json" --workflow-runs "$T/wf-runs-open.json" --ledger /dev/null > "$T/wfi.events"
+check "K11: journal 里还没有终态的 workflow agent 不发 subagent.end" 'all(.[]; .type != "subagent.end")' "$T/wfi.events"
+if [ ! -s "$T/m9b.err" ]; then ok; else ko "这一节的映射有报错: $(head -c 300 "$T/m9b.err")"; fi
+
 echo "════ 10. K19 钉子：映射规则变了就得升 rule_version ════"
 # 协议「适配器升级映射规则时更新 rule_version」。把上面各节确定性的输出（fixtures 的 golden + 第 6～9 节的事件，四路 rule_version 都有）
 # 按 rule_version 分别算摘要，记在 expect/RULE-DIGESTS：摘要变了而版本号还是登记过的那个 → 红。升了版本号（新名字没登记）不算错，
 # --update 把新名字记进去、去掉旧的；--update 碰到「变了没升」也红，除非 --accept-rule-digest（确认只是 fixture 变了、规则没变）
 DIG=$FX/expect/RULE-DIGESTS
 cat "$T"/*.norm > "$T/digest.in"
-for x in cap big sys sys0 cfg-on cfg-off cfg-default k8 k12 k13 m8a m8c m8c0 m8d m8s m8s0 m8u m8u1 m8v k18 k20 k20-0 k21 k21-nt k21-deny k22 k22-noroot k22i; do
+for x in cap big sys sys0 cfg-on cfg-off cfg-default k8 k12 k13 m8a m8c m8c0 m8d m8s m8s0 m8u m8u1 m8v k18 k20 k20-0 k21 k21-nt k21-deny k22 k22-noroot k22i \
+         a11 a11b sf-sub sf-main sf-parent wf-sub wf-main wfi; do
     [ -f "$T/$x.events" ] && jq -S -c . "$T/$x.events" >> "$T/digest.in"
 done
 : > "$T/digests.new"
@@ -588,8 +732,9 @@ elif [ ! -f "$DIG" ]; then ko "K19: 缺 expect/RULE-DIGESTS（跑 --update 生�
 elif [ -n "$bad_rv" ]; then ko "K19: 映射输出变了而 rule_version 没升：${bad_rv}（改了映射规则就升 map.mjs 的 RULE_VERSIONS，再 --update）"
 elif [ -n "$new_rv" ]; then ko "K19: 有没登记的 rule_version：${new_rv}（跑 --update 登记）"
 else ok; fi
-check "K19: 四路 rule_version 都在钉子里，且都是 09-16 定的 v2 基线（09-15 定 v1 之后改过规则、版本号一直没动）" \
-    '(map(.provenance.rule_version) | unique | map(select(. != null))) == ["call-v2","diverge-v2","ext-v2","turn-v2"]' "$T/digest.in"
+RV_NOW=$(node --input-type=module -e "import { RULE_VERSIONS } from '$SELF/lib/map.mjs'; console.log(JSON.stringify(Object.values(RULE_VERSIONS).sort()))")
+check "K19: 四路 rule_version 都在钉子里，且与 map.mjs 的 RULE_VERSIONS 一致（${RV_NOW}）" \
+    "(map(.provenance.rule_version) | unique | map(select(. != null))) == $RV_NOW" "$T/digest.in"
 
 echo
 [ "$skipped_schema" -gt 0 ] && echo "  ⚠ 本机 python3 没有 jsonschema，协议 schema 校验跳过 $skipped_schema 处（pip install jsonschema 后重跑）"

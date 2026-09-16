@@ -645,7 +645,7 @@ function describe(e) {
   } else if (t === 'message.user' && e.payload.delivery === 'queued') d = `（模型干活时插进来的话）“${clip(e.payload.text, 100)}”`;
   else if (t === 'message.user' || t === 'message.assistant') d = `“${clip(e.payload.text, 100)}”`;
   else if (t === 'subagent.start') d = `${e.payload.agent_type} 父=${e.parent_agent_instance_id}`;
-  else if (t === 'subagent.end') d = `${e.payload.status.code} ${e.payload.agent_type ?? ''}`;
+  else if (t === 'subagent.end') d = `${e.payload.status.code} ${e.payload.agent_type ?? ''}${Array.isArray(e.files) ? ` 文件 ${e.files.filter((f) => f.operation !== 'read').length} 改/${e.files.filter((f) => f.operation === 'read').length} 读` : ''}${e.extensions?.['vibetrail.workflow'] ? ` workflow ${e.extensions['vibetrail.workflow'].run_id}` : ''}`;
   else if (String(t).startsWith('ext.')) { const p = { ...e.payload }; delete p.tool_input; d = clip(JSON.stringify(p), 100); }
   const ts = String(e.occurred_at).replace(/\.\d+Z$/, 'Z').replace('T', ' ').replace(/Z$/, '');
   const typ = t + ' '.repeat(Math.max(22 - t.length, 1));
@@ -874,6 +874,37 @@ export async function cmdDoctor() {
     }
   } catch {}
   if (rw > 0) note(`有 ${rw} 次 transcript 被重写后从头重读（offset 信任检查，DESIGN §3.3）`);
+
+  // A11 完整性（运行时部分）：每份 transcript 新读到的记录走到了哪，按会话累计在 state/<sid>/integrity.json
+  const tot = {}; const unknownTypes = {}; const noHit = new Set(); const broken = []; const truncated = new Set(); let nInteg = 0;
+  try {
+    for (const d of fs.readdirSync(path.join(VT_HOME, 'state'))) {
+      const integ = readJson(path.join(VT_HOME, 'state', d, 'integrity.json'), null);
+      if (!integ || typeof integ.files !== 'object' || integ.files === null) continue;
+      nInteg++;
+      for (const [name, f] of Object.entries(integ.files)) {
+        if (!f || typeof f !== 'object') continue;
+        for (const [k, v] of Object.entries(f)) if (typeof v === 'number') tot[k] = (tot[k] ?? 0) + v;
+        for (const [k, v] of Object.entries(f.unknown_types ?? {})) if (typeof v === 'number') unknownTypes[k] = (unknownTypes[k] ?? 0) + v;
+        if ((f.marker_without_hit ?? 0) > 0) noHit.add(d.slice(0, 8));
+        if ((f.truncated_bytes ?? 0) > 0) truncated.add(d.slice(0, 8));
+        const g = (k) => f[k] ?? 0;
+        if (g('seen') !== g('records') + g('bad_json') + g('skipped_non_object') + g('skipped_no_uuid') + g('replayed') + g('inherited')) broken.push(`${d.slice(0, 8)}/${name}`);
+      }
+    }
+  } catch {}
+  if (nInteg === 0) say('  · 完整性（A11）：还没有读过记录');
+  else {
+    const t = (k) => tot[k] ?? 0;
+    ok(`完整性（A11）：${nInteg} 个会话读过 ${t('seen')} 条记录，${t('records')} 条进了映射；不是对象 ${t('skipped_non_object')}、没有 uuid ${t('skipped_no_uuid')}、回放副本 ${t('replayed')}、复制来的历史 ${t('inherited')} 条按规则跳过`);
+    if (t('bad_json') > 0) note(`transcript 里有 ${t('bad_json')} 行不是 JSON（写到一半崩了？），整行跳过`);
+    if (broken.length) note(`有记录没走到映射、也没算进任何一种跳过（${broken.slice(0, 5).join('、')}${broken.length > 5 ? ' 等' : ''}）——映射层计数有漏洞，查 map.mjs 的 step`);
+    if (noHit.size) note(`拒绝标记（User rejected tool use）没被判据认出 ${t('marker_without_hit')} 次（会话 ${[...noHit].slice(0, 5).join('、')}）——Claude Code 的拒绝文案可能变了，人拒绝会漏报（G6）`);
+    const uk = Object.entries(unknownTypes).sort((a, b) => b[1] - a[1]);
+    if (uk.length) note(`transcript 里有 ${uk.length} 种不认识的记录类型：${uk.slice(0, 6).map(([k, v]) => `${k} ×${v}`).join('、')}${uk.length > 6 ? ' 等' : ''}——新版 Claude Code 加的，看要不要映射（在 map.mjs 的已知清单里登记或加映射）`);
+    if (t('content_dropped') > 0) say(`  · 超过协议 1 MiB 的事件去掉正文照发 ${t('content_dropped')} 条（vibetrail.content_dropped = size）`);
+    if (truncated.size) note(`单次读超过 50 MB、丢掉了最老的 ${Math.round(t('truncated_bytes') / 1048576)} MB 没读（会话 ${[...truncated].slice(0, 5).join('、')}）`);
+  }
 
   // 落后的 transcript
   let lag = 0;
