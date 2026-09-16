@@ -267,6 +267,19 @@ check "全新机器（原来没有 settings.json）：init 说新建了一份，
 mkdir -p "$T/g/home/.claude"; printf '{"model": "opus"}\n' > "$T/g/home/.claude/settings.json"; g0=$(cksum < "$T/g/home/.claude/settings.json")
 check "运行时在临时目录、settings 不在（模拟测试漏设 VIBETRAIL_CLAUDE_SETTINGS）：init 拒绝写，settings 一字不动" \
     '! ( cd "$REPO" && VIBETRAIL_HOME=$T/g/tmpvt VIBETRAIL_CLAUDE_SETTINGS=$T/g/home/.claude/settings.json VIBETRAIL_TMP_ROOTS=$T/g/tmpvt bash "$SELF/vibetrail" init --no-register --no-pick >/dev/null 2>&1 ) && [ "$(cksum < "$T/g/home/.claude/settings.json")" = "$g0" ]'
+# 重复挂载：Claude Code 把 HOME / 项目 / 企业策略几层的 hooks 合起来跑，同一事件挂两处就触发两遍
+# （teamai 的 src/hooks.ts:1009 踩过同一个坑：老版本在 HOME 之外还往项目目录写了一份，升级后每次会话开始触发两次）
+vdoc(){ ( cd "$REPO" && VIBETRAIL_HOME=$IS/.vibetrail VIBETRAIL_CLAUDE_SETTINGS=$IS/.claude/settings.json bash "$SELF/vibetrail" doctor 2>&1 ); }
+check "doctor：只有 HOME 挂着时说「只挂在一处」；Notification 的两个 matcher（permission_prompt / idle_prompt）不算重复" \
+    'o=$(vdoc); printf "%s" "$o" | grep -q "hook 只挂在一处" && ! printf "%s" "$o" | grep -q "重复挂载"'
+mkdir -p "$REPO/.claude"; jq '{hooks: {Stop: .hooks.Stop}}' "$IS/.claude/settings.json" > "$REPO/.claude/settings.local.json"
+check "doctor：项目级 settings 里也挂了一份 Stop → 报重复挂载，并把两份文件都点名" \
+    'o=$(vdoc); printf "%s" "$o" | grep -q "hook 重复挂载：Stop（2 条" && printf "%s" "$o" | grep -q "$REPO/.claude/settings.local.json"'
+rm -f "$REPO/.claude/settings.local.json"; rmdir "$REPO/.claude" 2>/dev/null
+check "doctor：同一份 settings 里同一事件挂了两条（同 matcher）也算重复" \
+    'jq ".hooks.Stop += .hooks.Stop" "$IS/.claude/settings.json" > "$IS/.claude/s.tmp" && cp "$IS/.claude/settings.json" "$IS/.claude/s.bak" \
+     && mv "$IS/.claude/s.tmp" "$IS/.claude/settings.json"; o=$(vdoc); mv "$IS/.claude/s.bak" "$IS/.claude/settings.json"
+     printf "%s" "$o" | grep -q "hook 重复挂载：Stop（2 条"'
 vcli uninstall
 check "uninstall 之后回到原样，原样那份备份没被覆盖" 'jq -e ". == {model: \"opus\"}" "$IS/.claude/settings.json" >/dev/null && jq -e ". == {model: \"opus\"}" "$IS/.vibetrail/backup/settings.json.before-vibetrail" >/dev/null 2>&1'
 

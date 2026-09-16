@@ -118,7 +118,7 @@ bash experiments/collect-demo/report.sh -o experiments/collect-demo/out/report.m
 ~/.vibetrail/bin/vibetrail uninstall
 ```
 
-`doctor` 查运行时、jq 版本与**映射器在这个 jq 上跑不跑得通**（拿一条假记录真跑一遍：jq 的语法错是整份文件级的，编译不过的话 transcript 那一路一条都不出，而 hook 仍然全部 exit 0）、hook 条目（包括命令指向的脚本在不在）、登记表、有没有落后没采的会话、错误日志（映射失败单独点出条数）。
+`doctor` 查运行时、jq 版本与**映射器在这个 jq 上跑不跑得通**（拿一条假记录真跑一遍：jq 的语法错是整份文件级的，编译不过的话 transcript 那一路一条都不出，而 hook 仍然全部 exit 0）、hook 条目（包括命令指向的脚本在不在）、有没有重复挂载（同一事件挂在 HOME 与项目两处会触发两遍）、登记表、有没有落后没采的会话、错误日志（映射失败单独点出条数）。
 卸载只去掉 settings 里自己的条目和运行时，已采的数据、配置、登记表留着；加 `--purge` 连 `~/.vibetrail` 整个删掉。
 
 ## 演示时要说清楚的

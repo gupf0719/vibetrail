@@ -18,7 +18,7 @@
 #   vibetrail show [--session SID] [--type 前缀] [--last N] [--json]
 #       把采到的事件按会话、按时间列成人能读的一行一条；--json 原样输出协议事件
 #   vibetrail sync                                            立刻把登记过的仓里没采完的 transcript 补一遍（平时开会话时的 SessionStart 会做）
-#   vibetrail doctor                                          自检：运行时、jq 与映射器、settings 条目、scope 与登记、采集证据、落后、错误日志
+#   vibetrail doctor                                          自检：运行时、jq 与映射器、settings 条目与重复挂载、scope 与登记、采集证据、落后、错误日志
 #   vibetrail version
 #
 # 环境变量：VIBETRAIL_HOME（默认 ~/.vibetrail）、VIBETRAIL_CLAUDE_SETTINGS（默认 ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json）、
@@ -489,6 +489,18 @@ cmd_sync(){ # 与 SessionStart 的补做相同：本仓与所有登记过的仓�
     say "✓ 补采完：spool 从 $before 块到 $after 块（vibetrail show / list 看结果）"
 }
 
+settings_layers(){ # 本机所有可能挂着 vibetrail hook 的 settings：HOME 两份、企业策略、当前仓与登记过的仓（连同各自 worktree）的项目级两份
+    printf '%s\n' "$SETTINGS" "${SETTINGS%.json}.local.json" \
+        "/Library/Application Support/ClaudeCode/managed-settings.json" "/etc/claude-code/managed-settings.json"
+    local a d wt
+    { vt_main_checkout "$PWD" 2>/dev/null; for a in "$VT_HOME/projects"/*; do [ -f "$a" ] && head -1 "$a"; done; } | sort -u \
+      | while IFS= read -r d; do
+            [ -d "$d" ] || continue
+            git -C "$d" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' \
+              | while IFS= read -r wt; do printf '%s\n%s\n' "$wt/.claude/settings.json" "$wt/.claude/settings.local.json"; done
+        done
+}
+
 cmd_doctor(){
     local fatal=0 warn=0 a
     ok(){ printf '  ✓ %s\n' "$*"; }
@@ -556,6 +568,26 @@ cmd_doctor(){
             fi
         fi
     else bad "读不了 $SETTINGS"; fi
+    # 重复挂载：Claude Code 把 HOME / 项目 / 企业策略几层的 hooks 合起来跑，同一事件挂在两处就触发两遍。
+    # teamai 踩过同一个坑（它的 src/hooks.ts:1009：老版本在 HOME 之外还往项目目录写过一份，升级后两份都活着，每次会话开始触发两次），
+    # 它的对策是安装期清扫，我们先做检查。照它的经验，这里不按「当前登记的事件」过滤——早先写下的副本挂的可能是别的事件名
+    local dup
+    # 按「事件 + matcher」分组数：同一事件下不同 matcher 各一条是正常的（init 给 Notification 写了 permission_prompt 与 idle_prompt 两条）
+    dup=$(settings_layers | sort -u | while IFS= read -r a; do
+              [ -f "$a" ] || continue
+              "$JQ" -r --arg f "$a" '(.hooks // {}) | to_entries[] | .key as $e
+                  | .value[]? | ((.matcher // "*") | tostring) as $m
+                  | ([.hooks[]? | select((((.command? // "") | tostring) | contains("vibetrail-hook")))] | length) as $n
+                  | select($n > 0) | "\($e)\t\($m)\t\($n)\t\($f)"' "$a" 2>/dev/null
+          done | awk -F'\t' '{ k = $1 SUBSEP $2; n[k] += $3; e[k] = $1; m[k] = $2
+                               if (index(f[k], $4) == 0) f[k] = f[k] (f[k] == "" ? "" : "、") $4 }
+                              END { for (k in n) if (n[k] > 1)
+                                        printf "%s%s（%d 条：%s）\n", e[k], (m[k] == "*" ? "" : " matcher=" m[k]), n[k], f[k] }')
+    if [ -n "$dup" ]; then
+        while IFS= read -r a; do note "hook 重复挂载：$a"; done <<< "$(printf '%s' "${dup}" | sed "s#${HOME}/#~/#g")"
+        say "     · 后果：这些事件每触发一次跑两遍 hook；session.start / session.end / ext.claude.* 会各多一份（它们的幂等键里带时间），"
+        say "       轮次与分歧那几类按 event_id 在本机 ids 就挡掉了。去掉多余的那份（init 只往 HOME 写，项目级的是人手加的）"
+    else ok "hook 只挂在一处（${SETTINGS}）"; fi
     # scope 与登记
     local scope; scope=$(vt_conf scope project)
     local here; here=$(vt_main_checkout "$PWD" 2>/dev/null) || here=""
