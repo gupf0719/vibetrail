@@ -1,0 +1,75 @@
+#!/usr/bin/env node
+// vibetrail 运行时入口（DESIGN D12）：按 argv 分发。移植期间先只有 map 一个子命令，
+// hook / cli / push 随 ②③⑤ 依次搬进来。
+//
+//   node vibetrail.mjs map --sid … --project-id … [--from-line N] … < <transcript 的字节切片>
+//
+// stdin 是 vibetrail-map 按 offset 切好的那一段（整行，末尾半行由调用方裁掉），每行一条记录。
+// stdout：每行一个协议事件（event_id 为 null、多一个 _key，由 vt_fill_ids 填），最后一行 {"_ledger": …}。
+// 与 jq 版逐字节对齐：字段、顺序、账本都不变（golden 比对前按键排序，所以键序无关）。
+import { readFileSync } from 'node:fs';
+import { mapRecords } from './lib/map.mjs';
+
+const argv = process.argv.slice(2);
+const cmd = argv.shift();
+
+function die(msg) { process.stderr.write(`✗ vibetrail.mjs: ${msg}\n`); process.exit(1); }
+
+function parseArgs(rest) {
+  const a = {
+    sid: '', project_id: '', workspace_id: '', parent_instance: 'main',
+    start_line: 1, from_line: 0, meta: null, seen_uuids: [], hook_turns: {}, hook_perms: [],
+    perm_since: '', close_last: '', stop_turn: '', turns: true, vt_version: '', rule_version: 'diverge-v1',
+    capture_content: '1',
+  };
+  const jsonFile = (p, dflt) => { try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return dflt; } };
+  for (let i = 0; i < rest.length; i++) {
+    const k = rest[i], v = rest[i + 1];
+    switch (k) {
+      case '--sid': a.sid = v; i++; break;
+      case '--project-id': a.project_id = v; i++; break;
+      case '--workspace-id': a.workspace_id = v; i++; break;
+      case '--parent-instance': a.parent_instance = v; i++; break;
+      case '--start-line': a.start_line = Number(v); i++; break;
+      case '--from-line': a.from_line = Number(v); i++; break;
+      // --meta 收的是 JSON 串（vibetrail-map 那边是 --argjson），也容许给文件路径
+      case '--meta': {
+        if (v === '' || v === 'null') a.meta = null;
+        else { try { a.meta = JSON.parse(v); } catch { a.meta = jsonFile(v, null); } }
+        i++; break;
+      }
+      case '--seen-uuids': a.seen_uuids = v === '' ? [] : jsonFile(v, []); i++; break;
+      case '--hook-turns': a.hook_turns = v === '' ? {} : jsonFile(v, {}); i++; break;
+      case '--hook-perms': a.hook_perms = v === '' ? [] : jsonFile(v, []); i++; break;
+      case '--perm-since': a.perm_since = v; i++; break;
+      case '--close-last': a.close_last = v; i++; break;
+      case '--stop-turn': a.stop_turn = v; i++; break;
+      case '--rule-version': a.rule_version = v; i++; break;
+      case '--vt-version': a.vt_version = v; i++; break;
+      case '--capture-content': a.capture_content = v; i++; break;
+      case '--no-turns': a.turns = false; break;
+      default: die(`未知参数 ${k}`);
+    }
+  }
+  return a;
+}
+
+if (cmd === 'map') {
+  const args = parseArgs(argv);
+  const raw = readFileSync(0, 'utf8');
+  const records = [];
+  let ln = 0;
+  for (const line of raw.split('\n')) {
+    ln++;
+    if (line.trim() === '') continue;
+    try { records.push(JSON.parse(line)); }
+    catch (e) { die(`第 ${ln} 行不是 JSON：${String(e.message).slice(0, 120)}`); }
+  }
+  const { events, ledger } = mapRecords(records, args);
+  let buf = '';
+  for (const e of events) buf += JSON.stringify(e) + '\n';
+  buf += JSON.stringify({ _ledger: ledger }) + '\n';
+  process.stdout.write(buf);
+} else {
+  die(`未知子命令 ${cmd ?? '(空)'}；移植期间只有 map`);
+}

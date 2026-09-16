@@ -140,6 +140,21 @@ fi
 case "$perm_since" in ''|*[!0-9]*) perm_since="";; esac
 
 # ---- 映射：从 start_byte 读到最后一个换行（按偏移跳读、走管道，不落临时副本） ----
+# D12 移植期间两套引擎并存：VIBETRAIL_ENGINE=node 走 .mjs，默认仍是 jq。两边吃同样的 stdin、给同样的 stdout，
+# 对拍就是同一批 transcript 两个引擎各跑一遍比事件（移植 ① 的验收）
+if [ "${VIBETRAIL_ENGINE:-jq}" = "node" ]; then
+    NODE=$(vt_conf node node)
+    set -- --sid "$sid" --project-id "$project_id" --workspace-id "$workspace_id" --parent-instance "$parent" \
+           --start-line "$start_line" --from-line "$from_line" --meta "$meta_json" \
+           --seen-uuids "$tmp.seen" --hook-turns "$tmp.turns" --hook-perms "$tmp.perms" --perm-since "$perm_since" \
+           --close-last "$close_last" --stop-turn "$stop_turn" --vt-version "$vt_version" --rule-version "diverge-v1" \
+           --capture-content "${capture_content:-$(vt_conf capture_content 1)}"
+    [ "$turns" = false ] && set -- "$@" --no-turns
+    tail -c +$((start_byte + 1)) "$f" | head -c $((consumed - start_byte)) \
+        | "$NODE" "$SELF/vibetrail.mjs" map "$@" > "$tmp" 2>"$tmp.err"
+    rc=$?
+    if [ $rc -ne 0 ] || [ -s "$tmp.err" ]; then die "node 失败（rc=${rc}）: $(head -c 300 "$tmp.err")"; fi
+else
 tail -c +$((start_byte + 1)) "$f" | head -c $((consumed - start_byte)) | $JQ -n -c -L "$SELF" \
     --arg sid "$sid" --arg project_id "$project_id" --arg workspace_id "$workspace_id" --arg parent_instance "$parent" \
     --argjson start_line "$start_line" --argjson from_line "$from_line" --argjson meta "$meta_json" --slurpfile seen_uuids "$tmp.seen" \
@@ -151,6 +166,7 @@ tail -c +$((start_byte + 1)) "$f" | head -c $((consumed - start_byte)) | $JQ -n 
 rc=$?
 if [ $rc -ne 0 ] || [ -s "$tmp.err" ]; then
     die "jq 失败（rc=${rc}）: $(head -c 300 "$tmp.err")"
+fi
 fi
 
 # ---- event_id：UUIDv5(uuid5(NS_URL, "vibetrail"), "<sid>|<_key>")，实现在 vibetrail-lib.sh 的 vt_fill_ids（hook 直接发的事件共用） ----
