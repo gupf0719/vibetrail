@@ -83,11 +83,17 @@
      ⑤ 之后才在 JS 里做下面「09-16 复核核出的修补」，再写 push。
   3. 测试：第一步 bash 回归脚本不动，只把被测程序换掉（断言处的 jq 只在开发机用，运行时不再依赖 jq）；第二步换 `node:test`。fixtures / golden / scenario.json 原样沿用。
   4. 风险要盯：行为漂移（靠 golden 与 hook 回归兜）；同步 hook 从 20 ms 变 70～135 ms；desktop 启动的 hook 没有 PATH（包装只用 config 里的绝对路径）；两套并存期间别的会话往 jq 里加东西（冻结）。
-- [x] **09-16 复核核出的修补**（2026-09-16：K8 / K12 / K13 `51f8716`，K14 / K15①③ / K16 `4235fca`，各带回归；K15 ②④⑤ 与 U16 仍开着）（本机 124,666 条真实事件 + teamai / Pilot 源码对照，见 OPEN-ISSUES；都小，**移植完在 JS 里做**，顺序按影响排）：
+- [x] **09-16 复核核出的修补**（2026-09-16：K8 / K12 / K13 `51f8716`，K14 / K15①③ / K16 `4235fca`，K15④⑤ `bbca2fd` / `296a08d`，K15② 与 U16 随 D13 `0d4fa7d`；各带回归，全部关闭）（本机 124,666 条真实事件 + teamai / Pilot 源码对照，见 OPEN-ISSUES；都小，**移植完在 JS 里做**，顺序按影响排）：
   K8 复制历史按记录 `sessionId` 跳过（🔴，7.6% 的事件在复制的轮上、trace 翻倍）→ K13 打断的 turn.end 补 `closed_by` / `stops`、打断后置 closed →
   K12 只在人话 / 斜杠命令处开轮或打 `turn_kind` → K15 ①③（capabilities 加 `tool.end`、state 目录清理）→ K14 uninstall 留 ids → K16 命令串 `2>/dev/null || true` 与 stdin 超时。
-  每条各补一个回归用例（见下面「回归」）。U16（四个只记事件头的事件默认登不登记）等用户定。
-- [ ] push（用户 09-15：先不急着做）：`vibetrail push [--list | --show]`，端点与 token 从 `~/.vibetrail/config` 读、没配不发；配了按协议打批（≤ 100 条 / 16 MiB）、每条先过 schema、`event_id` 幂等、accepted + duplicate 推进水位并删本机块、失败重发。
+  每条各补一个回归用例（见下面「回归」）。U16 用户 09-16 定只挂 5 个 hook（D13）。
+- [ ] **push 之前先对齐采集端协议**（2026-09-16 对照 `paas-coding-collector/docs/collection-event-protocol.md` 核出；推出去之后再改，云端历史要么分成两份、要么口径前后不一，详见 OPEN-ISSUES）：
+  1. K17：`project_id` 改成简单项目名（remote 的仓库名 > 主 checkout 目录名），`workspace_id` 改成第一次见到时生成、持久化的 UUID（uninstall 留着）；先定按主 checkout 一个还是每个 worktree 一个；test-hook-flow 第 16 段跟着改。
+  2. K18：状态分类换成推荐值（`error` → `failure`），`tool.end` 的 code 换成 `succeeded` / `failed`；goldens 与断言跟着改。
+  3. U12：用量口径——cached 算 input 的子集、total = input + output、来源没给的字段不填（要用户定）。
+  4. K24：被别的 Stop hook 拦下时不提前发 `turn.end`——Stop 时等 `stop_hook_summary` 落盘，或跟 collector 确认可以后到的覆盖先到的（要定）。
+  5. K19：统一升一次 `rule_version` 定成基线，之后改映射规则就升；加钉子：golden 变了而 rule_version 没变就红。
+- [ ] push（用户 09-15：先不急着做）：`vibetrail push [--list | --show]`，端点从 `~/.vibetrail/config`、token 从 `~/.vibetrail/token` 读（09-16 init 已引导填；联调阶段 token 可省），端点没配不发；配了按协议打批（≤ 100 条 / 16 MiB）、每条先过 schema、`event_id` 幂等、accepted + duplicate 推进水位并删本机块、失败重发。
   **门槛与兜底（D6，用户 09-15 定，DESIGN §4）**：Stop 落 spool 后查全机最早待发是否超 1 小时、全机待发是否满 100 条（`push_max_age` / `push_max_events` 可配），任一满足且不在退避期才推，
   扫全部 spool 混批、循环发到发完、一次最多 10 批；SessionEnd 起脱离进程的后台 push、SessionStart 补做后 push，都不看门槛只看退避；机器级 mkdir 锁 `state/push/.lock`、陈旧阈值 600 s；
   失败分暂时（退避 1 分钟起指数到 1 小时封顶，记在 `state/push/`）与永久（4xx 整块挪 `spool/.rejected/`、计数进 doctor）。
@@ -97,7 +103,7 @@
   - **批是 ack 单位，不是块**：本机 751 块里 310 块超过 100 条，最大一块 20,000 条（补采历史）。每块记一个已发行号的游标（`state/push/<块名>.cursor`），按批发、批 ack 推进游标，
     游标到末尾才删块；进程在 ack 与推进游标之间被杀最多重发一批，event_id 幂等兜住。上面「ack 即删整块」按这个理解。
   - **4xx 只隔离那一批**（≤ 100 条写进 `spool/.rejected/<块名>.<批号>.jsonl`），游标照推——一块 20,000 条不能因一条坏事件全丢。
-  - **门槛重估**：加了 trace 后一轮常常就超 100 条（本机 `message.assistant` + `tool.end` 占 95%），「满 100 条」等于每次 Stop 都推，D6 要的「每小时量级」不成立。
+  - **门槛重估**（立为 OPEN-ISSUES U17，做 push 前定）：加了 trace 后一轮常常就超 100 条（本机 `message.assistant` + `tool.end` 占 95%），「满 100 条」等于每次 Stop 都推，D6 要的「每小时量级」不成立。
     要么明说接受，要么 `push_max_events` 默认改到 1,000 左右；SessionStart / sync 的后台路径不限 10 批（本机现在积压 1,245 批，按 10 批要 125 次 hook 才发完），改成限时（如 60 s）不限批数。
   - **「每条先过 schema」bash + jq 做不到**：改成手写结构校验 `lib/schema.mjs`（D12；必填键、`code` 正则、条件必填、`occurred_at` 以 Z 结尾、单条 ≤ 1 MiB、每批 ≤ 100 条 / 16 MiB），完整 schema 校验只留在测试里（python jsonschema）。
   - **push 在 D12 移植之后用 JS 写**（`lib/push.mjs`）：分批与游标是数组切片加一个 JSON 状态文件，退避加抖动一行算式，重试分类对 `response.status` / `err.code` 做 switch，`fetch` 传 header 对象、token 不经过命令行。先用 bash 写再移植等于做两遍，不做。
@@ -107,19 +113,21 @@
   - `batch_id` 用首末 event_id 算 UUIDv5，重发同一批 id 不变，服务端排查方便；`client.device_id` 用 config 里的。
   - 先修 K14（uninstall 留 spool 删 ids）再上 push，否则重装后待发翻倍。
   - 要测再加：块超 100 条分批与游标续传、4xx 只丢一批、进程在 ack 与删块之间被杀不重不丢、token 不出现在进程列表。
+- [ ] **全采与协议补齐**（2026-09-16 核出，不挡 push，详见 OPEN-ISSUES）：K20 排队的人话发 `message.user`（`delivery: queued`，本机 278 条没上报）；K21 按停止打断工具补发 `tool.end(cancelled)`；K22 `turn.end.files[]`（这一轮改了哪些文件，先量体积）；K23 `capture_content=0` 时 `subagent.start` 不带 `task`；K11 workflow 子 agent 遇到样本时递归扫 `subagents/`；K25 DESIGN 补全采的决策条目、改 §0 / §2 / D5。
 - [ ] 完整性钉子：每类记录条数进出相等、映射后事件全部过 schema（这两条测试期已在 `test-map.sh` 钉住；运行时要进账本与 doctor）、超 1 MiB 被拒计数、未知记录类型 / 事件名告警（A11；G10、G6）。
   **09-16**：映射账本里 in / out / replayed / skipped_no_uuid / sentinel 已有，K8 修后再加 inherited；缺的是把它们按会话累计进 state、由 doctor 汇总（哪个会话 `marker_without_hit` > 0、`skipped_*` > 0、replayed 异常多），
   并在 test-hook-flow 里做成恒等式断言（记录数 = 出事件的 + 跳过的 + 不产事件的）——Pilot 的恒等式只写在文档里、测试 grep 不到，正是要避免的（G10）。
+  **09-16 补**：D13 之后没有 hook 侧的类型化事件可以对账（DESIGN §3.2），「已知清单之外的记录类型 / attachment 类型」告警更要紧；超过 1 MiB 现在是去掉正文照发（`vibetrail.content_dropped` = size），条数进 doctor。
 - [ ] 回归（用户 09-15：先不急着做）：两路各有带断言的测试，输入用 [experiments/collect-demo/scenario.json](experiments/collect-demo/scenario.json) 回放，补上 SessionStart 补做、
   打断后无 Stop、后台子 agent 晚于父 Stop、一轮多 commit、端点未配置 / 配置后断网五个场景。分歧一路已有 `test-hook-flow.sh`，其中补做与打断后无 Stop 已覆盖；
-  轮次元数据一路现在只有 demo.sh 端到端跑一遍、没有断言。本机 python 没装 jsonschema，两套回归里的 schema 项在这台机器上是跳过的。
-  **09-16 要补的用例**：带外来 `sessionId` 记录的复制历史不上报（K8）、非人话 promptId 不开轮（K12）、关轮之后再来打断只留一条或带 closed_by（K13）、
-  summary 与 Stop 同一秒落盘时两条路 event_id 相同且只留一条（D7 补记）、uninstall 后重装 spool 不翻倍（K14）、命令串带 `|| true` 时 `settings_ok` / doctor 仍认得（K16）；push 的见上。
+  轮次元数据一路现在只有 demo.sh 端到端跑一遍、没有断言。（09-16 起本机装了 jsonschema，两套回归里的 schema 项不再跳过。）
+  **09-16 已补**：K8 / K12 / K13（test-map 第 7 段）、K14 / K16（test-hook-flow 第 17 段）、后台子 agent 晚于父 Stop（test-hook-flow 第 7 段，D13）。**还缺**：summary 与 Stop 同一秒落盘时两条路 event_id 相同且只留一条（D7 补记）、一轮多 commit、端点未配置 / 配置后断网（随 push）；push 的见上。
   turn.start / turn.end 成对、status、commits 的断言也还没有（demo.sh 只打印）。
 - [ ] 查询端只留 push 前本地预览（G9，读取不归本项目）：`vibetrail list / show` 已做（09-15），`push --list / --show` 随 push；然后 OPEN-ISSUES 关 G7。
   退役脚本 09-15 已按用户要求归档到 `old/`（`old/README.md`），审计线的几份随 U6 定去留。
   **09-16 加**：`vibetrail show --bodies` 只列 `content_state = included` 的事件（被拒调用的 `tool.request.input`、被打断的回复、之后人的下一句），
   就是 G9 原话「让开发放心没有侵犯隐私」要的那份「什么正文出了本机」，几十行。
+  **09-16 作废**：全采正文之后出本机的几乎是全部正文，按条列没有意义，改成按事件类型汇总条数与正文大小、能抽看某一条（OPEN-ISSUES G9）。
 
 ## G11 多个会话改、一个会话提交：追回每一行出自哪个会话
 

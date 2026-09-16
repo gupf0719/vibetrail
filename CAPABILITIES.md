@@ -37,10 +37,12 @@
 | 功能 | 状态 | 形态 |
 |---|---|---|
 | 运行时移植到 Node 单文件 `.mjs`、去掉 jq | ✅ 2026-09-16（DESIGN D12） | 两个 ≤ 30 行的 sh 包装 + 每次 hook 一个 node 进程；`tools/lib/` 下 map / hook / cli / push / schema 五个 `.mjs`，只用内建模块、不构建；磁盘上的一切不变，golden 与 hook 回归原样验移植；移植期间 jq 版冻结只修 🔴；拆解见 TODO |
-| `vibetrail push [--list \| --show]` | ❌ 用户 09-15 定往后放；09-16 定在 D12 移植之后用 JS 写 | 端点没配不发；配了按协议打批、每条过 schema、`event_id` 幂等、ack 即删、门槛与退避（D6）；DESIGN §4。本地看待发内容现在用 `vibetrail list / show` |
+| push 之前对齐采集端协议 | ❌ 09-16 核出，push 前改 | `project_id` / `workspace_id`（K17）、状态分类与 code（K18）、`rule_version`（K19）、拦停时不提前发 turn.end（K24）、用量口径（U12）；清单见 DESIGN §4.1「协议文档里 schema 管不到的规矩」 |
+| 全采与协议补齐 | ❌ 09-16 核出，不挡 push | 排队的人话（K20）、按停止打断工具的 `tool.end(cancelled)`（K21）、`turn.end.files[]`（K22）、关掉全采时 `subagent.start` 的 `task`（K23） |
+| `vibetrail push [--list \| --show]` | ❌ 用户 09-15 定往后放；09-16 定在 D12 移植之后用 JS 写 | token 从 `~/.vibetrail/token` 读（09-16 init 已引导填）；门槛默认值待定（U17）；端点没配不发；配了按协议打批、每条过 schema、`event_id` 幂等、ack 即删、门槛与退避（D6）；DESIGN §4。本地看待发内容现在用 `vibetrail list / show` |
 | doctor 余项 | 🔁 | 已做的见上表；还缺最近会话的 `stop_hook_summary` 里有没有跑过我们的命令、本机语料里的未知 `type` / `attachment.type` / hook 事件名（G6） |
 | 完整性钉子 | 🔁 | 映射后事件全部过 schema、每类命中数 == 事件数已在 `test-map.sh` 钉住（测试期）；运行时的条数进出、超 1 MiB 被拒计数、未知类型 / 事件名告警待做（G10、G6） |
-| 补充回归场景 | ❌ 用户 09-15 定往后放 | 轮次元数据一路的断言（turn.start / turn.end 成对、status、commits）、一轮多 commit、后台子 agent 晚于父 Stop、端点未配置 / 配置后断网；现在只有 `demo.sh` 端到端跑一遍 |
+| 补充回归场景 | ❌ 用户 09-15 定往后放 | 轮次元数据一路的断言（turn.start / turn.end 成对、status、commits）、一轮多 commit、端点未配置 / 配置后断网；现在只有 `demo.sh` 端到端跑一遍（后台子 agent 晚于父 Stop 09-16 已由 test-hook-flow 第 7 段钉住） |
 
 ### 退役（2026-09-14，D4；2026-09-15 代码归档到 `old/`，见 `old/README.md`）
 
