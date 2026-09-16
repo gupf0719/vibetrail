@@ -11,6 +11,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { mapRecords } from './lib/map.mjs';
 import { runHook, detach, SYNC_EVENTS } from './lib/hook.mjs';
+import { cli } from './lib/cli.mjs';
 
 const argv = process.argv.slice(2);
 const cmd = argv.shift();
@@ -88,5 +89,7 @@ if (cmd === 'map') {
   } catch { /* 失败只进 errors.log，永远 exit 0 */ }
   process.exit(0);
 } else {
-  die(`未知子命令 ${cmd ?? '(空)'}；移植期间有 map / hook`);
+  // 其余全是 CLI 子命令（init / uninstall / projects / list / show / sync / doctor / version）
+  const rc = await cli([cmd, ...argv].filter((x) => x !== undefined));
+  process.exit(rc || 0);
 }
