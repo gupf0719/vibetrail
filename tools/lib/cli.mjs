@@ -113,7 +113,13 @@ function eventsFor(mode) {
 }
 
 // ---- settings 条目 ----
-const hookCommand = (ev) => `/bin/bash '${path.join(VT_HOME, 'bin', 'vibetrail-hook').replace(/'/g, "'\\''")}' ${ev}`;
+// K16①（借 teamai builtin-hooks.ts:191）：运行时被删、包装冒错时，Claude Code 不会在每个事件上弹 hook 错误。
+// 包装是 POSIX sh，用 sh 调；老版本写的是 /bin/bash '…' <事件>，解析两种都认，重跑 init 会换成新写法
+const hookCommand = (ev) => `sh '${path.join(VT_HOME, 'bin', 'vibetrail-hook').replace(/'/g, "'\\''")}' ${ev} 2>/dev/null || true`;
+const hookScriptOf = (cmd) => {
+  const m = String(cmd).match(/^[^']*'(.*)' [A-Za-z]+(?: 2>\/dev\/null \|\| true)?$/);
+  return m ? m[1].replace(/'\\''/g, "'") : '';
+};
 function entriesJson(events) {                            // 每个事件一个 matcher 组（Notification 两组），timeout 显式给（§3.4）
   const out = [];
   for (const ev of events) {
@@ -170,8 +176,7 @@ function settingsOk() {                                   // 刚写的：是 JSO
     for (const g of Array.isArray(groups) ? groups : []) {
       for (const h of g?.hooks ?? []) {
         if (!isOurs(h)) continue;
-        const m = String(h.command).match(/^[^']*'(.*)' [A-Za-z]*$/);
-        const p = m ? m[1].replace(/'\\''/g, "'") : '';
+        const p = hookScriptOf(h.command);
         if (!p || !isFile(p)) return false;
       }
     }
@@ -380,9 +385,20 @@ export function cmdUninstall(argv) {
   }
   if (purge) { fs.rmSync(VT_HOME, { recursive: true, force: true }); say(`✓ 已删除 ${VT_HOME}（含 spool 里还没发出去的数据）`); }
   else {
-    for (const d of ['bin', 'state', 'logs']) fs.rmSync(path.join(VT_HOME, d), { recursive: true, force: true });
-    say(`✓ 已删除 ${VT_HOME}/bin、state、logs`);
-    say('  留着：spool（还没发出去的数据）、config、登记表、settings 备份；连它们一起删用 --purge');
+    for (const d of ['bin', 'logs']) fs.rmSync(path.join(VT_HOME, d), { recursive: true, force: true });
+    // K14：spool 留着，已写进 spool 的 event_id 清单（state/<sid>/ids）也得留——否则重装后 SessionStart 补做把老会话整个再生成一遍，
+    // spool 里同 event_id 出现两块，list / show 的数字翻倍。state 里别的（offset、seen、轮次证据）删掉，重装后从头读、按 ids 挡掉重复
+    let kept = 0;
+    try {
+      for (const sid of fs.readdirSync(path.join(VT_HOME, 'state'))) {
+        const dir = path.join(VT_HOME, 'state', sid);
+        if (!isDir(dir)) { fs.rmSync(dir, { force: true }); continue; }
+        for (const f of fs.readdirSync(dir)) if (f !== 'ids') fs.rmSync(path.join(dir, f), { recursive: true, force: true });
+        if (isFile(path.join(dir, 'ids'))) kept++; else fs.rmSync(dir, { recursive: true, force: true });
+      }
+    } catch {}
+    say(`✓ 已删除 ${VT_HOME}/bin、logs，以及 state 里除 ids 之外的内容`);
+    say(`  留着：spool（还没发出去的数据）、${kept} 个会话已写入的 event_id 清单（重装后不重复写）、config、登记表、settings 备份；连它们一起删用 --purge`);
   }
   say('  被观测的仓里本来就没写过东西，不用还原');
 }
@@ -640,8 +656,7 @@ export async function cmdDoctor() {
       const wrong = [];
       for (const gs of Object.values(s.hooks ?? {})) for (const g of Array.isArray(gs) ? gs : []) for (const h of g?.hooks ?? []) {
         if (!isOurs(h)) continue;
-        const m = String(h.command).match(/^[^']*'(.*)' [A-Za-z]*$/);
-        const p = m ? m[1].replace(/'\\''/g, "'") : '';
+        const p = hookScriptOf(h.command);
         if (p && !isFile(p)) wrong.push(p);
       }
       if (wrong.length) bad(`条目指向的运行时不存在：${[...new Set(wrong)].join(' ')}`);

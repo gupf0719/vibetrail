@@ -416,6 +416,66 @@ check "pick 里去掉一个本来就没登记的：明说「本来就没登记�
 vt_register "$REPO2"
 check "projects remove --drop：不再登记，它已采、还没发出去的数据挪出 spool（到 removed/，不删）" \
     'bash "$SELF/vibetrail" projects remove "$REPO2" --drop >/dev/null 2>&1; ! vt_registered "$REPO2" && [ ! -e "$VT_HOME/spool/$PK2" ] && ls -d "$VT_HOME/removed/$PK2"-* >/dev/null 2>&1'
+echo "════ 17. 09-16 复核修补（K14 / K15 / K16，OPEN-ISSUES）：独立沙箱 home，不依赖前面各节的状态 ════"
+K=$T/k-home; KP=$K/claude/projects/$(vt_slug "$REPO"); mkdir -p "$K/.claude" "$KP"
+KSID=11111111-2222-4333-8444-555555555555
+jq -c --arg cwd "$REPO" '.steps[] | select(.append) | .append | .cwd = $cwd' "$SC" > "$KP/$KSID.jsonl"
+kcli(){ ( cd "$REPO" && VIBETRAIL_HOME=$K/.vibetrail VIBETRAIL_CLAUDE_SETTINGS=$K/.claude/settings.json \
+          VIBETRAIL_CLAUDE_PROJECTS=$K/claude/projects bash "$SELF/vibetrail" "$@" 2>&1 ); }
+kevents(){ find "$K/.vibetrail/spool" -name '*.jsonl' ! -name '.*' -exec cat {} + 2>/dev/null | grep -c .; }
+
+# K15①：session.start 的 capabilities 带 tool.end（D8 加调用 trace 时漏了）
+k15a(){ node --input-type=module -e '
+import { hookEvents } from "'"$SELF"'/lib/hook.mjs";
+const e = hookEvents("SessionStart", { session_id: "s" }, { now: "2026-09-16T00:00:00.000Z", project_id: "p", workspace_id: "w", vt_version: "v", vcs: null });
+process.exit(e.length === 1 && e[0].payload.capabilities.includes("tool.end") ? 0 : 1);'; }
+check "K15①: session.start 的 capabilities 带 tool.end" 'k15a'
+
+# K16①：条目命令写成 sh '…/vibetrail-hook' <事件> 2>/dev/null || true；老写法 /bin/bash '…' 重跑 init 换掉、不翻倍；doctor 认新写法
+printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/bin/bash %s Stop","timeout":120}]}]}}\n' "'$K/.vibetrail/bin/vibetrail-hook'" > "$K/.claude/settings.json"
+kcli init >/dev/null
+cmds=$(jq -r '[.hooks[][]?.hooks[]?.command] | .[]' "$K/.claude/settings.json")
+n_all=$(printf '%s\n' "$cmds" | grep -c vibetrail-hook); n_new=$(printf '%s\n' "$cmds" | grep -c -E "^sh '.*vibetrail-hook' [A-Za-z]+ 2>/dev/null \|\| true$")
+check "K16①: 条目命令全是 sh '…' <事件> 2>/dev/null || true，老的 /bin/bash 写法被换掉而不是并存" \
+    '[ "$n_all" -gt 0 ] && [ "$n_all" = "$n_new" ] && [ "$(printf "%s\n" "$cmds" | grep -c "^/bin/bash")" = 0 ]'
+check "K16①: 换写法后 Stop 只挂一条（没有新旧两条并存）" \
+    '[ "$(jq "[.hooks.Stop[]?.hooks[]? | select(.command | contains(\"vibetrail-hook\"))] | length" "$K/.claude/settings.json")" = 1 ]'
+check "K16①: doctor 认得新写法（命令指向的脚本在、条目齐）" \
+    'o=$(kcli doctor); ! printf "%s" "$o" | grep -q "条目指向的运行时不存在" && printf "%s" "$o" | grep -q "hook 条目："'
+
+# K16②：宿主写完 payload 却不关 stdin，hook 1 秒空闲就当读完退出，不会挂到 Claude Code 的 timeout
+k16b(){ python3 - "$SELF" <<'PYEOF'
+import subprocess, sys, time
+t = time.time()
+p = subprocess.Popen(['bash', sys.argv[1] + '/vibetrail-hook', 'Notification'],
+                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+p.stdin.write(b'{"session_id":"k16","hook_event_name":"Notification","cwd":"/nonexistent"}'); p.stdin.flush()   # 故意不关
+try:
+    p.wait(timeout=6); sys.exit(0 if time.time() - t < 4 else 1)
+except subprocess.TimeoutExpired:
+    p.kill(); sys.exit(1)
+PYEOF
+}
+check "K16②: stdin 写完不关，hook 照样在 4 秒内退出" 'k16b'
+
+# K14：uninstall 留下 state/*/ids；重装后补做不把老会话再写一遍，spool 条数不翻倍
+kcli projects add >/dev/null; kcli sync >/dev/null
+n1=$(kevents)
+kcli uninstall >/dev/null
+check "K14: uninstall 后 spool 与 ids 还在，state 里别的删了" \
+    '[ "$(kevents)" = "$n1" ] && [ -f "$K/.vibetrail/state/$KSID/ids" ] && [ ! -e "$K/.vibetrail/state/$KSID/main.json" ]'
+kcli init >/dev/null; kcli sync >/dev/null
+check "K14: 重装再补做，spool 条数不变（$n1 条，没有翻倍）" '[ "$n1" -gt 0 ] && [ "$(kevents)" = "$n1" ]'
+
+# K15③：state/<sid>/ 30 天没动、spool 里也没有它的待发块，补做时整个删掉；有待发块的留着（ids 还要挡重复）
+mkdir -p "$K/.vibetrail/state/stale-sid" "$K/.vibetrail/state/kept-sid" "$K/.vibetrail/spool/x/kept-sid"
+echo '{}' > "$K/.vibetrail/state/stale-sid/main.json"; echo '{}' > "$K/.vibetrail/state/kept-sid/main.json"
+echo '{"type":"x"}' > "$K/.vibetrail/spool/x/kept-sid/20260801T000000Z-1-main.jsonl"
+for d in stale-sid kept-sid; do perl -e 'utime(time - 40*86400, time - 40*86400, @ARGV)' "$K/.vibetrail/state/$d/main.json" "$K/.vibetrail/state/$d"; done
+kcli sync >/dev/null
+check "K15③: 40 天没动、没有待发块的会话目录被清掉；有待发块的留着" \
+    '[ ! -e "$K/.vibetrail/state/stale-sid" ] && [ -d "$K/.vibetrail/state/kept-sid" ] && [ -d "$K/.vibetrail/state/$KSID" ]'
+
 check "测试没有动真实的 settings.json（${REAL_SETTINGS}）" '[ "$( { cat "$REAL_SETTINGS" 2>/dev/null || true; } | cksum)" = "$REAL_SUM" ]'
 echo
 [ "$skipped_schema" -gt 0 ] && echo "  ⚠ 本机 python3 没有 jsonschema，协议 schema 校验跳过 $skipped_schema 处（pip install jsonschema 后重跑）"

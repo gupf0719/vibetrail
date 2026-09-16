@@ -123,8 +123,23 @@ if (cmd === 'map') {
   // 同步 hook（SessionStart / UserPromptSubmit / SessionEnd / PermissionRequest）读完 stdin 就丢后台，自己立刻退出，不让人等；
   // hook-run 是那个后台进程自己的入口，不再二次丢。
   const event = argv.shift() ?? '';
+  // K16②（借 teamai hook-dispatch-cli.ts:36-65）：宿主写完 payload 却不关 stdin 时，裸读会一直等到 Claude Code 的 timeout
+  // （同步 hook 是 10 s，人就干等 10 s）。改成流式读、1 秒没有新数据就当读完
+  const readStdin = (idleMs = 1000) => new Promise((resolve) => {
+    const chunks = []; let timer = null; let finished = false;
+    const done = () => {
+      if (finished) return; finished = true; clearTimeout(timer);
+      try { process.stdin.pause(); process.stdin.destroy(); } catch {}
+      resolve(Buffer.concat(chunks).toString('utf8'));
+    };
+    const arm = () => { clearTimeout(timer); timer = setTimeout(done, idleMs); };
+    process.stdin.on('data', (c) => { chunks.push(c); arm(); });
+    process.stdin.on('end', done);
+    process.stdin.on('error', done);
+    arm();
+  });
   let payload = '';
-  try { payload = readFileSync(0, 'utf8'); } catch { process.exit(0); }
+  try { payload = await readStdin(); } catch { process.exit(0); }
   try {
     if (cmd === 'hook' && SYNC_EVENTS.has(event) && process.env.VIBETRAIL_FOREGROUND !== '1') {
       detach(fileURLToPath(import.meta.url), event, payload);

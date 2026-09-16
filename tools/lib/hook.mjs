@@ -255,8 +255,9 @@ const vcsOf = (v) => {
   for (const k of ['head_sha', 'branch', 'dirty']) if (v[k] !== null && v[k] !== undefined) o[k] = v[k];
   return Object.keys(o).length ? o : null;
 };
+// K15①：D8 加调用 trace 时漏了 tool.end
 const CAPABILITIES = ['session.start', 'session.end', 'turn.start', 'turn.end', 'subagent.start', 'subagent.end',
-  'permission.decision', 'tool.request', 'message.user', 'message.assistant', 'ext.claude'];
+  'permission.decision', 'tool.request', 'tool.end', 'message.user', 'message.assistant', 'ext.claude'];
 
 export function hookEvents(event, p, ctx) {    // → [事件…]（0 或 1 条），形状与 hook-events.jq 逐字段一致
   const { project_id, workspace_id, vt_version, agent_version, surface, now, vcs, extra = {} } = ctx;
@@ -710,6 +711,27 @@ export function runHook(event, payload) {
     }
     ctx = saved;
     if (!main && isFile(tpath)) processSession(sid, tpath, source === 'resume' ? 'resume' : '');
+    // K15③：以前只清 turns / perms，main.json / ids / seen 永不清——transcript 30 天被 Claude Code 清掉后它们还在。
+    // 整个会话目录 30 天没动、且 spool 里没有它的待发块（有的话 ids 还要用来挡重复，K14）才删
+    const staleCutoff = Date.now() - 30 * 86400 * 1000;
+    const pendingSids = new Set();
+    try {
+      for (const pk of fs.readdirSync(path.join(VT_HOME, 'spool'))) {
+        let sids = []; try { sids = fs.readdirSync(path.join(VT_HOME, 'spool', pk)); } catch { continue; }
+        for (const s2 of sids) {
+          try { if (fs.readdirSync(path.join(VT_HOME, 'spool', pk, s2)).some((f) => f.endsWith('.jsonl') && !f.startsWith('.'))) pendingSids.add(s2); } catch {}
+        }
+      }
+    } catch {}
+    try {
+      for (const s2 of fs.readdirSync(path.join(VT_HOME, 'state'))) {
+        const dir = path.join(VT_HOME, 'state', s2);
+        if (!isDir(dir) || pendingSids.has(s2) || s2 === sid) continue;
+        let newest = 0;
+        try { newest = Math.max(fs.statSync(dir).mtimeMs, ...fs.readdirSync(dir).map((f) => { try { return fs.statSync(path.join(dir, f)).mtimeMs; } catch { return 0; } })); } catch {}
+        if (newest > 0 && newest < staleCutoff) fs.rmSync(dir, { recursive: true, force: true });
+      }
+    } catch {}
     // 轮次、权限框证据留两周
     const cutoff = Date.now() - 14 * 86400 * 1000;
     try {
