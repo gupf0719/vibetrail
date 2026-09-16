@@ -177,7 +177,7 @@ offset 只在解析成功后前移，所以只是晚到，不会漏。`transcrip
 ### 3.4 hook 纪律
 
 `exit 0`；stdout 为空（SessionStart / UserPromptSubmit 的 stdout 会进模型上下文）；每条显式 `timeout`；命令用绝对路径、不依赖 PATH——
-desktop 启动的 hook 拿到什么 PATH 未测，jq 的绝对路径由 init 写进配置（§5.3）；`-p` 模式下 async hook 在会话结束时被杀，靠下一次 SessionStart
+desktop 启动的 hook 拿到什么 PATH 未测，jq 的绝对路径由 init 写进配置（§5.3；D12 移植后记的是 node 的）；`-p` 模式下 async hook 在会话结束时被杀，靠下一次 SessionStart
 补做兜底；所有 hook 并行跑，与被观测仓自己的 Stop hook（agentDock 有三个）互不等待。每条记录带 Claude Code 版本与 `hook_event_name`——
 判据靠英文串、`prompt_snapshot` 只在 ≥ 2.1.258、hook 事件集随版本变（文档列 30 余种，2.1.260 bundle 里 33 种），同一台机器 CLI（2.1.12）
 与 desktop 自带（2.1.266）并存；doctor 报版本与未知事件。
@@ -361,6 +361,8 @@ Stop / SubagentStop 120 s 且 `async`（Stop 要等 `stop_hook_summary`）、其
 
 ### 5.3 实现栈：bash + jq + curl，不做 Go
 
+> **2026-09-16 起改为 Node 单文件 `.mjs`、去掉 jq，bash 只留 sh 包装（D12，待移植；拆解在 TODO）。本节保留当时的理由，「不做 Go、不做常驻进程」仍成立。**
+
 没有常驻进程，每次 hook 是一个短命进程，bash 够用；已有的判据、fixtures、回放都是 bash + jq。唯一的运行时依赖是 jq（macOS 不自带），
 init 时把它的绝对路径写进 `~/.vibetrail/config`，hook 不靠 PATH；doctor 校验。curl 系统自带。Go 单二进制的好处（零依赖、HTTP 顺手）
 在这个形态下不值一个新栈；将来 push 那层若在 bash 里写不干净再议。
@@ -406,6 +408,48 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
   [Pilot 实跑](third-party/loongsuite-pilot-collection-sample.md)、[Pilot 原始输出](third-party/loongsuite-pilot-collection-output.md)。
 
 ## 7. 决策记录
+
+### D12 — 运行时全部换成 Node 单文件 `.mjs`、去掉 jq；bash 只留一个 sh 包装（2026-09-16，现行，待移植）
+
+用户原话：「node硬依赖问题不大，把jq全换成mjs吧」「你不用写代码，把文档更新，移植方案写一下就行」。此前 09-14 的「如果不是常驻进程，用不到go吧」仍成立：不做 Go、不做常驻进程。
+
+**为什么改**（09-16 复核 G7 时算的账）：
+
+- jq 已经付出的代价都发生在这个仓里：记在案的坑 17 处（diverge-rules.jq 12、map-events.jq 5——`|` 与 `,` 的优先级、正则标志 m / s 反着来、多态字段抛错后同条记录后面的规则全不求值、
+  函数参数在调用处求值、`index/1` 盖掉内建、模块按 cwd 找）；jq 1.6 把 `$end` 当保留字，整份 map-events.jq 编译不过、transcript 一路一条都不出而 hook 全部 exit 0（d916dbc），
+  本机 1.6、另一台 1.7，doctor 只好拿假记录真跑一遍映射器；map-events.jq 是 628 行单个 `foreach` 手工串状态的状态机，排队的每条修补都要往里加。
+- bash 这边：macOS 的 bash 3.2 locale 坑、没有 `timeout`、`stat` / `shasum` 两套写法、算 UUIDv5 要 20 行 xargs + awk 绕、回归脚本 47 KB。
+- push 要的分批、游标、带抖动的退避、重试分类、header 走文件，bash 都能写但每样都别扭，schema 校验干脆做不到；先用 bash 写再移植等于做两遍。
+- jq 换来的只有启动快（jq 40 ms、node 70 ms、冷 135 ms），而这只对同步 hook 有意义，同步 hook 本来读完 stdin 就丢后台。
+- 三种语言混着（bash + jq + node）比一种更差：jq 的版本问题会留在几十处小的 JSON 读写里。Node 既然是硬依赖，jq 就没有留下的理由。
+
+**定了什么**（形状照 Pilot 的 hook 层，不要它的 daemon 与托管下载）：
+
+1. settings 里的命令写成 `sh '<路径>/vibetrail-hook' <事件> 2>/dev/null || true`（OPEN-ISSUES K16 一并做）。`vibetrail-hook` 是 30 行以内的 POSIX sh：从 `~/.vibetrail/config` 读 `node=`，
+   `exec node vibetrail.mjs hook <事件>`；找不到 node 也 exit 0、只往 errors.log 记一行。node 的绝对路径记在 config、不写死进 settings，升级 node 只需重跑 init。`vibetrail` 命令同一个包装转给 cli。
+2. **每次 hook 一个 node 进程做完全部**。不能用 `node -e` 逐条替换现在的 `jq -r`：一次启动 70 ms，SessionStart 补做要读 46 个会话的 state，逐条起进程会到十秒量级。
+3. 同步 hook（SessionStart / UserPromptSubmit / SessionEnd）照 teamai：读完 stdin 就 `spawn(process.execPath, […], {detached: true, stdio: 'ignore'}).unref()` 再退出，人等 70～135 ms。
+   PermissionRequest 同样。
+4. 只用内建模块 `fs` / `path` / `crypto` / `child_process` / `fetch`；不引 npm 包、不构建、不用 TS（TS + tsup 会多出构建与包，失去「单文件、cat 能读」）；node ≥ 20，`fetch` 从 21 起稳定，本机 21 / 24。
+5. git 调用 `execFileSync('git', …, {timeout: 3000, env: {…, GIT_OPTIONAL_LOCKS: '0'}})`，替代自己写的 vt_timeout；零写入（A8）的做法不变。
+6. **磁盘上的一切不变**：spool 块文件、state、config（多一行 `node=`）、登记表、event_id 的算法（同一命名空间、同一 `_key`）、协议事件的每个字段。换语言，不换设计。
+7. 文件布局：`tools/vibetrail-hook`、`tools/vibetrail`（两个 sh 包装）、`tools/vibetrail.mjs`（入口，按 argv 分发 hook / cli / push）、`tools/lib/` 下 `map.mjs`（原 map-events.jq +
+   diverge-rules.jq + hook-events.jq）、`hook.mjs`（原 vibetrail-hook + vibetrail-lib.sh + vibetrail-map）、`cli.mjs`（原 vibetrail）、`push.mjs`（新）、`schema.mjs`（手写结构校验，约 150 行：
+   必填键、`code` 正则、条件必填、单条 ≤ 1 MiB、每批 ≤ 100 条 / 16 MiB；完整 JSON Schema 校验只留在测试里）。ESM 相对 import，MANIFEST 照旧列全部文件。
+8. 测试分两步：先不动 bash 回归脚本，只把被测程序换掉（断言处的 jq 只在开发机用，运行时不再依赖 jq）；第二步换 `node:test`。`fixtures.jsonl`、`fixtures-map/` 的 golden、
+   `scenario.json`、schema 都与语言无关，原样沿用——这是移植的安全网。
+9. doctor 的运行时探针从「jq 跑映射器」换成「node ≥ 20 且能 import `map.mjs`」；VERSION 记 node 版本；init 找 node 像现在找 jq（config 里的优先、其次 PATH、再 nvm / volta / brew 的常见路径，记绝对路径）。
+
+**移植顺序与验收**（拆解在 TODO；每步单独提交，移植与修补分开，出问题能定位是哪一步）：① map 模块 1:1 移植，test-map 158 项全绿、golden 按键排序逐字节相同，再拿本机真实语料对拍——
+同一批 transcript 新旧两版跑出的 event_id 集合与每条事件相同（去掉 `occurred_at` 取 now 的 hook 事件）；② hook 入口与共用函数，test-hook-flow 70 项全绿、demo.sh 跑通、零写入照旧；
+③ CLI，init / doctor 段全绿；④ 老文件归档到 `old/jq/`，各文档的 jq 说法同步改；⑤ 之后才在 JS 里做 09-16 复核核出的修补（K8 / K12 / K13 / K14 / K15），再写 push。估两到三天。
+**移植期间 jq 版冻结**：只修 🔴，别的会话别再往 `.jq` 里加东西。
+
+**风险写明**：行为漂移——jq 的铁律换成 JS 的坑（`test(…; "m")` 对应 JS 正则的 `s` 标志；多态字段照样先判类型；每条记录一个 try/catch，坏记录只丢自己不拖累后面的规则），靠 golden 与 70 项 hook 回归兜住；
+nvm 用户升级 node 后 config 里的路径失效（doctor 查存在性并提示重跑 init）；desktop 启动的 hook 没有 PATH（包装脚本只用 config 里的绝对路径）；同步 hook 从 20 ms 变 70～135 ms；这是第三版实现，又一次重写。
+
+**对照**：teamai 全 TS（npm 包，跑用户机器上的 Node，GUI 宿主写带 node 绝对路径的包装，`bash -lc "… 2>/dev/null" || true`）；Pilot 的 daemon 是 TS、hook 处理器是裸 `.mjs` 无构建，
+sh 包装按 pin 文件 → 托管运行时 → nvm / volta / fnm / brew 找 node、要求 ≥ 18，找不到就自己下载一份。我们取 Pilot 的 hook 形状与 teamai 的命令串写法，不要 daemon、不托管下载（node 硬依赖用户接受）。
 
 ### D11 — 项目级：init 不登记、由人 projects pick / add，移出可连待发数据一起挪走；补采按仓记；写 settings 加两道保险（2026-09-16，现行）
 
@@ -620,7 +664,9 @@ D2 的「正文与指针分开」在 D5 后反转：分歧事件自带能判责�
 | Claude Code 自带 OTel | prompt 内容默认脱敏只记长度，给形状不给叙事；可顺手开着当指标层，不作主干 |
 | 进程包装 / fetch 拦截器（Pilot 的路） | desktop 不经过 wrapper；拦截器要注入进程；system prompt 新版 transcript 自带（§6.3） |
 | 改造 Pilot 而不是自建 hook | 用户 09-11「肯定不止靠pilot，我知道他做不到，要改造」；默认自建，U7 |
-| Go 单二进制 | 没有常驻进程，不值一个新栈（§5.3） |
+| Go 单二进制 | 没有常驻进程，不值一个新栈（§5.3）；09-16 定用 Node 单文件 `.mjs`（D12），同样不做 Go |
+| Node + TS + 构建（tsup，teamai 的形态） | 多出构建与包，失去「单文件、cat 能读」；裸 `.mjs` 只用内建模块就够（D12） |
+| 用 `node -e` 逐条替换 `jq -r`（bash + jq + node 三种语言并存） | 一次 node 启动 70 ms，SessionStart 补做读 46 个会话的 state 会到十秒量级；jq 的版本问题也留在几十处小读写里。整个 hook 进一个 node 进程（D12） |
 | 本机「最近一次 hook 触发」心跳检查 | 用来兜住 doctor 查不出来的静默不触发（安全模式、`--settings` 指了别的文件、settings 被别的工具覆盖）。用户 09-16 否掉：云端按「登记过的仓该有数据却一直没有」同样能发现，本机不值得再定一个「多久算不对劲」的阈值。文件里读得出来的那两个开关（`disableAllHooks`、托管设置的 `allowManagedHooksOnly`）doctor 已经查，读不出来的在同一条消息里明说 |
 | 一起采 Codex / Cursor | Pilot 三分之一代码在适配各家格式；地基（hook 热加载、`CLAUDE_CODE_SESSION_ID` 等于文件名）是 Claude Code 特有的实测。默认不做，U9 |
 

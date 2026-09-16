@@ -35,7 +35,8 @@
 
 | 功能 | 状态 | 形态 |
 |---|---|---|
-| `vibetrail push [--list \| --show]` | ❌ 用户 09-15 定往后放 | 端点没配不发；配了按协议打批、每条过 schema、`event_id` 幂等、ack 即删、门槛与退避（D6）；DESIGN §4。本地看待发内容现在用 `vibetrail list / show` |
+| 运行时移植到 Node 单文件 `.mjs`、去掉 jq | ❌ 用户 09-16 定（DESIGN D12） | 两个 ≤ 30 行的 sh 包装 + 每次 hook 一个 node 进程；`tools/lib/` 下 map / hook / cli / push / schema 五个 `.mjs`，只用内建模块、不构建；磁盘上的一切不变，golden 与 hook 回归原样验移植；移植期间 jq 版冻结只修 🔴；拆解见 TODO |
+| `vibetrail push [--list \| --show]` | ❌ 用户 09-15 定往后放；09-16 定在 D12 移植之后用 JS 写 | 端点没配不发；配了按协议打批、每条过 schema、`event_id` 幂等、ack 即删、门槛与退避（D6）；DESIGN §4。本地看待发内容现在用 `vibetrail list / show` |
 | doctor 余项 | 🔁 | 已做的见上表；还缺最近会话的 `stop_hook_summary` 里有没有跑过我们的命令、本机语料里的未知 `type` / `attachment.type` / hook 事件名（G6） |
 | 完整性钉子 | 🔁 | 映射后事件全部过 schema、每类命中数 == 事件数已在 `test-map.sh` 钉住（测试期）；运行时的条数进出、超 1 MiB 被拒计数、未知类型 / 事件名告警待做（G10、G6） |
 | 补充回归场景 | ❌ 用户 09-15 定往后放 | 轮次元数据一路的断言（turn.start / turn.end 成对、status、commits）、一轮多 commit、后台子 agent 晚于父 Stop、端点未配置 / 配置后断网；现在只有 `demo.sh` 端到端跑一遍 |
