@@ -17,6 +17,10 @@ const argv = process.argv.slice(2);
 const cmd = argv.shift();
 
 function die(msg) { process.stderr.write(`✗ vibetrail.mjs: ${msg}\n`); process.exit(1); }
+// "<since>-<until>,<since>-" → [[since, until|null], …]（K15④ 的挂载时间段）
+const parsePeriods = (v) => String(v || '').split(',').map((x) => x.trim()).filter(Boolean)
+  .map((x) => { const [a, b] = x.split('-'); return [Number(a), b === undefined || b === '' ? null : Number(b)]; })
+  .filter(([a]) => Number.isFinite(a) && a > 0);
 
 function parseArgs(rest) {
   const a = {
@@ -45,6 +49,7 @@ function parseArgs(rest) {
       case '--hook-turns': a.hook_turns = v === '' ? {} : jsonFile(v, {}); i++; break;
       case '--hook-perms': a.hook_perms = v === '' ? [] : jsonFile(v, []); i++; break;
       case '--perm-since': a.perm_since = v; i++; break;
+      case '--perm-periods': a.perm_periods = parsePeriods(v); i++; break;
       case '--close-last': a.close_last = v; i++; break;
       case '--stop-turn': a.stop_turn = v; i++; break;
       case '--rule-version': a.rule_version = v; i++; break;
@@ -93,6 +98,7 @@ if (cmd === 'map') {
       case '--hook-turns': o.hook_turns = v ? JSON.parse(readFileSync(v, 'utf8')) : {}; i++; break;
       case '--hook-perms': o.hook_perms = v ? JSON.parse(readFileSync(v, 'utf8')) : []; i++; break;
       case '--perm-since': o.perm_since = v; i++; break;
+      case '--perm-periods': o.perm_periods = parsePeriods(v); i++; break;
       case '--close-last': o.close_last = v; i++; break;
       case '--stop-turn': o.stop_turn = v; i++; break;
       case '--vt-version': o.vt_version = v; i++; break;

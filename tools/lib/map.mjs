@@ -188,7 +188,7 @@ export function mapRecords(records, args) {
   const {
     sid, project_id, workspace_id, parent_instance = 'main',
     start_line = 1, from_line = 0, meta = null,
-    seen_uuids = [], hook_turns = {}, hook_perms = [], perm_since = '',
+    seen_uuids = [], hook_turns = {}, hook_perms = [], perm_since = '', perm_periods = null, split_decisions = {},
     close_last = '', stop_turn = '', turns = true,
     vt_version = '', rule_version = 'diverge-v1', capture_content = '1',
   } = args;
@@ -196,6 +196,17 @@ export function mapRecords(records, args) {
 
   const prior = {};
   for (const p of seen_uuids) prior[p[0]] = p[1];
+  // K15④：PermissionRequest 挂上过的时间段。以前只有一个 perm_since，判定用的是「重读那一刻」的配置，
+  // 重跑 init 没登记它就被清空，历史的结论跟着翻。现在按「拒绝发生那一刻挂没挂着」判
+  const periods = (isArr(perm_periods) && perm_periods.length > 0) ? perm_periods
+    : (Number(perm_since) > 0 ? [[Number(perm_since), null]] : []);
+  const mountedAt = (ms) => ms !== null && periods.some(([a, b]) => ms >= Number(a) * 1000 && (b === null || b === undefined || ms < Number(b) * 1000));
+  // 用户 09-16 定（K15④ 方案 A）：一次「拒绝」第一次判出人拒绝还是按停止，就记下来，之后重读一律沿用、不重算——
+  // 否则配置变了、弹框证据过期（两周清）、uninstall 删了证据，重读都会翻结论，而两种结论发的是不同的事件（event_id 不同），
+  // 云端会对同一次动作收到两条互相矛盾的记录。键是「拒绝记录 uuid|调用 id」；新判的放进账本，由调用方存进 state
+  const splitsPrior = isObj(split_decisions) ? split_decisions : {};
+  const splitsNew = {};
+  let splitsReused = 0;
 
   const st = {
     ln: start_line - 1, turn: null, turn_line: 0,
@@ -398,9 +409,7 @@ export function mapRecords(records, args) {
   // ---- K7：人拒绝 还是 按停止打断了正在跑的工具 ----
   const splitStop = (s, tu, tur) => {
     const at = epochms(s.ts);
-    const sinceNum = Number(perm_since);
-    const since = (Number.isFinite(sinceNum) ? sinceNum : 0) * 1000;
-    if (since > 0 && at !== null && at >= since) {
+    if (mountedAt(at)) {
       const from = alt(epochms(tu ? tu.ts : null), at - 600000);
       const shown = (isArr(hook_perms) ? hook_perms : []).filter(isObj).filter((p) => {
         if (!(tu === null || tu === undefined ? true : p.tool_name === tu.name)) return false;
@@ -422,8 +431,13 @@ export function mapRecords(records, args) {
     const tur = isStr(r.toolUseResult) ? r.toolUseResult : null;
     const items = blocks.map((b) => {
       const tu = b.call_id !== null ? alt(nz(st.tools[b.call_id]), null) : null;
-      const cls = (h.kind === 'permission_denied' && /^The user doesn't want to proceed with this tool use/.test(b.text)
-        && !String(alt(tur, '')).startsWith('Error:')) ? splitStop(s, tu, tur) : null;
+      let cls = null;
+      if (h.kind === 'permission_denied' && /^The user doesn't want to proceed with this tool use/.test(b.text)
+        && !String(alt(tur, '')).startsWith('Error:')) {
+        const key = `${s.uuid}|${alt(b.call_id, '')}`;
+        if (isObj(splitsPrior[key])) { cls = splitsPrior[key]; splitsReused += 1; }
+        else { cls = splitStop(s, tu, tur); splitsNew[key] = cls; }
+      }
       return { b, tu, cls };
     });
     for (const it of items) {
@@ -821,6 +835,7 @@ export function mapRecords(records, args) {
     sources: st.ledger.sources,
     turns: { ...st.ledger.turns, open: alt(st.pturn ? st.pturn.id : null, null), open_line: alt(st.pturn ? st.pturn.line : null, null),
       closed: alt(st.pturn ? st.pturn.closed : null, false), model: alt(st.pturn ? st.pturn.model : null, st.turn_model) },
-    trace: { call_open: st.call !== null } };
+    trace: { call_open: st.call !== null },
+    split_decisions_new: splitsNew, split_reused: splitsReused };
   return { events, ledger };
 }

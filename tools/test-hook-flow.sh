@@ -303,12 +303,13 @@ check "uninstall 之后回到原样，原样那份备份没被覆盖" 'jq -e ". 
 echo "════ 14. K7：「User rejected tool use」是人拒绝还是按停止——先按 permissionMode 粗分，挂上 PermissionRequest 后看弹没弹过框 ════"
 # 场景：人问一句 → 模型跑一个 Bash → 该调用得到「The user doesn't want to proceed…」→ 「[Request interrupted by user for tool use]」→ Stop。
 # 两种来历写进 transcript 的逐字一样；时间戳取「现在」前后，PermissionRequest 的证据（hook 当场记的时间）才落在时间窗里
-k7case(){ # k7case <会话后缀> <permissionMode> <permission_request_since：空=没挂上> <弹没弹过框 0/1>
+k7case(){ # k7case <会话后缀> <permissionMode> <permission_request_since：空=没挂上> <弹没弹过框 0/1> [整行配置，如 permission_request_periods=…]
     local sid0=$SID tr0=$TR t0 t1 t2
     SID=77777777-0000-4000-8000-00000000000$1; TR=$TDIR/$SID.jsonl; K7SPOOL=$VT_HOME/spool/$PKEY/$SID
     t0=$(jq -n -r 'now - 3 | todate'); t1=$(jq -n -r 'now - 1 | todate'); t2=$(jq -n -r 'now | todate')
-    grep -v '^permission_request_since=' "$VT_HOME/config" > "$VT_HOME/config.tmp"; mv "$VT_HOME/config.tmp" "$VT_HOME/config"
+    grep -v '^permission_request_' "$VT_HOME/config" > "$VT_HOME/config.tmp"; mv "$VT_HOME/config.tmp" "$VT_HOME/config"
     [ -n "$3" ] && printf 'permission_request_since=%s\n' "$3" >> "$VT_HOME/config"
+    [ -n "${5:-}" ] && printf '%s\n' "$5" >> "$VT_HOME/config"
     { rec k1 "" pk7 user '"跑一下测试"' "$(jq -n -c --arg m "$2" --arg t "$t0" '{permissionMode: $m, timestamp: $t}')" | jq -c '.parentUuid = null'
       rec k2 k1 pk7 assistant '[]' "$(jq -n -c --arg t "$t0" '{timestamp: $t, message: {id: "mk7", model: "claude-opus-5", role: "assistant", content: [{type: "tool_use", id: "tk7", name: "Bash", input: {command: "sleep 100"}}]}}')"
     } > "$TR"
@@ -333,6 +334,27 @@ check "挂上了、弹过框：是拒绝，prompt_shown = true；PermissionReque
 k7case 4 default "$(( $(date +%s) - 60 ))" 0
 check "挂上了、没弹过框：default 模式也是按停止" \
     '[ "$(k7ev "[(map(select(.type == \"permission.decision\")) | length), ($stopped | .[0].extensions[\"vibetrail.split_by\"])]")" = "[0,\"permission_request\"]" ]'
+
+# K15④ 方案 A（用户 09-16：「不重算，当时判什么就什么」）：第一次判出的结论存进 state/<sid>/splits.json，重读沿用。
+# 这里把会让结论翻的三件事一起做了——配置清空（重跑 init 没登记 PermissionRequest）、弹框证据没了（两周清 / uninstall 删）、
+# 迫使从头重读（像重装后补采）——同一次按停止仍然只有按停止那一条，不会冒出一条「人拒绝」
+k7case 5 default "$(( $(date +%s) - 60 ))" 0
+K5SID=77777777-0000-4000-8000-000000000005; K5S=$VT_HOME/state/$K5SID; K5SPOOL=$VT_HOME/spool/$PKEY/$K5SID
+check "K15④: 第一次判出按停止，结论记进 splits.json" \
+    '[ "$(jq -r "[.[]] | map(.by) | join(\",\")" "$K5S/splits.json" 2>/dev/null)" = "permission_request" ]'
+grep -v '^permission_request_' "$VT_HOME/config" > "$VT_HOME/config.tmp"; mv "$VT_HOME/config.tmp" "$VT_HOME/config"
+rm -rf "$K5S/perms" "$K5S/main.json" "$K5S/main.seen"
+sid0=$SID; tr0=$TR; SID=$K5SID; TR=$TDIR/$K5SID.jsonl
+hook Stop "$(payload Stop '{"prompt_id":"pk7"}')"
+SID=$sid0; TR=$tr0
+check "K15④: 配置清空、证据删掉、从头重读之后，仍然只有那一条按停止，没有冒出 permission.decision" \
+    '[ "$(cat "$K5SPOOL"/*.jsonl | jq -s -c "[(map(select(.type == \"permission.decision\")) | length), (map(select(.type == \"turn.end\" and .extensions[\"vibetrail.kind\"] == \"interrupt_tool\")) | length)]")" = "[0,1]" ]'
+# K15④：挂载时间段——PermissionRequest 挂过的那段已经结束，但拒绝发生在段内，照样按弹框证据判（老的单一 since 被清空后会退到粗猜）
+now5=$(date +%s)
+k7case 6 default "" 0 "permission_request_periods=$(( now5 - 60 ))-$(( now5 ))"
+check "K15④: 段已结束、拒绝在段内：按证据判成按停止（不是 default 模式粗猜的人拒绝）" \
+    '[ "$(k7ev "[(map(select(.type == \"permission.decision\")) | length), ($stopped | .[0].extensions[\"vibetrail.split_by\"])]")" = "[0,\"permission_request\"]" ]'
+grep -v '^permission_request_' "$VT_HOME/config" > "$VT_HOME/config.tmp"; mv "$VT_HOME/config.tmp" "$VT_HOME/config"
 
 echo "════ 15. 两家都没解决、我们自己修的：内部 agent（K9）、K7 两处补充、API 重试与 origin.kind（U15）、轮里插话（K10）、调用 id ════"
 hook SubagentStop "$(payload SubagentStop '{"agent_id":"ainternal1","agent_type":""}')"

@@ -213,6 +213,34 @@ export function vtHookPerms(sid) {
   try { names = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); } catch { return []; }
   return names.sort().map((f) => readJson(path.join(dir, f), null)).filter((v) => v !== null && typeof v === 'object' && !Array.isArray(v));
 }
+// K15④：PermissionRequest 挂上过的时间段，config 里一行 permission_request_periods=<since>-<until>,<since>-（最后一段没结束就空着）。
+// 老安装只有 permission_request_since=<t>：当成一段从 t 起、还没结束的
+export function vtPermPeriods() {
+  const raw = vtConf('permission_request_periods', '');
+  if (raw) {
+    return raw.split(',').map((x) => x.trim()).filter(Boolean).map((x) => {
+      const [a, b] = x.split('-');
+      return [Number(a), b === undefined || b === '' ? null : Number(b)];
+    }).filter(([a]) => Number.isFinite(a) && a > 0);
+  }
+  const since = Number(vtConf('permission_request_since', ''));
+  return since > 0 ? [[since, null]] : [];
+}
+export const formatPermPeriods = (ps) => ps.map(([a, b]) => `${a}-${b === null || b === undefined ? '' : b}`).join(',');
+
+// K15④ 方案 A：每条拒绝第一次判出的「人拒绝 / 按停止」存在 state/<sid>/splits.json，重读沿用、不重算。
+// 与 ids 一样是「只写一次」的历史：uninstall 留着它（K14），补做清陈旧 state 时跟整个目录一起走
+export const vtSplits = (sid) => { const v = readJson(path.join(VT_HOME, 'state', sid, 'splits.json'), {}); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; };
+export function vtSplitsSave(sid, fresh) {
+  if (!fresh || Object.keys(fresh).length === 0) return true;
+  try {
+    const cur = vtSplits(sid);
+    for (const [k, v] of Object.entries(fresh)) if (!(k in cur)) cur[k] = v;   // 已有的不覆盖：结论只判一次
+    vtWriteJson(path.join(VT_HOME, 'state', sid, 'splits.json'), cur);
+    return true;
+  } catch { return false; }
+}
+
 export function vtPruneRemoved() {             // projects remove --drop 挪出去的数据留一天
   const dir = path.join(VT_HOME, 'removed');
   if (!isDir(dir)) return;
@@ -400,7 +428,7 @@ export function mapFile(file, opts) {
   const {
     sid, project_id, workspace_id, parent_instance = 'main', meta = null,
     start_line = 1, start_byte = null, from_line = 0, seenFile = '', hook_turns = {}, hook_perms = [],
-    perm_since = '', close_last = '', stop_turn = '', turns = true, capture_content = '1', vt_version = VT_RUNTIME_VERSION,
+    perm_since = '', perm_periods = null, split_decisions = {}, close_last = '', stop_turn = '', turns = true, capture_content = '1', vt_version = VT_RUNTIME_VERSION,
   } = opts;
   const total = fs.statSync(file).size;
 
@@ -460,7 +488,7 @@ export function mapFile(file, opts) {
     seen_uuids: seenFile && isFile(seenFile)
       ? readText(seenFile).split('\n').filter(Boolean).map((l) => { const [u, n] = l.split('\t'); return [u, Number(n)]; })
       : [],
-    hook_turns, hook_perms, perm_since, close_last, stop_turn, turns, vt_version, rule_version: 'diverge-v1', capture_content,
+    hook_turns, hook_perms, perm_since, perm_periods, split_decisions, close_last, stop_turn, turns, vt_version, rule_version: 'diverge-v1', capture_content,
   });
 
   // 下次的起读字节：checkpoint 行的偏移
@@ -609,10 +637,12 @@ export function runHook(event, payload) {
       out = mapFile(f, { sid: s2, project_id: ctx.project, workspace_id: ctx.workspace,
         start_line: ckl, start_byte: ckb, from_line: lines, seenFile,
         hook_turns: name === 'main' ? vtHookTurns(s2) : {},
-        hook_perms: vtHookPerms(s2), perm_since: vtConf('permission_request_since', ''),
+        hook_perms: vtHookPerms(s2), perm_periods: vtPermPeriods(), split_decisions: vtSplits(s2),
         close_last: name === 'main' || close ? close : '', stop_turn: name === 'main' ? stopTurn : '',
         capture_content: vtConf('capture_content', '1') });
     } catch (e) { vtLogError(ev, s2, `map:${name}`, 2); return; }
+    // 结论先落盘再写 spool：反过来的话，spool 写进去了、结论没存上，下次重读就可能判出另一种、发出矛盾的事件
+    if (!vtSplitsSave(s2, out.ledger.split_decisions_new)) { vtLogError(ev, s2, `splits:${name}`, 1); return; }
     if (!vtSpoolWrite(ctx.pkey, s2, name, out.events)) { vtLogError(ev, s2, `spool:${name}`, 1); return; }
     const srcLines = (out.ledger.sources || []).map(([u, n]) => `${u}\t${n}`).join('\n');
     if (srcLines) { try { fs.appendFileSync(seenFile, srcLines + '\n'); } catch {} }

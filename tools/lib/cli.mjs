@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import {
   VT_HOME, VT_RUNTIME_VERSION, vtConf, vtSha, vtSlug, vtRealpath, vtMainCheckout, vtProjectKey,
   vtRegistered, vtRegister, vtUnregister, vtPruneRemoved, settingsPath, claudeProjects, runHook,
+  vtPermPeriods, formatPermPeriods,
 } from './hook.mjs';
 
 const say = (s = '') => process.stdout.write(s + '\n');
@@ -32,6 +33,12 @@ function confSet(key, value) {                            // 改或加一行，�
   const f = path.join(VT_HOME, 'config');
   const cur = (readText(f) || '').split('\n').filter((l) => l !== '' && !l.startsWith(key + '='));
   fs.writeFileSync(f + '.tmp', [...cur, `${key}=${value}`].join('\n') + '\n');
+  fs.renameSync(f + '.tmp', f);
+}
+function confDel(key) {                                  // 删掉一行，别的行原样留着
+  const f = path.join(VT_HOME, 'config');
+  const cur = (readText(f) || '').split('\n').filter((l) => l !== '' && !l.startsWith(key + '='));
+  fs.writeFileSync(f + '.tmp', cur.join('\n') + (cur.length ? '\n' : ''));
   fs.renameSync(f + '.tmp', f);
 }
 const findNode = () => {
@@ -357,8 +364,16 @@ export function cmdInit(argv) {
     say('  settings 热加载，已开着的会话从下一次 hook 起生效');
   }
   // PermissionRequest 挂上的时刻（K7）
-  if (events.includes('PermissionRequest')) { if (!vtConf('permission_request_since', '')) confSet('permission_request_since', String(Math.floor(Date.now() / 1000))); }
-  else confSet('permission_request_since', '');
+  // K15④：记「挂上过的时间段」而不是一个时刻——挂上时开一段，这次不登记就把开着的那段收尾；老安装的 since 自动迁成一段。
+  // 判定按拒绝发生那一刻挂没挂着，重跑 init 不再改写历史的结论
+  const periods = vtPermPeriods();
+  const nowSec = Math.floor(Date.now() / 1000);
+  const lastP = periods[periods.length - 1];
+  const openP = !!lastP && (lastP[1] === null || lastP[1] === undefined);
+  if (events.includes('PermissionRequest')) { if (!openP) periods.push([nowSec, null]); }
+  else if (openP) lastP[1] = nowSec;
+  confSet('permission_request_periods', formatPermPeriods(periods));
+  confDel('permission_request_since');
 
   // 4. 不登记任何仓，只列出登记表与候选
   if (vtConf('scope', 'project') === 'project') {
@@ -393,12 +408,13 @@ export function cmdUninstall(argv) {
       for (const sid of fs.readdirSync(path.join(VT_HOME, 'state'))) {
         const dir = path.join(VT_HOME, 'state', sid);
         if (!isDir(dir)) { fs.rmSync(dir, { force: true }); continue; }
-        for (const f of fs.readdirSync(dir)) if (f !== 'ids') fs.rmSync(path.join(dir, f), { recursive: true, force: true });
-        if (isFile(path.join(dir, 'ids'))) kept++; else fs.rmSync(dir, { recursive: true, force: true });
+        // K15④ 方案 A：拒绝的判定结论（splits.json）与 ids 一样留下，重装后重读沿用、不翻
+        for (const f of fs.readdirSync(dir)) if (f !== 'ids' && f !== 'splits.json') fs.rmSync(path.join(dir, f), { recursive: true, force: true });
+        if (isFile(path.join(dir, 'ids')) || isFile(path.join(dir, 'splits.json'))) kept++; else fs.rmSync(dir, { recursive: true, force: true });
       }
     } catch {}
-    say(`✓ 已删除 ${VT_HOME}/bin、logs，以及 state 里除 ids 之外的内容`);
-    say(`  留着：spool（还没发出去的数据）、${kept} 个会话已写入的 event_id 清单（重装后不重复写）、config、登记表、settings 备份；连它们一起删用 --purge`);
+    say(`✓ 已删除 ${VT_HOME}/bin、logs，以及 state 里除 ids 与拒绝判定之外的内容`);
+    say(`  留着：spool（还没发出去的数据）、${kept} 个会话已写入的 event_id 清单与拒绝判定（重装后不重复写、结论不翻）、config、登记表、settings 备份；连它们一起删用 --purge`);
   }
   say('  被观测的仓里本来就没写过东西，不用还原');
 }
