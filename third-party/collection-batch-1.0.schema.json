@@ -137,11 +137,11 @@
       "additionalProperties": false,
       "minProperties": 1,
       "properties": {
-        "input_tokens": { "type": "integer", "minimum": 0 },
-        "cached_input_tokens": { "type": "integer", "minimum": 0 },
-        "output_tokens": { "type": "integer", "minimum": 0 },
-        "reasoning_tokens": { "type": "integer", "minimum": 0 },
-        "total_tokens": { "type": "integer", "minimum": 0 }
+        "input_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+        "cached_input_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+        "output_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+        "reasoning_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+        "total_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 }
       }
     },
     "vcsSnapshot": {
@@ -399,6 +399,7 @@
         "parent_agent_instance_id": { "$ref": "#/$defs/id" },
         "parent_session_id": { "$ref": "#/$defs/id" },
         "parent_call_id": { "$ref": "#/$defs/id" },
+        "is_divergence": { "type": "boolean" },
         "provenance": { "$ref": "#/$defs/provenance" },
         "payload": { "type": "object" },
         "files": {
@@ -417,6 +418,13 @@
         "extensions": { "$ref": "#/$defs/extensions" }
       },
       "allOf": [
+        {
+          "if": {
+            "properties": { "is_divergence": { "const": true } },
+            "required": ["is_divergence"]
+          },
+          "then": { "required": ["turn_id"] }
+        },
         {
           "if": {
             "properties": {

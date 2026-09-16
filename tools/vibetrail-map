@@ -41,6 +41,7 @@ isnum(){ case "$1" in ''|*[!0-9]*) return 1;; esac; }
 
 f=""; sid=""; start_line=1; start_byte=""; from_line=0; project_id=""; workspace_id=""; meta=""; parent=""; ledger=""; vt_version="$VT_RUNTIME_VERSION"
 seen_file=""; sources_out=""; hook_turns=""; hook_perms=""; perm_since=""; close_last=""; turns=true; stop_turn=""
+capture_content=""      # 空＝照 config（capture_content，默认 1 全采）；测试显式传 --capture-content，免得跟着本机配置漂
 while [ $# -gt 0 ]; do
     case "$1" in
         --sid) sid=$2; shift 2;;
@@ -60,6 +61,7 @@ while [ $# -gt 0 ]; do
         --close-last) close_last=$2; shift 2;;
         --stop-turn) stop_turn=$2; shift 2;;
         --no-turns) turns=false; shift;;
+        --capture-content) capture_content=$2; shift 2;;
         --vt-version) vt_version=$2; shift 2;;
         -h|--help) sed -n '2,29p' "$0"; exit 0;;
         -*) die "未知参数 $1";;
@@ -144,6 +146,7 @@ tail -c +$((start_byte + 1)) "$f" | head -c $((consumed - start_byte)) | $JQ -n 
     --slurpfile hook_turns "$tmp.turns" --slurpfile hook_perms "$tmp.perms" --arg perm_since "$perm_since" \
     --arg close_last "$close_last" --arg stop_turn "$stop_turn" --argjson turns "$turns" \
     --arg vt_version "$vt_version" --arg rule_version "diverge-v1" \
+    --arg capture_content "${capture_content:-$(vt_conf capture_content 1)}" \
     -f "$SELF/map-events.jq" > "$tmp" 2>"$tmp.err"
 rc=$?
 if [ $rc -ne 0 ] || [ -s "$tmp.err" ]; then

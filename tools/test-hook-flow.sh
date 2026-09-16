@@ -26,6 +26,9 @@ REAL_SETTINGS=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json
 REAL_SUM=$( { cat "$REAL_SETTINGS" 2>/dev/null || true; } | cksum)
 export VIBETRAIL_HOME=$T/vt VIBETRAIL_CLAUDE_PROJECTS=$T/claude/projects VIBETRAIL_CLAUDE_SETTINGS=$T/claude/settings.json VIBETRAIL_STABLE_WAIT=0 VIBETRAIL_FOREGROUND=1
 . "$SELF/vibetrail-lib.sh"; VT_HOME=$VIBETRAIL_HOME
+# 全采正文默认开（用户 09-16）。下面这一大批断言钉的是「只带元数据」那个形态——它现在是 capture_content=0 的行为，
+# 仍然是支持的模式，显式关掉开关跑；全采的端到端在最后一节单测
+mkdir -p "$VT_HOME"; printf 'capture_content=0\n' > "$VT_HOME/config"
 SID=11111111-2222-4333-8444-555555555555
 TDIR=$VIBETRAIL_CLAUDE_PROJECTS/$(vt_slug "$REPO"); TR=$TDIR/$SID.jsonl
 PKEY=$(vt_project_key "$REPO"); SPOOL=$VT_HOME/spool/$PKEY/$SID
@@ -196,7 +199,7 @@ echo "════ 10. scope=user：未登记的仓也采 ════"
 vt_unregister "$REPO"; rm -rf "$VT_HOME/state" "$VT_HOME/spool"
 replay
 check "scope=project 下注销后回放：不写" '[ ! -e "$VT_HOME/spool" ]'
-printf 'scope=user\n' > "$VT_HOME/config"
+printf 'scope=user\ncapture_content=0\n' > "$VT_HOME/config"
 replay
 check "scope=user：照样写" '[ "$(spool_events | wc -l | tr -d " ")" = 3 ]'
 

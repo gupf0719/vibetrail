@@ -235,6 +235,8 @@ cmd_init(){
     grep -q '^endpoint=' "$VT_HOME/config" || conf_set endpoint ""
     chmod 600 "$VT_HOME/config"
     say "✓ 配置 → $VT_HOME/config（scope=$(vt_conf scope)，jq=${JQ}）"
+    if [ "$(vt_conf capture_content 1)" = "0" ]; then say "  采集内容：只带元数据（capture_content=0）"
+    else say "  采集内容：全采正文——prompt、模型输出、thinking、工具参数与结果原样上报，不脱敏（capture_content=0 可只留元数据）"; fi
 
     # 3. settings 条目
     local events bins; events=$(events_for "$mode"); bins=$(claude_binaries | sort -u)
@@ -609,6 +611,14 @@ cmd_doctor(){
         say "     · 后果：这些事件每触发一次跑两遍 hook；session.start / session.end / ext.claude.* 会各多一份（它们的幂等键里带时间），"
         say "       轮次与分歧那几类按 event_id 在本机 ids 就挡掉了。去掉多余的那份（init 只往 HOME 写，项目级的是人手加的）"
     else ok "hook 只挂在一处（${SETTINGS}）"; fi
+    # 采什么：全采正文是默认（用户 09-16），演示时这条得让人看见——它决定了出本机的是正文还是只有元数据
+    if [ "$(vt_conf capture_content 1)" = "0" ]; then
+        say "  · 只带元数据（capture_content=0）：正文只在分歧那几条里带（被拒的命令、被打断的回复、之后人的第一句）"
+    else
+        # 不算告警：这是默认行为，算 ⚠ 会让每台正常机器都报「有告警」，把真告警淹掉（和「本仓没登记」同理）
+        say "  · 全采正文（capture_content=1，默认）：人的 prompt、模型输出、thinking、工具参数与结果原样进事件，不脱敏"
+        say "       只要元数据：在 ${VT_HOME}/config 里写 capture_content=0"
+    fi
     # scope 与登记
     local scope; scope=$(vt_conf scope project)
     local here; here=$(vt_main_checkout "$PWD" 2>/dev/null) || here=""

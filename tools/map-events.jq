@@ -54,6 +54,10 @@
 include "diverge-rules";
 
 def opt($k; $v): if $v == null then {} else {($k): $v} end;
+# 全采正文（用户 09-16，推翻 D5 的「只带元数据」）：人的 prompt、模型输出、工具参数与结果进协议自带的字段，
+# thinking 进 extensions（协议 1.0 没有 reasoning 字段）。~/.vibetrail/config 的 capture_content=0 关掉，默认开。
+# 不叫 capture：那是 jq 的正则内建（本文件 epochms 就在用），别人读代码会混
+def capContent: $capture_content != "0";
 # ISO 时间 → 毫秒（trace 的耗时、K7 的权限框时间窗）
 def epochms: if type != "string" then null else
   (capture("^(?<b>[^.Z]+)(?<f>\\.[0-9]+)?Z$")? // null) as $m
@@ -161,12 +165,24 @@ def index($s):
 # ---------- 事件骨架 ----------
 # 发事件：同一个 _key 只发一次（同一条 tool_use / 回复可能被两次分歧各派生一次，如「拒绝」之后紧接「打断」）。
 # 登记不看门控——早于 $from_line 的触发记录已在上一次扫描时发过，这次只登记不发，分段扫与全量扫的集合才一致
+# 协议的单条事件上限 1 MiB（含 payload / extensions / raw / 元数据，见 collection-event-protocol.md「大小限制」）。
+# 协议明说「超限内容不会被截断后保存」——所以超限时整体去掉正文、标 content_state=omitted
+# （协议「内容省略与脱敏」：omitted 就是「内容存在但因隐私、大小或企业策略没有上报」），而不是截断，也不是把整条丢掉。
+# omitted 时协议禁止携带 raw，一并去掉。事件 id 不变，云端照样认得出这次调用发生过
+def sizeCap: 1048576 - 1024;   # 留 1 KiB 余量：这里量的是带 _key、event_id 还是 null 的形态，出门前会换成真 UUID
+def dropContent:
+  .payload |= (if type == "object" then del(.text, .input, .output) else . end)
+  | .extensions |= (if type == "object" then del(.["vibetrail.reasoning"]) else . end)
+  | del(.raw) | .content_state = "omitted"
+  | .extensions += {"vibetrail.content_dropped": "size"};
+def fitSize: if capContent and ((tojson | utf8bytelength) > sizeCap) then dropContent else . end;
+
 def emit($e):
   if .seen[$e._key] then .ledger.dedup += 1 else
     .seen[$e._key] = true
-    | if .ln > $from_line then .out += [$e] | .ledger.events[$e.type] += 1 else . end end;
+    | if .ln > $from_line then .out += [$e | fitSize] | .ledger.events[$e.type] += 1 else . end end;
 def emitAlways($e):    # 不看门控：文件末尾关轮（$close_last）时用，上一次可能已经读到了末尾；重复的由 hook 按 event_id 拦下
-  if .seen[$e._key] then .ledger.dedup += 1 else .seen[$e._key] = true | .out += [$e] | .ledger.events[$e.type] += 1 end;
+  if .seen[$e._key] then .ledger.dedup += 1 else .seen[$e._key] = true | .out += [$e | fitSize] | .ledger.events[$e.type] += 1 end;
 
 def turnOf($s):        # 轮次 id：记录自带 promptId；没有就按位置推（最近见到的 promptId），provenance 标 inferred
   if $s.promptId != null then {id: $s.promptId, inferred: false}
@@ -326,12 +342,17 @@ def decisions($r; $s; $h):
          elif ($b.text | test("^Permission to use \\S+")) then {name: ($b.text | capture("^Permission to use (?<n>\\S+)").n), how: "regex"}
          else {name: "unknown", how: "missing"} end) as $nm
       | .ledger.lookup[$nm.how] += 1
-      | (if $tu != null then emit(toolRequest($s; $t; $cid; $tu; {"vibetrail.trigger": $s.uuid, "vibetrail.kind": $h.kind})) else . end)
+      # 全采时 trace 那一路已经为每次调用发过同一条 tool.request（_key 相同），这里不再发第二遍
+      | (if $tu != null and (($turns and capContent) | not)
+         then emit(toolRequest($s; $t; $cid; $tu; {"vibetrail.trigger": $s.uuid, "vibetrail.kind": $h.kind})) else . end)
       | emit( base($s; "permission.decision"; $s.uuid; $s.ts; $t)
               | .payload = ({permission_id: ($cid // $s.uuid), tool_name: $nm.name,
                              decision: (if $h.kind == "permission_infra_fail" then "error" else "deny" end),
                              decided_by: ({permission_denied: "user", classifier_blocked: "policy", permission_infra_fail: "system"}[$h.kind]),
                              reason: ($b.text | .[0:4096])} + opt("call_id"; $cid))
+              # 协议 2026-09-16 新增的顶层 is_divergence：人拒绝权限就是分歧（collector 自己也会把 user+deny 规范化成 true，
+              # 但文档要求适配器尽量显式给）。分类器拦下、链路故障不算人机分歧，不标
+              | (if $h.kind == "permission_denied" then .is_divergence = true else . end)
               | .raw = {event_name: ("diverge." + $h.kind), data: $h}
               | .extensions += ({"vibetrail.kind": $h.kind, "vibetrail.human": $h.human, "vibetrail.tool_lookup": $nm.how}
                                 + (if ($it.cls.by // "none") != "none"
@@ -393,6 +414,8 @@ def interrupted($r; $s; $h; $detail):
   | (if $sub then null else hookEnd(hookTurn($t.id)) end) as $hend
   | vcsMerge($branch; $hend.vcs) as $vcs | commitsOf($hend) as $commits | (.pturn.git_commit // false) as $gc
   | emit( base($s; (if $sub then "subagent.end" else "turn.end" end); $s.uuid; $s.ts; $t)
+          # 人按停止打断，是协议认的分歧（「能够确定由用户发起的中断」）；系统超时、工具失败不算，那些走别的 kind
+          | .is_divergence = true
           | .payload = ({status: {code: (if $sub then "cancelled" else "interrupted" end), category: "cancellation", detail: ($detail | .[0:4096])}}
                         + (if $sub then opt("agent_type"; $meta.agentType)
                            else opt("model"; $model) + opt("usage"; $usage) + opt("vcs"; $vcs) end))
@@ -434,6 +457,10 @@ def emitAfter($s):
   | emit(message($s; turnOf($s); $s; "message.user"; "user";
          {"vibetrail.after": $p.after, "vibetrail.after_kind": $p.kind} + (if $s.slash then {"vibetrail.slash_command": true} else {} end)))
   | (if $s.human then .pending = null else . end);
+# 全采：每句人话（含斜杠命令）一条 message.user，带正文。分歧之后那句照旧走 emitAfter——_key 一样，
+# 两边只会发一条，走 emitAfter 的那条多带指回分歧的 extensions
+def emitPrompt($s): emit(message($s; turnOf($s); $s; "message.user"; "user";
+                                 (if $s.slash then {"vibetrail.slash_command": true} else {} end)));
 
 def turnBoundary($r; $s):   # 主会话里 promptId 换了：上一轮关、这一轮开
   if $turns and mainRec($r) and $r.type == "user" and ($r.promptId | type) == "string" and $r.promptId != (.pturn.id // null)
@@ -490,14 +517,23 @@ def usageOne($u): if ($u | type) != "object" then null else
   | .total_tokens = (.input_tokens + .cached_input_tokens + .output_tokens) end;
 def stopReasonOf($r): ($r.message | if type == "object" then .stop_reason else null end);
 def thinkingIn($r): ($r | msg.content | if type == "array" then any(.[]?; type == "object" and .type == "thinking") else false end);
+# thinking 正文（全采时进 message.assistant 的 extensions["vibetrail.reasoning"]）。不进 slim：它只在这里用，
+# 进了 slim 就会跟着每条记录进 .chain，白占内存
+def thinkingTextOf($r): ($r | msg.content) as $c
+  | if ($c | type) == "array"
+    then [$c[]? | objects | select(.type == "thinking") | (.thinking // "") | strings | select(length > 0)] | join("\n")
+    else "" end;
 
 def flushCall($eof):
   if .call == null then . else
     .call as $c
-    | (base({agent: $c.agent}; "message.assistant"; $c.last_uuid; $c.last_ts; $c.turn)
-       | .content_state = "omitted"
-       | .payload = ({author_type: "agent"} + opt("model"; $c.model))
+    | (($c.text // "") as $txt | ($c.reasoning // "") as $think
+       | base({agent: $c.agent}; "message.assistant"; $c.last_uuid; $c.last_ts; $c.turn)
+       | .content_state = (if capContent and ($txt | length) > 0 then "included" else "omitted" end)
+       | .payload = ({author_type: "agent"} + opt("model"; $c.model)
+                     + (if capContent and ($txt | length) > 0 then {text: $txt} else {} end))
        | .provenance = {kind: "transcript", rule_version: "call-v1", source_event_id: $c.last_uuid}
+       | (if capContent and ($think | length) > 0 then .extensions += {"vibetrail.reasoning": $think} else . end)
        | .extensions += {"vibetrail.call": ({kind: "llm", stop_reason: $c.stop_reason, tool_calls: $c.tools, tool_call_ids: ($c.tool_ids // []), thinking: $c.thinking}
                           + opt("response_id"; $c.mid) + opt("request_id"; $c.rid) + opt("usage"; usageOne($c.usage))
                           + opt("started_at"; if $c.started_at != null and $c.last_ts != null and $c.started_at > $c.last_ts then $c.last_ts else $c.started_at end))}   # 开始不晚于结束（照 Pilot 的 normalizeRequestStart）
@@ -521,8 +557,10 @@ def toolEnds($r; $s):
         | ({id: (.turn // $s.uuid), inferred: (.turn == null)}) as $t
         | if $st == null then . else
             emit( base($s; "tool.end"; $s.uuid; $s.ts; $t)
-                  | .content_state = "omitted"
-                  | .payload = ({tool_name: $tu.name, call_id: $cid, status: $st} + opt("duration_ms"; $d))
+                  | .content_state = (if capContent then "included" else "omitted" end)
+                  # 工具结果原样进 payload.output（协议是自由 JSON，不限长）：字符串就是字符串，块数组就是块数组，照 Pilot 的 content || output || result
+                  | .payload = ({tool_name: $tu.name, call_id: $cid, status: $st} + opt("duration_ms"; $d)
+                                + (if capContent then opt("output"; ($b.content // $b.output // $b.result // null)) else {} end))
                   | .provenance = {kind: "transcript", rule_version: "call-v1", source_event_id: $s.uuid}
                   | ._key = ($cid + "|tool.end") ) end end);
 
@@ -556,13 +594,29 @@ def traceStep($r; $s):
        | if .call == null
          then .call = {key: $k, mid: $s.mid, rid: $s.rid, model: $s.model, usage: $s.usage, stop_reason: stopReasonOf($r),
                        tools: [$s.tools[] | .name], tool_ids: [$s.tools[] | .id | strings], thinking: thinkingIn($r), last_ts: $s.ts, last_uuid: $s.uuid, ck: baseCheckpoint,
-                       started_at: .prev_end_ts, agent: $s.agent, turn: {id: (.turn // $s.uuid), inferred: (.turn == null)}}
+                       started_at: .prev_end_ts, agent: $s.agent, turn: {id: (.turn // $s.uuid), inferred: (.turn == null)},
+                       # 一次调用可能跨几条 assistant 记录（同一 message.id）：正文按出现顺序接起来，与 turn_usage 的合并同源
+                       text: (if capContent then $s.text else "" end), reasoning: (if capContent then thinkingTextOf($r) else "" end)}
               | .calls_seen += [{mid: $k, turn: .call.turn, started_at: .call.started_at, first_ts: $s.ts}]
               | (if (.calls_seen | length) > 200 then .calls_seen = .calls_seen[1:] else . end)
          else .call.last_ts = ($s.ts // .call.last_ts) | .call.last_uuid = $s.uuid
               | .call.stop_reason = (stopReasonOf($r) // .call.stop_reason)
               | .call.tools += [$s.tools[] | .name] | .call.tool_ids += [$s.tools[] | .id | strings] | .call.thinking = (.call.thinking or thinkingIn($r))
+              | (if capContent
+                 then .call.text = ([.call.text, $s.text] | map(select(type == "string" and length > 0)) | join("\n"))
+                      | .call.reasoning = ([.call.reasoning, thinkingTextOf($r)] | map(select(type == "string" and length > 0)) | join("\n"))
+                 else . end)
               | (if $s.usage != null and (($s.usage.output_tokens // 0) >= (.call.usage.output_tokens // -1)) then .call.usage = $s.usage else . end) end
+       # 全采：每次工具调用一条 tool.request，带完整参数。_key 与分歧那一路发的逐字一样（同一次调用就该是同一条事件），
+       # 所以 decisions 在全采时不再重复发，否则 vt_fill_ids 会报 _key 重复
+       | (if capContent
+          then reduce ($s.tools[] | select(.id != null)) as $tu (.;
+                 emit( base($s; "tool.request"; $s.uuid; $s.ts; {id: (.turn // $s.uuid), inferred: (.turn == null)})
+                       | .content_state = "included"
+                       | .payload = {tool_name: ($tu.name // "unknown"), call_id: $tu.id, input: $tu.input}
+                       | .provenance = {kind: "transcript", rule_version: "call-v1", source_event_id: $s.uuid}
+                       | ._key = ($s.uuid + "|tool.request|" + $tu.id) ))
+          else . end)
      else . end);
 
 def step($r):
@@ -596,7 +650,9 @@ def step($r):
               | (if any($hits[]; .kind == "permission_denied") then . else .ledger.sentinel.marker_without_hit += 1 end)
          else . end)
       | reduce $hits[] as $h (.; handle($r; $s; $h))
-      | (if ($s.human or $s.slash) and .pending != null then emitAfter($s) else . end)
+      | (if ($s.human or $s.slash)
+         then (if .pending != null then emitAfter($s) elif capContent then emitPrompt($s) else . end)
+         else . end)
     end
     end;
 

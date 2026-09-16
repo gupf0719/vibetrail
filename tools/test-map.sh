@@ -26,7 +26,7 @@ ko(){ fail=$((fail+1)); printf '  ✗ %s\n' "$*"; }
 check(){ local r; r=$(jq -s "$2" "$3" 2>&1); if [ "$r" = "true" ]; then ok; else ko "$1 （得到 ${r}）"; fi; }
 run(){ # run <名> <transcript> [额外参数…] → $T/<名>.events / .ledger；stderr 必须为空
     local n=$1 f=$2; shift 2
-    bash "$SELF/vibetrail-map" "$f" --no-turns --ledger "$T/$n.ledger" "$@" > "$T/$n.events" 2> "$T/$n.err" \
+    bash "$SELF/vibetrail-map" "$f" --no-turns --capture-content "${CAP:-0}" --ledger "$T/$n.ledger" "$@" > "$T/$n.events" 2> "$T/$n.err" \
         || { ko "$n: vibetrail-map 退出码非零: $(head -c 200 "$T/$n.err")"; return 1; }
     [ -s "$T/$n.err" ] && ko "$n: stderr 非空: $(head -c 200 "$T/$n.err")"
     return 0
@@ -150,7 +150,7 @@ for f in "${FILES[@]}" "$T/scenario.jsonl"; do
     sid=$(jq -r .sid "$T/$n.ledger"); pid=$(jq -r '.[0].project_id // "x"' -s "$T/$n.events"); wid=$(jq -r '.[0].workspace_id // "x"' -s "$T/$n.events")
     meta=(); [ -f "${f%.jsonl}.meta.json" ] && meta=(--meta "${f%.jsonl}.meta.json")
     par=$(jq -r .parent_instance "$T/$n.ledger")   # 切出来的前段在临时目录里，查不到兄弟文件，父实例照全量那次给
-    common=(--no-turns --sid "$sid" --parent-instance "$par" --project-id "$pid" --workspace-id "$wid" ${meta[@]+"${meta[@]}"})
+    common=(--no-turns --capture-content 0 --sid "$sid" --parent-instance "$par" --project-id "$pid" --workspace-id "$wid" ${meta[@]+"${meta[@]}"})
     sort "$full" > "$T/full.sorted"; badc=0
     for L in $(seq 1 $((N-1))); do
         head -n "$L" "$f" > "$T/cut.jsonl"
@@ -193,6 +193,60 @@ for path in sys.argv[1:]:
 sys.exit(1 if bad else 0)
 EOF
 then ok; else ko "event_id 与 python 的 UUIDv5 不一致: $(head -3 "$T/uuid.out")"; fi
+
+echo "════ 6. 全采正文（capture_content=1，默认；用户 09-16 推翻 D5 的「只带元数据」）════"
+# 上面几节跑的是 --capture-content 0（只带元数据，开关关掉的行为）。这一节开着跑同一段 scenario，
+# 断言四样正文各自进了协议自带的字段、thinking 进 extensions，以及协议的 1 MiB 单事件上限怎么兜
+bash "$SELF/vibetrail-map" "$T/scenario.jsonl" --capture-content 1 --sid 11111111-2222-4333-8444-555555555555 \
+    --project-id demo --workspace-id /tmp/demo-proj --ledger "$T/cap.ledger" > "$T/cap.events" 2> "$T/cap.err" \
+    || ko "全采: vibetrail-map 退出码非零: $(head -c 200 "$T/cap.err")"
+[ -s "$T/cap.err" ] && ko "全采: stderr 非空: $(head -c 200 "$T/cap.err")"
+c=$T/cap.events
+check "全采: 每句人话一条 message.user，带正文" \
+    '[.[] | select(.type=="message.user")] | length >= 2 and all(.[]; (.payload.text | length) > 0 and .content_state == "included")' "$c"
+check "全采: 模型输出进 message.assistant.payload.text" \
+    '[.[] | select(.type=="message.assistant" and (.payload.text // "") != "")] | length >= 1 and all(.[]; .content_state == "included")' "$c"
+check "全采: 每次工具调用一条 tool.request，带完整参数（Edit 的 file_path、Bash 的命令原文）" \
+    '[.[] | select(.type=="tool.request")] | length == 3 and any(.[]; .payload.tool_name == "Edit" and (.payload.input.file_path | length) > 0)
+     and any(.[]; .payload.tool_name == "Bash" and (.payload.input.command | length) > 0)' "$c"
+check "全采: 工具结果原样进 tool.end.payload.output——假密钥既没脱敏也没截断（用户 09-16 要的就是不脱敏）" \
+    '[.[] | select(.type=="tool.end")] | length >= 2 and any(.[]; (.payload.output | tostring | test("sk-demo")))' "$c"
+check "全采: thinking 进 extensions.vibetrail.reasoning，不混进 assistant 正文（协议：不得把 reasoning 伪装成普通 Assistant 文本）" \
+    '[.[] | select(.extensions["vibetrail.reasoning"] != null)] | length == 1 and ((.[0].extensions["vibetrail.reasoning"] | length) > 0)' "$c"
+schema_check < "$c" > "$T/schema.cap" && ok || ko "全采: $(cat "$T/schema.cap")"
+
+# 1 MiB 上限：协议说「超限内容不会被截断后保存」，所以超了要整体去正文、标 omitted，事件本身照发（event_id 不变）
+{ jq -n -c '{type:"user",uuid:"bu1",parentUuid:null,promptId:"bp1",message:{role:"user",content:"把大日志打出来"},isSidechain:false,cwd:"/tmp/fx",sessionId:"fx-big",version:"2.1.266",entrypoint:"cli",gitBranch:"main",timestamp:"2026-09-16T00:00:00.000Z"}'
+  jq -n -c '{type:"assistant",uuid:"ba1",parentUuid:"bu1",message:{id:"bm1",model:"claude-opus-5",role:"assistant",content:[{type:"tool_use",id:"toolu_big",name:"Bash",input:{command:"cat big.log"}}],usage:{input_tokens:5,output_tokens:5}},isSidechain:false,cwd:"/tmp/fx",sessionId:"fx-big",version:"2.1.266",entrypoint:"cli",gitBranch:"main",timestamp:"2026-09-16T00:00:01.000Z"}'
+  jq -n -c '{type:"user",uuid:"br1",parentUuid:"ba1",promptId:"bp1",message:{role:"user",content:[{type:"tool_result",tool_use_id:"toolu_big",content:("x" * 1200000),is_error:false}]},isSidechain:false,cwd:"/tmp/fx",sessionId:"fx-big",version:"2.1.266",entrypoint:"cli",gitBranch:"main",timestamp:"2026-09-16T00:00:02.000Z"}'
+} > "$T/big.jsonl"
+bash "$SELF/vibetrail-map" "$T/big.jsonl" --capture-content 1 --sid fx-big --project-id /tmp/fx --workspace-id /tmp/fx \
+    > "$T/big.events" 2> "$T/big.err" || ko "1 MiB: vibetrail-map 退出码非零: $(head -c 200 "$T/big.err")"
+b=$T/big.events
+check "1 MiB: 超限的 tool.end 去掉正文、标 omitted、注明是大小原因，事件本身照发" \
+    '[.[] | select(.type=="tool.end")] | length == 1 and (.[0] | .payload.output == null and .content_state == "omitted"
+     and .extensions["vibetrail.content_dropped"] == "size" and .payload.tool_name == "Bash" and .payload.status.code == "success")' "$b"
+check "1 MiB: 同一批里没超限的照常带正文（人话、工具参数）" \
+    'any(.[]; .type=="message.user" and .payload.text == "把大日志打出来" and .content_state == "included")
+     and any(.[]; .type=="tool.request" and .payload.input.command == "cat big.log")' "$b"
+check "1 MiB: 每条事件都在协议上限内" 'all(.[]; (tojson | utf8bytelength) < 1048576)' "$b"
+schema_check < "$b" > "$T/schema.big" && ok || ko "1 MiB: $(cat "$T/schema.big")"
+
+# hook 不传 --capture-content，走的是 config：这条链路单独钉一下，三种情形（开 / 关 / 没写＝默认开）
+for m in on off default; do
+    mkdir -p "$T/cfg-$m"
+    case $m in on) printf 'capture_content=1\n';; off) printf 'capture_content=0\n';; *) printf 'scope=project\n';; esac > "$T/cfg-$m/config"
+    VIBETRAIL_HOME=$T/cfg-$m bash "$SELF/vibetrail-map" "$T/scenario.jsonl" --sid s --project-id p --workspace-id w \
+        > "$T/cfg-$m.events" 2>/dev/null
+done
+check "开关走 config：capture_content=1 带正文" 'any(.[]; .type=="message.user" and (.payload.text // "") != "")' "$T/cfg-on.events"
+# 关掉开关＝回到 D5：trace 不带正文，只有分歧那两条带（被拒的命令原文、拒绝之后人说的第一句）
+check "开关走 config：capture_content=0 时 trace 不带正文，分歧那两条照旧带" \
+    'all(.[] | select(.type=="message.assistant"); (.payload.text // null) == null)
+     and all(.[] | select(.type=="tool.end"); (.payload.output // null) == null)
+     and ([.[] | select(.type=="message.user")] | length == 1 and (.[0].extensions["vibetrail.after"] | length) == 2)
+     and ([.[] | select(.type=="tool.request")] | length == 1 and (.[0].payload.input.command | startswith("sed -i")))' "$T/cfg-off.events"
+check "开关走 config：没写这一项＝默认全采" 'any(.[]; .type=="tool.end" and .payload.output != null)' "$T/cfg-default.events"
 
 echo
 [ "$skipped_schema" -gt 0 ] && echo "  ⚠ 本机 python3 没有 jsonschema，协议 schema 校验跳过 $skipped_schema 处（pip install jsonschema 后重跑）"
