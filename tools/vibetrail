@@ -18,7 +18,7 @@
 #   vibetrail show [--session SID] [--type 前缀] [--last N] [--json]
 #       把采到的事件按会话、按时间列成人能读的一行一条；--json 原样输出协议事件
 #   vibetrail sync                                            立刻把登记过的仓里没采完的 transcript 补一遍（平时开会话时的 SessionStart 会做）
-#   vibetrail doctor                                          自检：运行时、jq、settings 条目、scope 与登记、采集证据、落后、错误日志
+#   vibetrail doctor                                          自检：运行时、jq 与映射器、settings 条目、scope 与登记、采集证据、落后、错误日志
 #   vibetrail version
 #
 # 环境变量：VIBETRAIL_HOME（默认 ~/.vibetrail）、VIBETRAIL_CLAUDE_SETTINGS（默认 ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json）、
@@ -213,7 +213,9 @@ cmd_init(){
         for a in $RUNTIME_FILES; do cp "$SELF/$a" "$VT_HOME/bin.new/$a" || die "拷不了 $SELF/$a"; done
         chmod +x "$VT_HOME/bin.new/vibetrail" "$VT_HOME/bin.new/vibetrail-hook" "$VT_HOME/bin.new/vibetrail-map"
         local src_rev; src_rev=$(git -C "$SELF" rev-parse --short HEAD 2>/dev/null || echo unknown)
-        printf 'version=%s\nsource=%s\nsource_rev=%s\ninstalled_at=%s\n' "$VT_RUNTIME_VERSION" "$SELF" "$src_rev" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$VT_HOME/bin.new/VERSION"
+        # jq 也记一笔：同一份 .jq 在不同 jq 版本上编译结果不一样，换过 jq 时 doctor 要看得出来
+        printf 'version=%s\nsource=%s\nsource_rev=%s\ninstalled_at=%s\njq=%s\njq_version=%s\n' "$VT_RUNTIME_VERSION" "$SELF" "$src_rev" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$JQ" "$("$JQ" --version 2>/dev/null)" > "$VT_HOME/bin.new/VERSION"
         ( cd "$VT_HOME/bin.new" && for a in $RUNTIME_FILES; do
               printf '%s %s\n' "$( (command -v sha256sum >/dev/null 2>&1 && sha256sum "$a" || shasum -a 256 "$a") | cut -c1-64)" "$a"
           done > MANIFEST )
@@ -492,6 +494,8 @@ cmd_doctor(){
     ok(){ printf '  ✓ %s\n' "$*"; }
     bad(){ printf '  ✗ %s\n' "$*"; fatal=1; }
     note(){ printf '  ⚠ %s\n' "$*"; warn=1; }
+    err1(){ local l; l=$(printf '%s' "$1" | grep -m1 '✗'); [ -n "$l" ] || l=$(printf '%s' "$1" | head -1)   # 报错的第一行，去掉脚本自己的前缀
+            printf '%s' "$l" | sed 's/^✗ [a-z-]*: //; s/^✗ //'; }
     say "vibetrail doctor（VT_HOME=${VT_HOME}）"
     # 运行时
     if [ -f "$VT_HOME/bin/MANIFEST" ]; then
@@ -504,10 +508,32 @@ cmd_doctor(){
         if [ $((drift + miss)) -eq 0 ]; then ok "运行时完好（$(sed -n 's/^version=//p' "$VT_HOME/bin/VERSION" 2>/dev/null)，$(grep -c . "$VT_HOME/bin/MANIFEST") 个文件校验通过）"
         else bad "运行时：缺 $miss 个、内容变了 $drift 个——重跑 vibetrail init"; fi
     else bad "运行时不在 $VT_HOME/bin（没装，或被删了）——跑 vibetrail init"; fi
-    # jq
-    local j; j=$(vt_conf jq "")
-    if [ -n "$j" ] && [ -x "$j" ]; then ok "jq：$j"; JQ=$j; else bad "config 里的 jq 不可执行：${j:-没配}——hook 全部静默退出，重跑 vibetrail init"; JQ=$(command -v jq || echo jq); fi
+    # jq：版本也报出来——jq 的语法随版本变，同一份 .jq 在 1.6 上编译不过、1.7 上没事（真判据是下面的映射器一项）
+    local j jv jv0; j=$(vt_conf jq "")
+    if [ -n "$j" ] && [ -x "$j" ]; then JQ=$j; jv=$("$JQ" --version 2>/dev/null || echo "版本未知"); ok "jq：${j}（${jv}）"
+    else bad "config 里的 jq 不可执行：${j:-没配}——hook 全部静默退出，重跑 vibetrail init"; JQ=$(command -v jq || echo jq); jv=$("$JQ" --version 2>/dev/null || echo "版本未知"); fi
     export JQ
+    jv0=$(sed -n 's/^jq_version=//p' "$VT_HOME/bin/VERSION" 2>/dev/null)
+    if [ -n "$jv0" ] && [ "$jv0" != "$jv" ]; then note "jq 换过：装的时候是 ${jv0}，现在是 ${jv}——下面的映射器一项才是判据"; fi
+    # 映射器：拿一条假记录在这个 jq 上真跑一遍。jq 的语法错是整份文件级的，一处不认整份都不编译——
+    # 2026-09-16 踩过：map-events.jq 里 $end 撞上 jq 1.6 的保留字 end，transcript 那一路（turn.end、人机分歧、调用 trace）
+    # 一条都不出，而 hook 全部 exit 0、list / show 只是少东西，痕迹只有 errors.log 里的 map:* rc=2
+    local rt probe perr prc
+    rt=$VT_HOME/bin; [ -f "$rt/vibetrail-map" ] || rt=$SELF
+    if probe=$(mktemp -d "${TMPDIR:-/tmp}/vibetrail-doctor.XXXXXX"); then
+        printf '%s\n' '{"type":"user","uuid":"doctor-probe","sessionId":"doctor-probe","cwd":"/","timestamp":"1970-01-01T00:00:00.000Z","message":{"role":"user","content":"probe"}}' > "$probe/t.jsonl"
+        perr=$(bash "$rt/vibetrail-map" "$probe/t.jsonl" 2>&1 >/dev/null); prc=$?    # 账本走 stderr，所以只认 rc
+        if [ $prc -ne 0 ]; then
+            bad "map-events.jq 在这个 jq（${jv}）上跑不起来：$(err1 "$perr")——transcript 那一路（turn.end、人机分歧、调用 trace）一条都不会出，而 hook 仍然全部 exit 0"
+        else
+            perr=$(printf '{}' | "$JQ" -c --arg event SessionStart --arg project_id p --arg workspace_id w --arg vt_version "$VT_RUNTIME_VERSION" \
+                --arg agent_version 0 --arg surface cli --arg now "1970-01-01T00:00:00Z" --argjson vcs null --argjson extra '{}' \
+                -f "$rt/hook-events.jq" 2>&1 >/dev/null); prc=$?
+            if [ $prc -eq 0 ]; then ok "映射器在这个 jq 上跑得通（map-events.jq、hook-events.jq）"
+            else bad "hook-events.jq 在这个 jq（${jv}）上跑不起来：$(err1 "$perr")——会话 / 轮次这些 hook 当场发的事件一条都不会出"; fi
+        fi
+        rm -rf "$probe"
+    fi
     # settings 条目
     if [ -f "$SETTINGS" ] && "$JQ" -e 'type == "object"' "$SETTINGS" >/dev/null 2>&1; then
         local have; have=$("$JQ" -r '(.hooks // {}) | to_entries[] | select(any(.value[]?.hooks[]?; ((.command? // "") | tostring | contains("vibetrail-hook")))) | .key' "$SETTINGS" | sort | tr '\n' ' ')
@@ -569,7 +595,8 @@ cmd_doctor(){
     [ $lag -eq 0 ] && ok "登记的仓里没有落后的 transcript" || note "$lag 份 transcript 没采完（下一次在该仓开会话时 SessionStart 会补做）"
     # 错误日志
     if [ -s "$VT_HOME/logs/errors.log" ]; then
-        note "errors.log 有 $(grep -c . "$VT_HOME/logs/errors.log") 条（只记元数据），最近一条：$(tail -1 "$VT_HOME/logs/errors.log")"
+        local ne nm; ne=$(grep -c . "$VT_HOME/logs/errors.log"); nm=$(grep -c '"stage":"map' "$VT_HOME/logs/errors.log")
+        note "errors.log 有 $ne 条（只记元数据）$( [ "${nm:-0}" -gt 0 ] && printf '，其中 %s 条是映射失败（map:*）' "$nm" )，最近一条：$(tail -1 "$VT_HOME/logs/errors.log")"
     else ok "没有错误日志"; fi
     # 端点
     [ -n "$(vt_conf endpoint)" ] && ok "端点：$(vt_conf endpoint)" || say "  · 端点没配置：只落本机 spool、不发（push 还没做，DESIGN §4）"
