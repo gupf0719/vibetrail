@@ -8,7 +8,7 @@ import readline from 'node:readline';
 import {
   VT_HOME, VT_RUNTIME_VERSION, vtConf, vtSha, vtSlug, vtRealpath, vtMainCheckout, vtProjectKey,
   vtRegistered, vtRegister, vtUnregister, vtPruneRemoved, settingsPath, claudeProjects, runHook,
-  vtPermPeriods, formatPermPeriods, tokenPath, vtToken,
+  vtPermPeriods, formatPermPeriods, tokenPath, vtToken, vtProjectName, vtWorkspaceId, workspaceIdPath,
 } from './hook.mjs';
 
 const say = (s = '') => process.stdout.write(s + '\n');
@@ -510,7 +510,7 @@ export function cmdUninstall(argv) {
       }
     } catch {}
     say(`✓ 已删除 ${VT_HOME}/bin、logs，以及 state 里除 ids 与拒绝判定之外的内容`);
-    say(`  留着：spool（还没发出去的数据）、${kept} 个会话已写入的 event_id 清单与拒绝判定（重装后不重复写、结论不翻）、config、上报 token、登记表、settings 备份；连它们一起删用 --purge`);
+    say(`  留着：spool（还没发出去的数据）、${kept} 个会话已写入的 event_id 清单与拒绝判定（重装后不重复写、结论不翻）、工作区 id（workspaces/，重装后云端不把同一个仓的历史分成两份）、config、上报 token、登记表、settings 备份；连它们一起删用 --purge`);
   }
   say('  被观测的仓里本来就没写过东西，不用还原');
 }
@@ -554,12 +554,17 @@ export async function cmdProjects(argv) {
       const p = (readText(path.join(VT_HOME, 'projects', f)) || '').split('\n')[0];
       if (!p) continue;
       const k = pendingChunks(p);
-      say(`${p}${isDir(p) ? '' : '   ⚠ 目录不在了'}${k > 0 ? `   （spool 待发 ${k} 块）` : ''}`);
+      // K17：上报时用的项目名（登记表里显式写的 > origin 仓库名 > 目录名）一并列出来，好核对
+      say(`${p}${isDir(p) ? `   project_id=${vtProjectName(p)}` : '   ⚠ 目录不在了'}${k > 0 ? `   （spool 待发 ${k} 块）` : ''}`);
     }
   } else if (sub === 'add') {
-    const d = argv[1] || process.cwd();
-    const m = vtRegister(d);
-    if (m) say(`✓ 已登记 ${m}`); else die(`不在 git 仓里：${d}`);
+    // projects add [目录] [--name <项目名>]：--name 是 K17 的显式配置，写进登记表第二行，优先于 origin 的仓库名
+    let d = '', name = '';
+    for (let i = 1; i < argv.length; i++) { if (argv[i] === '--name') name = argv[++i] ?? ''; else d = argv[i]; }
+    if (name !== '' && !/^\S{1,256}$/.test(name)) die('--name 要 1～256 个非空白字符');
+    d = d || process.cwd();
+    const m = vtRegister(d, name);
+    if (m) say(`✓ 已登记 ${m}（上报时 project_id=${vtProjectName(m)}）`); else die(`不在 git 仓里：${d}`);
   } else if (sub === 'remove' || sub === 'rm') {
     let drop = false, d = '';
     for (const a of argv.slice(1)) { if (a === '--drop') drop = true; else d = a; }
@@ -612,6 +617,8 @@ function describe(e) {
   const vcs = e.payload?.vcs && typeof e.payload.vcs === 'object'
     ? `${e.payload.vcs.branch ?? '?'}@${String(e.payload.vcs.head_sha ?? '-').slice(0, 7)}${e.payload.vcs.dirty === true ? ' 有改动' : ''}` : '';
   const usage = e.payload?.usage && typeof e.payload.usage === 'object' ? `tokens ${e.payload.usage.total_tokens ?? '?'}` : '';
+  // U12 起「入」含缓存读（协议：cached 是 input 的子集），所以列成 入（其中缓存）/ 出
+  const inOut = (u) => `入 ${kn(u?.input_tokens)}（缓存 ${kn(u?.cached_input_tokens)}）/ 出 ${kn(u?.output_tokens)}`;
   let d = '';
   const t = e.type;
   if (t === 'session.start') {
@@ -619,7 +626,7 @@ function describe(e) {
     d = `source=${e.payload.source} model=${e.extensions?.['claude.model'] ?? '?'} ${v.branch ?? ''}@${String(v.head_sha ?? '').slice(0, 7)}`;
   } else if (t === 'session.end') d = `reason=${e.payload.reason}`;
   else if (t === 'turn.start') d = `${vcs} ${e.payload.model ? 'model=' + e.payload.model : ''} ${e.provenance?.kind === 'transcript' ? '(transcript 补位)' : ''}`;
-  else if (t === 'turn.end') d = `${e.payload.status.code} ${usage} ${vcs}${e.commits ? ' commits=' + e.commits.map((c) => c.sha.slice(0, 7)).join(',') : ''} ${e.extensions?.['vibetrail.closed_by'] ? '关轮:' + e.extensions['vibetrail.closed_by'] : ''}`;
+  else if (t === 'turn.end') d = `${e.payload.status.code} ${usage} ${vcs}${e.commits ? ' commits=' + e.commits.map((c) => c.sha.slice(0, 7)).join(',') : ''}${Array.isArray(e.files) ? ` 文件 ${e.files.filter((f) => f.operation !== 'read').length} 改/${e.files.filter((f) => f.operation === 'read').length} 读` : ''} ${e.extensions?.['vibetrail.closed_by'] ? '关轮:' + e.extensions['vibetrail.closed_by'] : ''}`;
   else if (t === 'permission.decision') d = `${e.payload.decision} by ${e.payload.decided_by} ${e.payload.tool_name} “${clip(e.payload.reason, 80)}”`;
   else if (t === 'tool.request') {
     const inp = e.payload.input;
@@ -627,14 +634,16 @@ function describe(e) {
     d = `${e.payload.tool_name} ${clip(String(s), 100)}`;
   } else if (t === 'message.assistant' && e.content_state === 'omitted') {
     const c = e.extensions?.['vibetrail.call'] ?? {};
-    d = `模型 ${e.payload.model ?? '?'}  入/缓存/出 ${kn(c.usage?.input_tokens)}/${kn(c.usage?.cached_input_tokens)}/${kn(c.usage?.output_tokens)}  ${c.stop_reason ?? '-'}`
+    d = `模型 ${e.payload.model ?? '?'}  ${inOut(c.usage)}  ${c.stop_reason ?? '-'}`
       + ((c.tool_calls ?? []).length ? ' → ' + c.tool_calls.join(',') : '') + (c.thinking ? '（有 thinking）' : '')
       + (c.started_at ? '  用时 ' + dur((secs(e.occurred_at) - secs(c.started_at)) * 1000) : '');
   } else if (t === 'tool.end') {
-    const m = { success: '成功', error: '出错', cancelled: '取消' };
+    // K18 起 code 是协议推荐值 succeeded / failed / cancelled（09-16 以前的 spool 里还有 success / error，照认）
+    const m = { succeeded: '成功', success: '成功', failed: '出错', error: '出错', cancelled: '取消' };
     const k = { reported: '（工具自报）', wall_clock: '（按记录时间差，含等待）' }[e.extensions?.['vibetrail.duration_kind']] ?? '';
     d = `${e.payload.tool_name} ${m[e.payload.status.code] ?? e.payload.status.code}  ${dur(e.payload.duration_ms)}${e.payload.duration_ms !== undefined ? k : ''}`;
-  } else if (t === 'message.user' || t === 'message.assistant') d = `“${clip(e.payload.text, 100)}”`;
+  } else if (t === 'message.user' && e.payload.delivery === 'queued') d = `（模型干活时插进来的话）“${clip(e.payload.text, 100)}”`;
+  else if (t === 'message.user' || t === 'message.assistant') d = `“${clip(e.payload.text, 100)}”`;
   else if (t === 'subagent.start') d = `${e.payload.agent_type} 父=${e.parent_agent_instance_id}`;
   else if (t === 'subagent.end') d = `${e.payload.status.code} ${e.payload.agent_type ?? ''}`;
   else if (String(t).startsWith('ext.')) { const p = { ...e.payload }; delete p.tool_input; d = clip(JSON.stringify(p), 100); }
@@ -840,8 +849,12 @@ export async function cmdDoctor() {
     if (np > 0) ok(`scope=project，登记了 ${np} 个项目`);
     else note('scope=project 但一个项目都没登记——什么都不会采（vibetrail projects pick 选，或 projects add）');
     if (here) {
-      if (vtRegistered(here)) ok(`本仓已登记：${here}`);
-      else say(`  · 本仓没登记，这个仓里的会话不采（要采：vibetrail projects add）：${here}`);
+      if (vtRegistered(here)) {
+        ok(`本仓已登记：${here}`);
+        // K17：上报时的两个标识——项目名不含用户名与路径，工作区 id 是本机第一次见到时生成、持久化的 UUID（uninstall 留着）
+        const wf = workspaceIdPath(here);
+        say(`     上报标识：project_id=${vtProjectName(here)}，workspace_id=${isFile(wf) ? (readText(wf) || '').split('\n')[0] : '（还没生成，第一次采到时生成）'}`);
+      } else say(`  · 本仓没登记，这个仓里的会话不采（要采：vibetrail projects add）：${here}`);
     }
   }
 
@@ -917,7 +930,7 @@ export const USAGE = `vibetrail：机器级安装、登记与本地查看（DESI
   vibetrail init [--scope project|user] [--events auto|core|all]
   vibetrail token [--status | --clear]
   vibetrail uninstall [--purge]
-  vibetrail projects [list | add [目录] | remove [目录] [--drop] | pick]
+  vibetrail projects [list | add [目录] [--name 项目名] | remove [目录] [--drop] | pick]
   vibetrail list
   vibetrail show [--session SID] [--type 前缀] [--last N] [--json]
   vibetrail sync

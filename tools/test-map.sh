@@ -6,7 +6,9 @@
 #      链路 → system，打断 → turn.end / subagent.end，for-tool-use → 吸收 + 未配对）
 #   4. 增量等价：对每个切点 L，「前 L 行全量扫」∪「全文从 L 起扫」== 「全文全量扫」——派生事件跟触发记录走、去重不看门控，
 #      这两条不成立时这里会红；再加一路「从前段账本给的 checkpoint_line（本轮开头）读起」，钉住 U11 的按轮增量
-# 用法：test-map.sh [--update]   --update 重新生成 golden（先看 diff 再提交）
+# 用法：test-map.sh [--update [--accept-rule-digest]]   --update 重新生成 golden（先看 diff 再提交）
+#   K19 钉子：expect/RULE-DIGESTS 记着每个 rule_version 的输出摘要，golden 变了而版本号没升就红——--update 也不放过，
+#   得先升 map.mjs 的 RULE_VERSIONS；确认只是 fixture 变了、映射规则没变时才加 --accept-rule-digest
 # 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
 # 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
 export LC_ALL=C
@@ -14,7 +16,10 @@ set -uo pipefail
 cd "$(dirname "$0")"; SELF=$PWD; FX=$SELF/fixtures-map
 FILES=("$FX"/*.jsonl "$FX"/fx-*/subagents/agent-*.jsonl)
 T=$(mktemp -d "${TMPDIR:-/tmp}/vibetrail-test-map.XXXXXX"); trap 'rm -rf "$T"' EXIT
-update=0; [ "${1:-}" = "--update" ] && update=1
+# 映射器的默认 workspace_id 会按第一次见到的工作区生成并持久化到 $VIBETRAIL_HOME/workspaces（K17）：测试一律指到临时目录，不碰真实的 ~/.vibetrail
+export VIBETRAIL_HOME=$T/vt; mkdir -p "$VIBETRAIL_HOME"
+update=0; accept=0
+for a in "$@"; do case "$a" in --update) update=1;; --accept-rule-digest) accept=1;; *) echo "✗ 不认识的参数：$a" >&2; exit 2;; esac; done
 fail=0; pass=0
 # 协议 schema 校验要 python3 + jsonschema（只在测试里用）；本机没装就跳过这几项并在末尾说明，不算失败
 if python3 -c 'import jsonschema' 2>/dev/null; then HAVE_SCHEMA=1; else HAVE_SCHEMA=0; fi
@@ -25,8 +30,10 @@ ko(){ fail=$((fail+1)); printf '  ✗ %s\n' "$*"; }
 # 断言：jq 表达式对 events 文件（-s 整体）求值必须是 true
 check(){ local r; r=$(jq -s "$2" "$3" 2>&1); if [ "$r" = "true" ]; then ok; else ko "$1 （得到 ${r}）"; fi; }
 run(){ # run <名> <transcript> [额外参数…] → $T/<名>.events / .ledger；stderr 必须为空
+    # project_id / workspace_id 显式给定（后面的参数可以覆盖）：K17 之后默认的 workspace_id 是随机生成的 UUID，golden 钉不住
     local n=$1 f=$2; shift 2
-    bash "$SELF/vibetrail-map" "$f" --no-turns --capture-content "${CAP:-0}" --ledger "$T/$n.ledger" "$@" > "$T/$n.events" 2> "$T/$n.err" \
+    bash "$SELF/vibetrail-map" "$f" --no-turns --capture-content "${CAP:-0}" --project-id fx --workspace-id ws-fixture --workspace-roots /tmp/fx \
+        --ledger "$T/$n.ledger" "$@" > "$T/$n.events" 2> "$T/$n.err" \
         || { ko "$n: vibetrail-map 退出码非零: $(head -c 200 "$T/$n.err")"; return 1; }
     [ -s "$T/$n.err" ] && ko "$n: stderr 非空: $(head -c 200 "$T/$n.err")"
     return 0
@@ -63,11 +70,12 @@ for f in "${FILES[@]}"; do
     else ok; fi
 done
 
+
 # 逐份的显式断言（golden 之外，说得出是哪一项漂了）
 e=$T/interrupt-text.events
 check "interrupt-text: 三条——被打断的回复、turn.end、人的下一句" 'map(.type) == ["message.assistant","turn.end","message.user"]' "$e"
 check "interrupt-text: 回复正文与 model，指回打断记录" '.[0].payload.text == "我看了一下，问题在 div：" and .[0].payload.model == "claude-opus-5" and .[0].payload.author_type == "agent" and .[0].extensions["vibetrail.trigger"] == "i1" and .[0].content_state == "included"' "$e"
-check "interrupt-text: turn.end 状态、用量按 message.id 去重、分支" '.[1].payload.status == {code:"interrupted",category:"cancellation",detail:"[Request interrupted by user]"} and .[1].payload.usage == {input_tokens:15,cached_input_tokens:100,output_tokens:20,reasoning_tokens:8,total_tokens:135} and .[1].payload.vcs.branch == "main" and .[1].turn_id == "p1" and .[1].provenance == {kind:"transcript",rule_version:"diverge-v1",source_event_id:"i1"}' "$e"
+check "interrupt-text: turn.end 状态、用量按 message.id 去重（U12：入含缓存读，total = 入 + 出）、分支" '.[1].payload.status == {code:"interrupted",category:"cancellation",detail:"[Request interrupted by user]"} and .[1].payload.usage == {input_tokens:115,cached_input_tokens:100,output_tokens:20,reasoning_tokens:8,total_tokens:135} and .[1].payload.vcs.branch == "main" and .[1].turn_id == "p1" and .[1].provenance == {kind:"transcript",rule_version:"diverge-v2",source_event_id:"i1"}' "$e"
 check "interrupt-text: 人的下一句去掉 system-reminder 块，只留人写的" '.[2].payload.text == "先别看 div" and .[2].extensions["vibetrail.after"] == ["i1"] and .[2].extensions["vibetrail.after_kind"] == "interrupt"' "$e"
 check "interrupt-text: raw 里保留提取器原始命中" '.[1].raw.event_name == "diverge.interrupt" and .[1].raw.data.kind == "interrupt" and .[1].raw.data.turn == "i1"' "$e"
 e=$T/interrupt-tool.events
@@ -87,7 +95,7 @@ check "subagent: 会话 id 取自路径、实例 id 是 agentId、父实例 main
 check "subagent: 打断映射成 subagent.end(cancelled)，带 agent_type，不带 usage / vcs" '[.[] | select(.type=="subagent.end")] | length == 1 and .[0].payload == {status:{code:"cancelled",category:"cancellation",detail:"[Request interrupted by user]"},agent_type:"general-purpose"}' "$e"
 check "subagent: 拒绝 + 被拒命令 + 被打断的回复都在；派活与注入消息不算人的下一句" 'map(.type) == ["tool.request","permission.decision","message.assistant","subagent.end"] and (.[2].payload.text == "测试跑不了，我读代码。")' "$e"
 e=$T/no-promptid.events
-check "no-promptid: 没有 promptId 的打断按位置推轮次，provenance 标 inferred" '[.[] | select(.type=="turn.end")] | length == 2 and .[0].turn_id == "i0" and .[0].provenance.kind == "inferred" and .[1].turn_id == "p1" and .[1].provenance.kind == "inferred" and .[1].provenance.rule_version == "diverge-v1"' "$e"
+check "no-promptid: 没有 promptId 的打断按位置推轮次，provenance 标 inferred" '[.[] | select(.type=="turn.end")] | length == 2 and .[0].turn_id == "i0" and .[0].provenance.kind == "inferred" and .[1].turn_id == "p1" and .[1].provenance.kind == "inferred" and .[1].provenance.rule_version == "diverge-v2"' "$e"
 check "no-promptid: 派生事件跟触发记录的轮次走" '[.[] | select(.type=="message.assistant")][0] | .turn_id == "p1" and .provenance.kind == "inferred"' "$e"
 check "no-promptid: 两句人话各指回各自的打断" '[.[] | select(.type=="message.user")] | map(.extensions["vibetrail.after"]) == [["i0"],["i1"]]' "$e"
 e=$T/unpaired.events
@@ -102,10 +110,10 @@ check "noise: 非对象行、字符串 message、缺字段的块都不炸；只�
 check "noise: 账本计数" '.[0]' <(jq -c '.skipped_non_object == 3 and .skipped_no_uuid == 1 and .records == 5' "$T/noise.ledger")
 check "noise: 没有 parentUuid 的打断按本轮顺序兜底找到回复（曾因行号全是 null 从未生效）" '.[0].extensions["vibetrail.interrupted_uuid"] == "m3"' "$e"
 e=$T/edge-cases.events
-check "edge: 越过合成记录找到真实回复，model 与用量不含合成记录" '.[0].type == "message.assistant" and .[0].payload.text == "我先删掉安装那一节。" and .[1].payload.model == "claude-opus-5" and .[1].payload.usage == {input_tokens:4,cached_input_tokens:40,output_tokens:9,total_tokens:53} and .[1].extensions["vibetrail.interrupted_uuid"] == "a1"' "$e"
+check "edge: 越过合成记录找到真实回复，model 与用量不含合成记录" '.[0].type == "message.assistant" and .[0].payload.text == "我先删掉安装那一节。" and .[1].payload.model == "claude-opus-5" and .[1].payload.usage == {input_tokens:44,cached_input_tokens:40,output_tokens:9,total_tokens:53} and .[1].extensions["vibetrail.interrupted_uuid"] == "a1"' "$e"
 check "edge: 斜杠命令规范成一句发出，标 slash_command，不结束等待" '.[2].type == "message.user" and .[2].payload.text == "/model claude-opus-5" and .[2].extensions["vibetrail.slash_command"] == true and .[2].extensions["vibetrail.after"] == ["i1"]' "$e"
 check "edge: 之后打的字照样发，指回同一次打断；本地命令输出不算人话" '.[3].payload.text == "换个模型再试，只删安装那一节" and .[3].extensions["vibetrail.after"] == ["i1"] and (.[3].extensions | has("vibetrail.slash_command") | not) and all(.[]; .payload.text != "<local-command-stdout>Set model to claude-opus-5</local-command-stdout>")' "$e"
-check "edge: 缺 message.id 时按 requestId 去重，断链时按本轮顺序兜底" '.[5].type == "turn.end" and .[5].payload.usage == {input_tokens:6,cached_input_tokens:60,output_tokens:12,total_tokens:78} and .[5].extensions["vibetrail.interrupted_uuid"] == "a3" and .[4].payload.text == "好，只删安装一节，其余不动。"' "$e"
+check "edge: 缺 message.id 时按 requestId 去重，断链时按本轮顺序兜底" '.[5].type == "turn.end" and .[5].payload.usage == {input_tokens:66,cached_input_tokens:60,output_tokens:12,total_tokens:78} and .[5].extensions["vibetrail.interrupted_uuid"] == "a3" and .[4].payload.text == "好，只删安装一节，其余不动。"' "$e"
 check "edge: 共 7 条事件，没认出的新拒绝措辞不发事件" 'length == 7 and all(.[]; .type != "permission.decision")' "$e"
 check "edge: 哨兵——有 User rejected tool use 标记而判据没认出，账本记 1；checkpoint 是最后一轮开头" '.[0]' <(jq -c '.sentinel == {marker:1, marker_without_hit:1} and .checkpoint_line == 12' "$T/edge-cases.ledger")
 e=$T/injected.events
@@ -225,7 +233,7 @@ bash "$SELF/vibetrail-map" "$T/big.jsonl" --capture-content 1 --sid fx-big --pro
 b=$T/big.events
 check "1 MiB: 超限的 tool.end 去掉正文、标 omitted、注明是大小原因，事件本身照发" \
     '[.[] | select(.type=="tool.end")] | length == 1 and (.[0] | .payload.output == null and .content_state == "omitted"
-     and .extensions["vibetrail.content_dropped"] == "size" and .payload.tool_name == "Bash" and .payload.status.code == "success")' "$b"
+     and .extensions["vibetrail.content_dropped"] == "size" and .payload.tool_name == "Bash" and .payload.status.code == "succeeded")' "$b"
 check "1 MiB: 同一批里没超限的照常带正文（人话、工具参数）" \
     'any(.[]; .type=="message.user" and .payload.text == "把大日志打出来" and .content_state == "included")
      and any(.[]; .type=="tool.request" and .payload.input.command == "cat big.log")' "$b"
@@ -342,8 +350,8 @@ APIERR='{"isApiErrorMessage":true,"error":"rate_limit","apiErrorStatus":429,"mes
   R a6 a5  s8a ap2 assistant '[]' "$(AM am2 '[{"type":"text","text":"缓过来了"}]')"
 } > "$T/m8a.jsonl"
 M8 "$T/m8a.jsonl" --sid s8a --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 --close-last session_end > "$T/m8a.events"
-check "API 出错结束的一轮：turn.end 状态是那个错误（rate_limit / error），证据 api_error" \
-    '[.[] | select(.type=="turn.end" and .turn_id=="ap1")] | length == 1 and .[0].payload.status == {code: "rate_limit", category: "error"}
+check "API 出错结束的一轮：turn.end 状态是那个错误（code rate_limit、分类 failure——K18 推荐值，不再是 error），证据 api_error" \
+    '[.[] | select(.type=="turn.end" and .turn_id=="ap1")] | length == 1 and .[0].payload.status == {code: "rate_limit", category: "failure"}
      and .[0].extensions["vibetrail.end_evidence"] == "api_error"' "$T/m8a.events"
 check "出错之后同一轮里又有真回复：算缓过来了，照常 completed" \
     '[.[] | select(.type=="turn.end" and .turn_id=="ap2")] | .[0].payload.status.code == "completed"' "$T/m8a.events"
@@ -417,9 +425,9 @@ check "子 agent（同步）：调用结果出 subagent.end——实例 asy1、�
      and (.[0] | .parent_agent_instance_id == "main" and .parent_call_id == "toolu_sync" and .payload.agent_type == "Explore"
        and .payload.status == {code: "completed", category: "success"} and .payload.last_message == "入口在 main.go"
        and .extensions["vibetrail.agent"] == {duration_ms: 4000, total_tokens: 1500, tool_use_count: 3})' "$T/m8s.events"
-check "子 agent（后台）：启动结果出 subagent.start（没给 subagent_type 就是 general-purpose），通知出 subagent.end（killed 算取消，带用量）" \
+check "子 agent（后台）：启动结果出 subagent.start（没给 subagent_type 就是 general-purpose，全采时带 task、标 included），通知出 subagent.end（killed 算取消，带用量）" \
     '([.[] | select(.type=="subagent.start" and .agent_instance_id=="abg1")] | length == 1 and (.[0] | .parent_call_id == "toolu_bg"
-       and .payload == {agent_type: "general-purpose", task: "后台跑测试"}))
+       and .payload == {agent_type: "general-purpose", task: "后台跑测试"} and .content_state == "included"))
      and ([.[] | select(.type=="subagent.end" and .agent_instance_id=="abg1")] | length == 1 and (.[0] | .parent_call_id == "toolu_bg"
        and .payload.status == {code: "killed", category: "cancellation"} and .payload.last_message == "跑到一半被停了"
        and .extensions["vibetrail.agent"] == {duration_ms: 60000, total_tokens: 900, tool_use_count: 7}))' "$T/m8s.events"
@@ -432,19 +440,156 @@ check "账本：后台启动记下（之后的通知靠它认），完成信号�
 schema_check < "$T/m8s.events" > "$T/schema.m8s" && ok || ko "subagent: $(cat "$T/schema.m8s")"
 M8 "$PJ/s8s.jsonl" --sid s8s --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 > "$T/m8s0.events"
 check "子 agent：关掉全采不带最后的回答" 'all(.[] | select(.type=="subagent.end"); .payload.last_message == null)' "$T/m8s0.events"
+check "K23: 关掉全采时 subagent.start 不带 task、标 omitted（协议把 task 算正文）" \
+    '[.[] | select(.type=="subagent.start")] | length >= 1 and all(.[]; (.payload | has("task") | not) and .content_state == "omitted")' "$T/m8s0.events"
+schema_check < "$T/m8s0.events" > "$T/schema.m8s0" && ok || ko "K23: $(cat "$T/schema.m8s0")"
 # 子 agent 文件自己：第一条记录出 subagent.start（类型、任务、派它的调用取 meta）；最后一次调用只在完成信号不早于文件最后一条时写出
 M8 "$SA/agent-asy1.jsonl" --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 --close-last if_done --done-ts 2026-09-16T04:00:06.000Z \
     --ledger "$T/m8u.ledger" > "$T/m8u.events"
-check "子 agent 文件：第一条记录出 subagent.start，父 main、派它的调用与类型取 meta；完成信号晚于最后一条 → 最后一次调用写出" \
+check "子 agent 文件：第一条记录出 subagent.start，父 main、派它的调用与类型取 meta（关掉全采不带 task，K23）；完成信号晚于最后一条 → 最后一次调用写出" \
     '([.[] | select(.type=="subagent.start")] | length == 1 and (.[0] | .agent_instance_id == "asy1" and .parent_agent_instance_id == "main"
-       and .parent_call_id == "toolu_sync" and .payload == {agent_type: "Explore", task: "找入口"}))
+       and .parent_call_id == "toolu_sync" and .payload == {agent_type: "Explore"} and .content_state == "omitted"))
      and ([.[] | select(.type=="message.assistant")] | length == 1)' "$T/m8u.events"
+M8 "$SA/agent-asy1.jsonl" --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 1 --close-last if_done --done-ts 2026-09-16T04:00:06.000Z \
+    --ledger /dev/null > "$T/m8u1.events"
+check "子 agent 文件：全采时 subagent.start 带 meta 里的任务描述、标 included" \
+    '[.[] | select(.type=="subagent.start")][0] | .payload == {agent_type: "Explore", task: "找入口"} and .content_state == "included"' "$T/m8u1.events"
 M8 "$SA/agent-asy1.jsonl" --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 --close-last if_done --done-ts 2026-09-16T04:00:03.000Z \
     --ledger "$T/m8v.ledger" > "$T/m8v.events"
 check "子 agent 文件：完成信号早于最后一条（SendMessage 续上后又写了）→ 那次调用先不写出" \
     '[.[] | select(.type=="message.assistant")] | length == 0' "$T/m8v.events"
 check "子 agent 文件：账本带最后一条记录的时间（hook 拿它判续上之后有没有新的完成信号）" '.[0].last_ts == "2026-09-16T04:00:05.000Z" and .[0].trace.call_open == true' "$T/m8v.ledger"
 if [ ! -s "$T/m8.err" ]; then ok; else ko "这一节的映射有报错: $(head -c 300 "$T/m8.err")"; fi
+
+echo "════ 9. push 前对齐采集端协议（OPEN-ISSUES K18 / U12 / K20 / K21 / K22，2026-09-16）════"
+: > "$T/m9.err"
+M9(){ bash "$SELF/vibetrail-map" "$@" --ledger /dev/null 2>>"$T/m9.err"; }
+# K18：tool.end 的 code / 分类用推荐值；subagent.end 的 failed 是 failure。U12：用量算法
+{ R e1 ""  s9e ep1 user '"跑"' "$(TS 05:00:00.000Z)"
+  R e2 e1  s9e ep1 assistant '[]' "$(AM em1 '[{"type":"tool_use","id":"toolu_ok","name":"Bash","input":{"command":"true"}},{"type":"tool_use","id":"toolu_bad","name":"Bash","input":{"command":"false"}}]' \
+      | jq -c '.message.usage = {input_tokens: 10, cache_creation_input_tokens: 5, cache_read_input_tokens: 100, output_tokens: 20, output_tokens_details: {thinking_tokens: 8}}' | with_ts 05:00:01.000Z)"
+  R e3 e2  s9e ep1 user '[{"type":"tool_result","tool_use_id":"toolu_ok","content":"ok"},{"type":"tool_result","tool_use_id":"toolu_bad","content":"boom","is_error":true}]' "$(TS 05:00:02.000Z)"
+  R e4 e3  s9e ep1 assistant '[]' "$(AM em2 '[{"type":"tool_use","id":"toolu_ag","name":"Agent","input":{"description":"会失败","prompt":"y"}}]' | jq -c '.message.usage = {output_tokens: 7}' | with_ts 05:00:03.000Z)"
+  R e5 e4  s9e ep1 user '[{"type":"tool_result","tool_use_id":"toolu_ag","content":[{"type":"text","text":"炸了"}]}]' '{"timestamp":"2026-09-16T05:00:05.000Z","toolUseResult":{"status":"failed","agentId":"ag9","agentType":"general-purpose","content":[{"type":"text","text":"炸了"}]}}'
+  R e6 e5  s9e ep1 assistant '[]' "$(AM em3 '[{"type":"text","text":"完事"}]' | jq -c 'del(.message.usage)' | with_ts 05:00:06.000Z)"
+} > "$T/k18.jsonl"
+M9 "$T/k18.jsonl" --sid s9e --project-id fx --workspace-id ws --capture-content 0 --close-last session_end > "$T/k18.events"
+check "K18: tool.end 的 code 是 succeeded / failed、分类 success / failure（09-16 以前是 success / error，分类 error 云端会归进 other）" \
+    '[.[] | select(.type=="tool.end") | [.payload.call_id, .payload.status.code, .payload.status.category]] == [["toolu_ok","succeeded","success"],["toolu_bad","failed","failure"],["toolu_ag","succeeded","success"]]' "$T/k18.events"
+check "K18: 子 agent 失败的 subagent.end 分类 failure；来源自己的状态留在 code" \
+    '[.[] | select(.type=="subagent.end")] | length == 1 and .[0].payload.status == {code: "failed", category: "failure"}' "$T/k18.events"
+check "U12: input 含缓存创建与缓存读（10+5+100）、cached 是 input 的子集、reasoning 是 output 的子集、total = input + output；只给了 output 的那次照加" \
+    '[.[] | select(.type=="turn.end")][0].payload.usage == {input_tokens: 115, cached_input_tokens: 100, output_tokens: 27, reasoning_tokens: 8, total_tokens: 142}' "$T/k18.events"
+check "U12: 每次调用的用量同一算法；来源没给的字段不填（不再当 0）" \
+    '([.[] | select(.type=="message.assistant" and .extensions["vibetrail.call"].response_id == "em1")][0].extensions["vibetrail.call"].usage == {input_tokens: 115, cached_input_tokens: 100, output_tokens: 20, reasoning_tokens: 8, total_tokens: 135})
+     and ([.[] | select(.type=="message.assistant" and .extensions["vibetrail.call"].response_id == "em2")][0].extensions["vibetrail.call"].usage == {output_tokens: 7, total_tokens: 7})
+     and ([.[] | select(.type=="message.assistant" and .extensions["vibetrail.call"].response_id == "em3")][0].extensions["vibetrail.call"] | has("usage") | not)' "$T/k18.events"
+schema_check < "$T/k18.events" > "$T/schema.k18" && ok || ko "K18/U12: $(cat "$T/schema.k18")"
+
+# K20：模型干活时人插进去的话（queued_command 附件）全采时发 message.user（delivery queued）；task-notification 形态的附件不算人话；关掉全采只计数
+{ R q1 ""  s9q qp1 user '"先做这个"' "$(TS 06:00:00.000Z)"
+  R q2 q1  s9q qp1 assistant '[]' "$(AM qm1 '[{"type":"text","text":"做着"}]' | with_ts 06:00:01.000Z)"
+  AT q3 q2 s9q qp1 '{"type":"queued_command","commandMode":"prompt","prompt":"顺便把日志也看了","origin":{"kind":"human"}}' "$(TS 06:00:02.000Z)" | jq -c 'del(.promptId)'
+  AT q4 q3 s9q qp1 '{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification><task-id>bsh</task-id><status>completed</status></task-notification>"}' "$(TS 06:00:03.000Z)" | jq -c 'del(.promptId)'
+  R q5 q4  s9q qp1 assistant '[]' "$(AM qm2 '[{"type":"text","text":"好了"}]' | with_ts 06:00:04.000Z)"
+} > "$T/k20.jsonl"
+M9 "$T/k20.jsonl" --sid s9q --project-id fx --workspace-id ws --capture-content 1 --close-last session_end > "$T/k20.events"
+check "K20: 排队的人话一条 message.user——正文、author_type user、delivery queued、挂在当前轮、带正文标 included；通知形态的附件不算" \
+    '[.[] | select(.type=="message.user" and .payload.delivery == "queued")] | length == 1
+     and (.[0] | .payload.text == "顺便把日志也看了" and .payload.author_type == "user" and .turn_id == "qp1" and .content_state == "included" and .provenance.source_event_id == "q3")' "$T/k20.events"
+check "K20: 它不算分歧之后的下一句（没有 vibetrail.after），turn.end 照旧计数 queued_prompts = 1" \
+    '([.[] | select(.type=="message.user" and .payload.delivery == "queued")][0].extensions | has("vibetrail.after") | not)
+     and ([.[] | select(.type=="turn.end")][0].extensions["vibetrail.queued_prompts"] == 1)' "$T/k20.events"
+schema_check < "$T/k20.events" > "$T/schema.k20" && ok || ko "K20: $(cat "$T/schema.k20")"
+M9 "$T/k20.jsonl" --sid s9q --project-id fx --workspace-id ws --capture-content 0 --close-last session_end > "$T/k20-0.events"
+check "K20: 关掉全采：不发排队的正文，turn.end 仍计数" \
+    '([.[] | select(.type=="message.user")] | length == 0) and ([.[] | select(.type=="turn.end")][0].extensions["vibetrail.queued_prompts"] == 1)' "$T/k20-0.events"
+
+# K21：按停止打断正在跑的工具（K7 判成按停止的那类）：tool.end(cancelled) 与 turn.end(interrupted) 各一条；判成人拒绝的仍不发 tool.end
+REJ9='The user doesn'"'"'t want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.'
+{ R t1 ""  s9t tp1 user '"跑一下"' '{"permissionMode":"auto","timestamp":"2026-09-16T07:00:00.000Z"}'
+  R t2 t1  s9t tp1 assistant '[]' "$(AM tm1 '[{"type":"tool_use","id":"toolu_run","name":"Bash","input":{"command":"sleep 100"}}]' | with_ts 07:00:01.000Z)"
+  R t3 t2  s9t tp1 user "$(jq -n -c --arg t "$REJ9" '[{type: "tool_result", tool_use_id: "toolu_run", is_error: true, content: $t}]')" '{"timestamp":"2026-09-16T07:00:31.000Z","toolUseResult":"User rejected tool use"}'
+  R t4 t3  s9t tp1 user '[{"type":"text","text":"[Request interrupted by user for tool use]"}]' "$(TS 07:00:31.000Z)"
+} > "$T/k21.jsonl"
+M9 "$T/k21.jsonl" --sid s9t --project-id fx --workspace-id ws --capture-content 0 > "$T/k21.events"
+check "K21: 被打断的调用一条 tool.end——cancelled / cancellation、耗时按记录时间差标 wall_clock；turn.end(interrupted) 也在；不发 permission.decision" \
+    '([.[] | select(.type=="tool.end")] | length == 1 and (.[0] | .payload.call_id == "toolu_run" and .payload.status.code == "cancelled" and .payload.status.category == "cancellation"
+       and .payload.duration_ms == 30000 and .extensions["vibetrail.duration_kind"] == "wall_clock" and .extensions["vibetrail.kind"] == "interrupt_tool"))
+     and ([.[] | select(.type=="turn.end")] | length == 1 and .[0].payload.status.code == "interrupted")
+     and ([.[] | select(.type=="permission.decision")] | length == 0)' "$T/k21.events"
+check "K21: event_id 唯一（tool.request 与 tool.end 是两条）" '(map(.event_id) | length == (unique | length)) and any(.[]; .type=="tool.request" and .payload.call_id == "toolu_run")' "$T/k21.events"
+M9 "$T/k21.jsonl" --sid s9t --project-id fx --workspace-id ws --capture-content 0 --no-turns > "$T/k21-nt.events"
+check "K21: 只跑分歧一路（--no-turns）也发这条 tool.end（它是分歧派生的事实）" '[.[] | select(.type=="tool.end")] | length == 1' "$T/k21-nt.events"
+schema_check < "$T/k21.events" > "$T/schema.k21" && ok || ko "K21: $(cat "$T/schema.k21")"
+jq -n -c '[{at: "2026-09-16T07:00:02.000Z", tool_name: "Bash", agent_id: null, prompt_id: "tp1", permission_mode: "default"}]' > "$T/k21.perms"
+M9 "$T/k21.jsonl" --sid s9t --project-id fx --workspace-id ws --capture-content 0 --perm-periods "1-" --hook-perms "$T/k21.perms" > "$T/k21-deny.events"
+check "K21: 弹过权限框的是人拒绝：只发 permission.decision，不伪造 tool.end（协议：执行前被拒只发 decision）" \
+    '([.[] | select(.type=="permission.decision")] | length == 1) and ([.[] | select(.type=="tool.end")] | length == 0)' "$T/k21-deny.events"
+
+# K22：turn.end.files[]——Edit / Write / Read 成功的结果记进这一轮；路径相对工作区根（主 checkout 与 worktree，最长的根先匹配，/private/tmp 与 /tmp 一样）；
+# 根外的不发只计数；失败的调用不记；同一文件取最重的操作
+{ R f1 ""  s9f fp1 user '"改文件"' "$(TS 08:00:00.000Z)"
+  R f2 f1  s9f fp1 assistant '[]' "$(AM fm1 '[{"type":"tool_use","id":"toolu_r","name":"Read","input":{"file_path":"/tmp/fx/src/a.js"}},{"type":"tool_use","id":"toolu_e","name":"Edit","input":{"file_path":"/tmp/fx/src/a.js","old_string":"x","new_string":"y"}},{"type":"tool_use","id":"toolu_w","name":"Write","input":{"file_path":"/private/tmp/fx/docs/new.md","content":"hi"}},{"type":"tool_use","id":"toolu_wt","name":"Edit","input":{"file_path":"/tmp/fx/.claude/worktrees/w1/lib/b.js","old_string":"1","new_string":"2"}},{"type":"tool_use","id":"toolu_out","name":"Edit","input":{"file_path":"/Users/x/.claude/memory/MEMORY.md","old_string":"1","new_string":"2"}},{"type":"tool_use","id":"toolu_bad","name":"Edit","input":{"file_path":"/tmp/fx/src/c.js","old_string":"1","new_string":"2"}},{"type":"tool_use","id":"toolu_r2","name":"Read","input":{"file_path":"/tmp/fx/README.md"}}]' | with_ts 08:00:01.000Z)"
+  R f3 f2  s9f fp1 user '[{"type":"tool_result","tool_use_id":"toolu_r","content":"..."}]' '{"timestamp":"2026-09-16T08:00:02.000Z","toolUseResult":{"type":"text","file":{"filePath":"/tmp/fx/src/a.js"}}}'
+  R f4 f3  s9f fp1 user '[{"type":"tool_result","tool_use_id":"toolu_e","content":"ok"}]' '{"timestamp":"2026-09-16T08:00:03.000Z","toolUseResult":{"filePath":"/tmp/fx/src/a.js","structuredPatch":[]}}'
+  R f5 f4  s9f fp1 user '[{"type":"tool_result","tool_use_id":"toolu_w","content":"ok"}]' '{"timestamp":"2026-09-16T08:00:04.000Z","toolUseResult":{"type":"create","filePath":"/private/tmp/fx/docs/new.md"}}'
+  R f6 f5  s9f fp1 user '[{"type":"tool_result","tool_use_id":"toolu_wt","content":"ok"}]' '{"timestamp":"2026-09-16T08:00:05.000Z","toolUseResult":{"filePath":"/tmp/fx/.claude/worktrees/w1/lib/b.js"}}'
+  R f7 f6  s9f fp1 user '[{"type":"tool_result","tool_use_id":"toolu_out","content":"ok"}]' '{"timestamp":"2026-09-16T08:00:06.000Z","toolUseResult":{"filePath":"/Users/x/.claude/memory/MEMORY.md"}}'
+  R f8 f7  s9f fp1 user '[{"type":"tool_result","tool_use_id":"toolu_bad","content":"File has not been read yet","is_error":true}]' "$(TS 08:00:07.000Z)"
+  R f9 f8  s9f fp1 user '[{"type":"tool_result","tool_use_id":"toolu_r2","content":"# fx"}]' '{"timestamp":"2026-09-16T08:00:08.000Z","toolUseResult":{"type":"text","file":{"filePath":"/tmp/fx/README.md"}}}'
+  R fa f9  s9f fp1 assistant '[]' "$(AM fm2 '[{"type":"tool_use","id":"toolu_gone","name":"Edit","input":{"file_path":"/tmp/fx/.claude/worktrees/gone/lib/b.js","old_string":"2","new_string":"3"}}]' | with_ts 08:00:09.000Z)"
+  R fb fa  s9f fp1 user '[{"type":"tool_result","tool_use_id":"toolu_gone","content":"ok"}]' '{"timestamp":"2026-09-16T08:00:10.000Z","toolUseResult":{"filePath":"/tmp/fx/.claude/worktrees/gone/lib/b.js"}}'
+  R fc fb  s9f fp1 assistant '[]' "$(AM fm3 '[{"type":"text","text":"改完"}]' | with_ts 08:00:11.000Z)"
+} > "$T/k22.jsonl"
+M9 "$T/k22.jsonl" --sid s9f --project-id fx --workspace-id ws --workspace-roots /tmp/fx,/tmp/fx/.claude/worktrees/w1 --capture-content 0 --close-last session_end > "$T/k22.events"
+check "K22: turn.end.files[]——a.js 读过又改了记 modify、Write 新建记 create（/private/tmp 归到根）、worktree 里的按 worktree 根算（已删的 desktop worktree 也去掉 .claude/worktrees/<名>/ 前缀，同一个文件一个路径）、只读的记 read；根外的与失败的不记" \
+    '[.[] | select(.type=="turn.end")][0] | .files == [{path: "src/a.js", operation: "modify", evidence: "tool_result"}, {path: "docs/new.md", operation: "create", evidence: "tool_result"},
+       {path: "lib/b.js", operation: "modify", evidence: "tool_result"}, {path: "README.md", operation: "read", evidence: "tool_result"}]
+     and .extensions["vibetrail.files_dropped"] == {outside_workspace: 1}' "$T/k22.events"
+check "K22: 路径没有以 / 开头的、没有 .. 的（schema 的 path 正则）" \
+    '[.[] | select(.type=="turn.end")][0].files | all(.[]; .path | test("^[^/]") and (test("(^|/)\\.\\.?(/|$)") | not))' "$T/k22.events"
+schema_check < "$T/k22.events" > "$T/schema.k22" && ok || ko "K22: $(cat "$T/schema.k22")"
+M9 "$T/k22.jsonl" --sid s9f --project-id fx --workspace-id ws --workspace-roots "" --capture-content 0 --close-last session_end > "$T/k22-noroot.events"
+check "K22: 没给工作区根就不发 files[]、也不计根外" '[.[] | select(.type=="turn.end")][0] | (has("files") | not) and (.extensions | has("vibetrail.files_dropped") | not)' "$T/k22-noroot.events"
+# 打断结束的轮也带 files[]
+{ head -n 5 "$T/k22.jsonl"
+  R fi f5 s9f fp1 user '[{"type":"text","text":"[Request interrupted by user]"}]' "$(TS 08:00:05.000Z)"
+} > "$T/k22i.jsonl"
+M9 "$T/k22i.jsonl" --sid s9f --project-id fx --workspace-id ws --workspace-roots /tmp/fx --capture-content 0 > "$T/k22i.events"
+check "K22: 打断结束的轮 turn.end(interrupted) 也带 files[]" \
+    '[.[] | select(.type=="turn.end")][0] | .payload.status.code == "interrupted" and (.files | map(.path)) == ["src/a.js", "docs/new.md"]' "$T/k22i.events"
+if [ ! -s "$T/m9.err" ]; then ok; else ko "这一节的映射有报错: $(head -c 300 "$T/m9.err")"; fi
+
+echo "════ 10. K19 钉子：映射规则变了就得升 rule_version ════"
+# 协议「适配器升级映射规则时更新 rule_version」。把上面各节确定性的输出（fixtures 的 golden + 第 6～9 节的事件，四路 rule_version 都有）
+# 按 rule_version 分别算摘要，记在 expect/RULE-DIGESTS：摘要变了而版本号还是登记过的那个 → 红。升了版本号（新名字没登记）不算错，
+# --update 把新名字记进去、去掉旧的；--update 碰到「变了没升」也红，除非 --accept-rule-digest（确认只是 fixture 变了、规则没变）
+DIG=$FX/expect/RULE-DIGESTS
+cat "$T"/*.norm > "$T/digest.in"
+for x in cap big sys sys0 cfg-on cfg-off cfg-default k8 k12 k13 m8a m8c m8c0 m8d m8s m8s0 m8u m8u1 m8v k18 k20 k20-0 k21 k21-nt k21-deny k22 k22-noroot k22i; do
+    [ -f "$T/$x.events" ] && jq -S -c . "$T/$x.events" >> "$T/digest.in"
+done
+: > "$T/digests.new"
+for rv in $(jq -r '.provenance.rule_version // empty' "$T/digest.in" | sort -u); do
+    sha=$(jq -c --arg rv "$rv" 'select(.provenance.rule_version == $rv)' "$T/digest.in" | sort | shasum -a 256 | cut -c1-16)
+    printf '%s\t%s\n' "$rv" "$sha" >> "$T/digests.new"
+done
+bad_rv=""; new_rv=""
+while IFS="$(printf '\t')" read -r rv sha; do
+    old=$(grep "^$rv$(printf '\t')" "$DIG" 2>/dev/null | cut -f2)
+    if [ -z "$old" ]; then new_rv="$new_rv $rv"; elif [ "$old" != "$sha" ]; then bad_rv="$bad_rv $rv"; fi
+done < "$T/digests.new"
+if [ $update -eq 1 ]; then
+    if [ -n "$bad_rv" ] && [ $accept -eq 0 ]; then
+        ko "K19: 映射输出变了而 rule_version 没升：${bad_rv} ——先升 tools/lib/map.mjs 的 RULE_VERSIONS 再 --update；确认只是 fixture 变了、规则没变才加 --accept-rule-digest（RULE-DIGESTS 没动）"
+    else cp "$T/digests.new" "$DIG"; echo "  ↻ 已更新 RULE-DIGESTS（$(cut -f1 "$DIG" | tr '\n' ' ')）"; fi
+elif [ ! -f "$DIG" ]; then ko "K19: 缺 expect/RULE-DIGESTS（跑 --update 生成）"
+elif [ -n "$bad_rv" ]; then ko "K19: 映射输出变了而 rule_version 没升：${bad_rv}（改了映射规则就升 map.mjs 的 RULE_VERSIONS，再 --update）"
+elif [ -n "$new_rv" ]; then ko "K19: 有没登记的 rule_version：${new_rv}（跑 --update 登记）"
+else ok; fi
+check "K19: 四路 rule_version 都在钉子里，且都是 09-16 定的 v2 基线（09-15 定 v1 之后改过规则、版本号一直没动）" \
+    '(map(.provenance.rule_version) | unique | map(select(. != null))) == ["call-v2","diverge-v2","ext-v2","turn-v2"]' "$T/digest.in"
 
 echo
 [ "$skipped_schema" -gt 0 ] && echo "  ⚠ 本机 python3 没有 jsonschema，协议 schema 校验跳过 $skipped_schema 处（pip install jsonschema 后重跑）"

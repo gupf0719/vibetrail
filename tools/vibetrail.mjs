@@ -9,7 +9,7 @@
 // 与 jq 版逐字节对齐：字段、顺序、账本都不变（golden 比对前按键排序，所以键序无关）。
 import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { mapRecords } from './lib/map.mjs';
+import { mapRecords, RULE_VERSIONS } from './lib/map.mjs';
 import { runHook, detach, SYNC_EVENTS, mapFile, vtConf } from './lib/hook.mjs';
 import { cli } from './lib/cli.mjs';
 
@@ -26,7 +26,7 @@ function parseArgs(rest) {
   const a = {
     sid: '', project_id: '', workspace_id: '', parent_instance: 'main',
     start_line: 1, from_line: 0, meta: null, seen_uuids: [], hook_turns: {}, hook_perms: [],
-    perm_since: '', close_last: '', stop_turn: '', turns: true, vt_version: '', rule_version: 'diverge-v1',
+    perm_since: '', close_last: '', stop_turn: '', turns: true, vt_version: '', rule_version: RULE_VERSIONS.diverge,
     capture_content: '1',
   };
   const jsonFile = (p, dflt) => { try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return dflt; } };
@@ -36,6 +36,8 @@ function parseArgs(rest) {
       case '--sid': a.sid = v; i++; break;
       case '--project-id': a.project_id = v; i++; break;
       case '--workspace-id': a.workspace_id = v; i++; break;
+      // K22：工作区根（主 checkout 与 worktree，逗号分隔），turn.end.files[] 的路径按它算相对路径
+      case '--workspace-roots': a.workspace_roots = String(v).split(',').map((x) => x.trim()).filter(Boolean); i++; break;
       case '--parent-instance': a.parent_instance = v; i++; break;
       case '--start-line': a.start_line = Number(v); i++; break;
       case '--from-line': a.from_line = Number(v); i++; break;
@@ -90,6 +92,7 @@ if (cmd === 'map') {
       case '--sid': o.sid = v; i++; break;
       case '--project-id': o.project_id = v; i++; break;
       case '--workspace-id': o.workspace_id = v; i++; break;
+      case '--workspace-roots': o.workspace_roots = String(v).split(',').map((x) => x.trim()).filter(Boolean); i++; break;
       case '--parent-instance': o.parent_instance = v; i++; break;
       case '--start-line': o.start_line = Number(v); i++; break;
       case '--start-byte': startByte = v === '' ? null : Number(v); i++; break;

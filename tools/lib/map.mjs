@@ -184,6 +184,18 @@ const noPromptMode = (m) => ['auto', 'bypassPermissions', 'dontAsk'].includes(m)
 
 const SIZE_CAP = 1048576 - 1024;   // 协议单条 1 MiB，留 1 KiB 余量（量的是带 _key、event_id 还是 null 的形态）
 
+// K19：映射规则的版本号，四路各一个，进每条事件的 provenance.rule_version。协议：「适配器升级映射规则时更新 rule_version，
+// 不得改写已经接收的历史事件」——event_id 不含它，重读出来的 event_id 不变、云端按重复收下，所以升版本不改写历史。
+// 09-16 push 前统一升到 v2 定成基线（09-15 定 v1 之后改过 K8 / K12 / K13 / D13 / K15② / 全采 / K18 / U12 / K20–K23，版本号一直没动）。
+// 之后每改一次映射规则就升对应的一路；test-map.sh 钉着：golden 变了而版本号没升就红
+export const RULE_VERSIONS = { diverge: 'diverge-v2', turn: 'turn-v2', call: 'call-v2', ext: 'ext-v2' };
+
+// K22：turn.end.files[] 的路径要相对工作区根、不能 .. 、不能以 / 开头、不能有 \ 与控制字符（schema 的 path 正则）
+const PATH_OK = /^(?!\/)(?![A-Za-z]:)(?!.*\\)(?!.*(?:^|\/)\.{1,2}(?:\/|$))(?!.*\/\/)(?![\s\S]*[ -])[^/]+(?:\/[^/]+)*$/;
+const stripPrivate = (p) => String(p).replace(/^\/private(\/(?:tmp|var)(?:\/|$))/, '$1');   // macOS：/private/tmp 与 /tmp 是同一处
+const FILE_TOOLS = { Edit: 'modify', MultiEdit: 'modify', NotebookEdit: 'modify', Write: 'modify', Read: 'read' };
+const OP_RANK = { create: 3, modify: 2, read: 1 };
+
 export function mapRecords(records, args) {
   const {
     sid, project_id, workspace_id, parent_instance = 'main',
@@ -191,9 +203,25 @@ export function mapRecords(records, args) {
     seen_uuids = [], hook_turns = {}, hook_perms = [], perm_since = '', perm_periods = null, split_decisions = {},
     known_agents = {}, done_ts = null,
     close_last = '', stop_turn = '', turns = true,
-    vt_version = '', rule_version = 'diverge-v1', capture_content = '1',
+    vt_version = '', rule_version = RULE_VERSIONS.diverge, capture_content = '1',
+    workspace_roots = null,
   } = args;
   const capContent = capture_content !== '0';
+  // K22：工作区的根（主 checkout 与它的 worktree，hook 侧给；没给就没有 files[]）。最长的根先匹配，desktop 的 worktree 在主 checkout 下面
+  const roots = (isArr(workspace_roots) ? workspace_roots : []).filter((p) => isStr(p) && p !== '')
+    .map((p) => stripPrivate(p).replace(/\/+$/, '')).filter((p) => p !== '').sort((a, b) => b.length - a.length);
+  const relPath = (abs) => {
+    if (!isStr(abs) || abs === '') return null;
+    const p = stripPrivate(abs);
+    for (const r of roots) {
+      if (!p.startsWith(r + '/')) continue;
+      // desktop 的 worktree 都在主 checkout 的 .claude/worktrees/<名>/ 下：worktree 已经删了（不在 git worktree list 里）时也按仓内路径算，
+      // 否则同一个文件在 worktree 删前删后是两个路径
+      const rel = p.slice(r.length + 1).replace(/^\.claude\/worktrees\/[^/]+\//, '');
+      return PATH_OK.test(rel) ? rel : null;
+    }
+    return null;
+  };
 
   const prior = {};
   for (const p of seen_uuids) prior[p[0]] = p[1];
@@ -288,31 +316,57 @@ export function mapRecords(records, args) {
     return e;
   };
 
-  const usageOf = (m) => {
-    const us = Object.values(m).filter(isObj);
-    if (us.length === 0) return null;
-    const think = us.reduce((a, u) => a + (isObj(u.output_tokens_details) ? alt(nz(u.output_tokens_details.thinking_tokens), 0) : 0), 0);
-    const o = {
-      input_tokens: us.reduce((a, u) => a + alt(nz(u.input_tokens), 0) + alt(nz(u.cache_creation_input_tokens), 0), 0),
-      cached_input_tokens: us.reduce((a, u) => a + alt(nz(u.cache_read_input_tokens), 0), 0),
-      output_tokens: us.reduce((a, u) => a + alt(nz(u.output_tokens), 0), 0),
-    };
-    if (think > 0) o.reasoning_tokens = think;
-    o.total_tokens = o.input_tokens + o.cached_input_tokens + o.output_tokens;
-    for (const k of Object.keys(o)) if (typeof o[k] !== 'number') delete o[k];
-    return o;
+  // U12（用户 09-16 定，按采集端协议文档「usage 是累计值，采不到的字段省略而不是传 0；cached 通常是 input 的子集、reasoning 是 output 的子集，
+  // 不能把所有字段直接相加」）：input = input_tokens + cache_creation + cache_read（Claude 的 input_tokens 不含缓存，要加回去），
+  // cached = cache_read（input 的子集），output 原样（thinking 已含在里面），reasoning = thinking_tokens（output 的子集），
+  // total = input + output。来源一个字段都没给的就不填那一项，不再当 0 加。Pilot 的公式与此相同（hook-processor 的「token 全量公式」），
+  // teamai 是四桶独立、总数四项相加——正是协议不许的算法。09-15 以前：input 不含缓存读、total 三项相加、缺的按 0
+  const numOrNull = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const usageSum = (us) => {
+    let inp = null, cc = null, cr = null, out = null, think = null;
+    const add = (a, v) => (v === null ? a : (a ?? 0) + v);
+    for (const u of us) {
+      inp = add(inp, numOrNull(u.input_tokens)); cc = add(cc, numOrNull(u.cache_creation_input_tokens)); cr = add(cr, numOrNull(u.cache_read_input_tokens));
+      out = add(out, numOrNull(u.output_tokens));
+      think = add(think, isObj(u.output_tokens_details) ? numOrNull(u.output_tokens_details.thinking_tokens) : null);
+    }
+    const o = {};
+    const input = (inp === null && cc === null && cr === null) ? null : (inp ?? 0) + (cc ?? 0) + (cr ?? 0);
+    if (input !== null) o.input_tokens = input;
+    if (cr !== null) o.cached_input_tokens = cr;
+    if (out !== null) o.output_tokens = out;
+    if (think !== null && think > 0) o.reasoning_tokens = think;
+    if (input !== null || out !== null) o.total_tokens = (input ?? 0) + (out ?? 0);
+    return Object.keys(o).length > 0 ? o : null;
   };
-  const usageOne = (u) => {
-    if (!isObj(u)) return null;
-    const o = {
-      input_tokens: alt(nz(u.input_tokens), 0) + alt(nz(u.cache_creation_input_tokens), 0),
-      cached_input_tokens: alt(nz(u.cache_read_input_tokens), 0),
-      output_tokens: alt(nz(u.output_tokens), 0),
-    };
-    const t = isObj(u.output_tokens_details) ? alt(nz(u.output_tokens_details.thinking_tokens), 0) : 0;
-    if (t > 0) o.reasoning_tokens = t;
-    o.total_tokens = o.input_tokens + o.cached_input_tokens + o.output_tokens;
-    return o;
+  const usageOf = (m) => { const us = Object.values(m).filter(isObj); return us.length === 0 ? null : usageSum(us); };
+  const usageOne = (u) => (isObj(u) ? usageSum([u]) : null);
+
+  // K22：这一轮改 / 读了哪些文件——Edit / MultiEdit / NotebookEdit / Write / Read 成功的结果记进当前轮（主会话文件才有轮），
+  // 关轮时挂到 turn.end.files[]（协议把它与 commits[] 当成查「每轮改了哪些文件」的标准入口）。evidence 一律 tool_result（结果没报错才记）；
+  // Write 的结果 type=create 记 create，其余改动记 modify；同一文件取最重的操作（create > modify > read）。
+  // 路径相对工作区根，根外的（K2 跨仓，协议没有表达法）不发、只计数；超过协议上限 256 项先丢 read 再截断，都记在 extensions。
+  // 本机实测（09-16，11 个会话 72 轮）：有改动的轮平均 3.5 个文件、最多 10 个，路径平均 102 字节——每条 turn.end 不到 1 KB
+  const noteFile = (pt, absPath, op) => {
+    if (pt === null) return;
+    const rel = relPath(absPath);
+    if (rel === null) { if (roots.length > 0 && isStr(absPath) && absPath !== '') pt.files_outside += 1; return; }
+    const cur = pt.files[rel];
+    if (cur === undefined || OP_RANK[op] > OP_RANK[cur]) pt.files[rel] = op;
+  };
+  const attachFiles = (e, pt) => {
+    if (!pt || !isObj(pt.files)) return;
+    let list = Object.entries(pt.files).map(([p, op]) => ({ path: p, operation: op, evidence: 'tool_result' }));
+    let truncated = 0;
+    if (list.length > 256) {
+      const changed = list.filter((f) => f.operation !== 'read');
+      list = changed.length > 256 ? changed.slice(0, 256) : changed;
+      truncated = Object.keys(pt.files).length - list.length;
+    }
+    if (list.length > 0) e.files = list;
+    if (truncated > 0 || pt.files_outside > 0) {
+      e.extensions = { ...e.extensions, 'vibetrail.files_dropped': { ...(pt.files_outside > 0 ? { outside_workspace: pt.files_outside } : {}), ...(truncated > 0 ? { over_limit: truncated } : {}) } };
+    }
   };
 
   const hookTurn = (id) => { const h = isObj(hook_turns) ? nz(hook_turns[id]) : null; return alt(h, {}); };
@@ -359,12 +413,12 @@ export function mapRecords(records, args) {
   const openTurn = (s) => {
     st.pturn = { id: s.promptId, line: s.ln, last_ts: s.ts, usage: {}, model: null, answered: false,
       interrupted: false, denied: false, git_commit: false, closed: false, end_turn: false, stop_blocked: false,
-      block_pending: false, summary: null, queued: 0 };
+      block_pending: false, summary: null, queued: 0, files: {}, files_outside: 0 };
     if (s.ln > from_line) st.ledger.turns.started += 1;
     const h = hookTurn(s.promptId);
     const vcs = vcsMerge(st.branch, isObj(h.start) ? h.start.vcs : null);
     const e = base(s, 'turn.start', s.uuid, s.ts, { id: s.promptId, inferred: false });
-    e.provenance = { kind: 'transcript', rule_version: 'turn-v1', source_event_id: s.uuid };
+    e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.turn, source_event_id: s.uuid };
     e.payload = { ...opt('vcs', vcs) };
     e._key = s.promptId + '|turn.start';
     emit(e);
@@ -381,15 +435,16 @@ export function mapRecords(records, args) {
       : nz(h.fail) != null ? 'stop_failure'
       : pt.api_error ? 'api_error'
       : pt.end_turn ? 'end_turn' : 'none';
+    // K18：分类一律用协议推荐值（success / failure / cancellation / denial / unknown），来源自己的状态留在 code 里（协议允许）
     const status = pt.denied ? { code: 'denied', category: 'denial', detail: 'turn stopped by a permission denial' }
       : (pt.summary && pt.summary.prevented === true) ? { code: 'hook_stopped', category: 'cancellation', detail: cut(alt(pt.summary.reason, ''), 4096) }
       : (evidence === 'stop_hook_summary' || evidence === 'hook_stop' || evidence === 'end_turn') ? { code: 'completed', category: 'success' }
-      : evidence === 'stop_failure' ? { code: codeify(alt(isObj(h.fail) ? nz(h.fail.error) : null, 'error')), category: 'error' }
-      : evidence === 'api_error' ? { code: codeify(pt.api_error.error), category: 'error' }
+      : evidence === 'stop_failure' ? { code: codeify(alt(isObj(h.fail) ? nz(h.fail.error) : null, 'error')), category: 'failure' }
+      : evidence === 'api_error' ? { code: codeify(pt.api_error.error), category: 'failure' }
       : { code: 'unknown', category: 'unknown' };
     const usage = usageOf(pt.usage), vcs = vcsMerge(st.branch, isObj(tend) ? tend.vcs : null), commits = commitsOf(tend);
     const e = base(s, 'turn.end', null, alt(pt.summary ? pt.summary.ts : null, alt(stop ? stop.at : null, pt.last_ts)), { id: pt.id, inferred: false });
-    e.provenance = { kind: 'transcript', rule_version: 'turn-v1',
+    e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.turn,
       ...(pt.summary !== null || stop !== null ? { source_event: 'Stop' } : {}),
       ...opt('source_event_id', pt.summary ? pt.summary.uuid : null) };
     e.payload = { status, ...opt('model', pt.model), ...opt('usage', usage), ...opt('vcs', vcs) };
@@ -398,6 +453,7 @@ export function mapRecords(records, args) {
       e.extensions = { ...e.extensions, 'vibetrail.commit_method': alt(isObj(tend) ? nz(tend.commit_method) : null, 'rev-list'),
         'vibetrail.commit_attribution': pt.git_commit ? 'agent_tool' : 'inferred' };
     }
+    attachFiles(e, pt);
     e.extensions = { ...e.extensions, 'vibetrail.closed_by': how,
       'vibetrail.end_evidence': pt.denied ? 'denial' : evidence,
       'vibetrail.stops': alt(stop ? nz(stop.stops) : null, 0),
@@ -519,7 +575,20 @@ export function mapRecords(records, args) {
     if (stopCalls.length > 0) {
       for (const cid of stopCalls) {
         const tu = alt(nz(st.tools[cid]), null);
-        if (tu !== null) emit(toolRequest(s, t, cid, tu, { 'vibetrail.trigger': s.uuid, 'vibetrail.kind': kind }));
+        if (tu === null) continue;
+        emit(toolRequest(s, t, cid, tu, { 'vibetrail.trigger': s.uuid, 'vibetrail.kind': kind }));
+        // K21：协议「工具调用中断并导致轮次终止时，tool.end(cancelled) 与 turn.end 各发一条，不能只保留其中一条」。
+        // 以前这类（K7 判成按停止的）只补发 tool.request；判成人拒绝的仍不发 tool.end（协议：执行前被拒只发 permission.decision）。
+        // _key 仍是 <call_id>|tool.end：之后不会再有真结果（这次调用已经被打断），有也只留一条；耗时只能按记录时间差，标 wall_clock
+        const b1 = epochms(s.ts), a1 = epochms(tu.ts);
+        const wall = (b1 !== null && a1 !== null && b1 >= a1) ? b1 - a1 : null;
+        const te = base(s, 'tool.end', s.uuid, s.ts, t);
+        te.payload = { tool_name: alt(tu.name, 'unknown'), call_id: cid,
+          status: { code: 'cancelled', category: 'cancellation', detail: 'tool call interrupted by the user (stop pressed while it was running)' },
+          ...opt('duration_ms', wall) };
+        te.extensions = { ...te.extensions, 'vibetrail.trigger': s.uuid, 'vibetrail.kind': kind, ...(wall !== null ? { 'vibetrail.duration_kind': 'wall_clock' } : {}) };
+        te._key = cid + '|tool.end';
+        emit(te);
       }
     } else if (reply !== null) {
       for (const tl of reply.tools) {
@@ -545,6 +614,7 @@ export function mapRecords(records, args) {
       e.extensions = { ...e.extensions, 'vibetrail.commit_method': alt(isObj(hend) ? nz(hend.commit_method) : null, 'rev-list'),
         'vibetrail.commit_attribution': gc ? 'agent_tool' : 'inferred' };
     }
+    if (!sub && st.pturn !== null && st.pturn.id === t.id) attachFiles(e, st.pturn);   // K22：打断结束的轮也带 files[]
     const rawData = { ...h }; delete rawData.as_kind; delete rawData.split_by; delete rawData.permission_mode; delete rawData.stop_calls;
     e.raw = { event_name: 'diverge.' + h.kind, data: rawData };
     // K13：打断发的 turn.end 以前不带 closed_by / stops（本机 252 条全空），读的一方连「同 turn_id 取 stops 最大」都用不上
@@ -591,6 +661,18 @@ export function mapRecords(records, args) {
     if (s.human) st.pending = null;
   };
   const emitPrompt = (s) => emit(message(s, turnOf(s), s, 'message.user', 'user', s.slash ? { 'vibetrail.slash_command': true } : {}));
+  // K20：模型干活时人插进去的话（queued_command 附件，commandMode prompt、origin 是人）。09-16 全采之后人说的话里只有这一类没发出去。
+  // 协议：排队消息用 delivery=queued，「不能把排队消息当成人的实时输入」——所以不算分歧之后的下一句（那要等它真正作为 prompt 提交时的 user 记录）。
+  // 正文取附件的 prompt；附件没有 promptId（本机 41 条全没有），轮次按当前轮推。关掉全采时照旧只在 turn.end 上计数
+  const emitQueued = (r, s) => {
+    const text = nz(r.attachment.prompt);
+    if (!isStr(text) || text.length === 0) return;
+    const e = base(s, 'message.user', s.uuid, s.ts, turnOf(s));
+    e.payload = { text, author_type: 'user', delivery: 'queued' };
+    e.content_state = 'included';
+    e._key = s.uuid + '|message.user';
+    emit(e);
+  };
 
   const turnBoundary = (r, s) => {
     // K12（09-16 复核：turn.end 里 6.4% 是 unknown，106 轮一次模型调用都没有）：以前任何带新 promptId 的 user 记录都开一轮，
@@ -648,7 +730,7 @@ export function mapRecords(records, args) {
     const e = base({ agent: c.agent }, 'message.assistant', c.last_uuid, c.last_ts, c.turn);
     e.content_state = (capContent && txt.length > 0) ? 'included' : 'omitted';
     e.payload = { author_type: 'agent', ...opt('model', c.model), ...(capContent && txt.length > 0 ? { text: txt } : {}) };
-    e.provenance = { kind: 'transcript', rule_version: 'call-v1', source_event_id: c.last_uuid };
+    e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.call, source_event_id: c.last_uuid };
     if (capContent && think.length > 0) e.extensions = { ...e.extensions, 'vibetrail.reasoning': think };
     const startedAt = (c.started_at !== null && c.last_ts !== null && cmpJq(c.started_at, c.last_ts) > 0) ? c.last_ts : c.started_at;
     e.extensions = { ...e.extensions, 'vibetrail.call': {
@@ -668,11 +750,19 @@ export function mapRecords(records, args) {
       if (cid === null || !st.tools[cid]) continue;
       const tu = st.tools[cid];
       const txt = errText(b.content);
-      const status = b.is_error !== true ? { code: 'success', category: 'success' }
+      // K18：code 与分类用协议推荐值（tool.end：succeeded / failed / cancelled；分类 success / failure / cancellation）。
+      // 09-16 以前发的是 success / error，分类 error 云端会归进 other
+      const status = b.is_error !== true ? { code: 'succeeded', category: 'success' }
         : /^\[Tool call (did not complete|skipped)/.test(txt) ? { code: 'cancelled', category: 'cancellation' }
         : (isHumanDenial(txt) || isClassifier(txt) || isInfra(txt) || txt.startsWith("The user doesn't want to")) ? null
-        : { code: 'error', category: 'error' };
+        : { code: 'failed', category: 'failure' };
       if (status === null) continue;
+      // K22：成功的文件工具记进当前轮（主会话才有轮；子 agent 文件里 pturn 一直是 null）
+      if (b.is_error !== true && mainRec(r) && st.pturn !== null && FILE_TOOLS[tu.name] !== undefined && isObj(tu.input)) {
+        const p = alt(nz(tu.input.file_path), nz(tu.input.notebook_path));
+        const op = (tu.name === 'Write' && isObj(r.toolUseResult) && r.toolUseResult.type === 'create') ? 'create' : FILE_TOOLS[tu.name];
+        noteFile(st.pturn, p, op);
+      }
       const b1 = epochms(s.ts), a1 = epochms(tu.ts);
       const wall = (b1 !== null && a1 !== null && b1 >= a1) ? b1 - a1 : null;
       // K15②（用户 09-16 定）：Claude Code 自己记了耗时的工具（WebSearch 的 durationSeconds、WebFetch 的 durationMs、
@@ -690,7 +780,7 @@ export function mapRecords(records, args) {
       e.content_state = capContent ? 'included' : 'omitted';
       e.payload = { tool_name: tu.name, call_id: cid, status, ...opt('duration_ms', d),
         ...(capContent ? opt('output', alt(nz(b.content), alt(nz(b.output), alt(nz(b.result), null)))) : {}) };
-      e.provenance = { kind: 'transcript', rule_version: 'call-v1', source_event_id: s.uuid };
+      e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.call, source_event_id: s.uuid };
       if (dkind) e.extensions = { ...e.extensions, 'vibetrail.duration_kind': dkind };
       e._key = cid + '|tool.end';
       emit(e);
@@ -711,7 +801,7 @@ export function mapRecords(records, args) {
     e.payload = { ...opt('retry_attempt', nz(r.retryAttempt)), ...opt('retry_in_ms', nz(r.retryInMs)), ...opt('max_retries', nz(r.maxRetries)),
       ...opt('source', nz(r.source)), ...opt('error', isStr(emsg) ? cut(emsg, 200) : null), ...opt('status', alt(nz(err.status), null)) };
     // 协议要求 ext.* 带 source_event（今天更新的 schema）；这一路是 transcript 出的，填来源记录的子类型
-    e.provenance = { kind: 'transcript', rule_version: 'call-v1', source_event: 'api_error', source_event_id: s.uuid };
+    e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.call, source_event: 'api_error', source_event_id: s.uuid };
     e.extensions = { ...e.extensions, ...opt('vibetrail.response_id', req ? req.mid : null) };
     e._key = s.uuid + '|api_error';
     emit(e);
@@ -750,7 +840,7 @@ export function mapRecords(records, args) {
         const e = base(s, 'tool.request', s.uuid, s.ts, { id: alt(st.turn, s.uuid), inferred: st.turn === null });
         e.content_state = 'included';
         e.payload = { tool_name: alt(tu.name, 'unknown'), call_id: tu.id, input: tu.input };
-        e.provenance = { kind: 'transcript', rule_version: 'call-v1', source_event_id: s.uuid };
+        e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.call, source_event_id: s.uuid };
         e._key = s.uuid + '|tool.request|' + tu.id;
         emit(e);
       }
@@ -774,7 +864,7 @@ export function mapRecords(records, args) {
     const e = base(s, 'ext.claude.prompt_snapshot', s.uuid, s.ts, { id: alt(st.turn, s.uuid), inferred: st.turn === null });
     e.content_state = 'included';
     e.payload = { bytes: Buffer.byteLength(text, 'utf8'), sha256: sha };
-    e.provenance = { kind: 'transcript', rule_version: 'call-v1', source_event: 'prompt_snapshot', source_event_id: s.uuid };
+    e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.call, source_event: 'prompt_snapshot', source_event_id: s.uuid };
     e.extensions = { ...e.extensions, 'vibetrail.system_prompt': text };
     e._key = 'ext|prompt_snapshot|' + sha.slice(0, 16);
     emit(e);
@@ -800,7 +890,7 @@ export function mapRecords(records, args) {
     const x = String(alt(v, 'completed'));
     if (x === 'completed') return { code: 'completed', category: 'success' };
     if (/^(stopped|killed|cancelled|canceled|interrupted|aborted)$/.test(x)) return { code: codeify(x), category: 'cancellation' };
-    return { code: codeify(x), category: 'error' };
+    return { code: codeify(x), category: 'failure' };   // K18：failed 等是 failure，不是 error
   };
   // 与原先 SubagentStart / SubagentStop hook 发的 _key 相同（<agentId>|subagent.start / end）：同一个 agent 只算一条，哪一路先到用哪一路
   const agentStart = (s, aid, parent, agentType, callId, task) => {
@@ -808,8 +898,11 @@ export function mapRecords(records, args) {
     e.agent_instance_id = aid;
     e.parent_agent_instance_id = parent;
     delete e.parent_call_id; if (isStr(callId)) e.parent_call_id = callId;
-    e.payload = { agent_type: agentType, ...opt('task', isStr(task) && task !== '' ? task : null) };
-    e.provenance = { kind: 'transcript', rule_version: 'turn-v1', source_event_id: s.uuid };
+    // K23：协议把 payload.task 算正文，content_state=omitted 时必须缺失——只在全采时带，关掉时不带、标 omitted
+    const withTask = capContent && isStr(task) && task !== '';
+    e.payload = { agent_type: agentType, ...(withTask ? { task } : {}) };
+    e.content_state = capContent ? 'included' : 'omitted';
+    e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.turn, source_event_id: s.uuid };
     e._key = `${aid}|subagent.start`;
     emit(e);
   };
@@ -821,7 +914,7 @@ export function mapRecords(records, args) {
     const withMsg = capContent && isStr(lastMessage) && lastMessage.length > 0;
     e.payload = { agent_type: agentType, status: agentEndStatus(status), ...(withMsg ? { last_message: lastMessage } : {}) };
     if (withMsg) e.content_state = 'included';
-    e.provenance = { kind: 'transcript', rule_version: 'turn-v1', source_event_id: s.uuid };
+    e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.turn, source_event_id: s.uuid };
     if (isObj(facts) && Object.keys(facts).length > 0) e.extensions = { ...e.extensions, 'vibetrail.agent': facts };
     e._key = `${aid}|subagent.end`;
     emit(e);
@@ -894,7 +987,7 @@ export function mapRecords(records, args) {
     if (st.last_cwd !== null && r.cwd !== st.last_cwd) {
       const e = base(s, 'ext.claude.cwd_changed', s.uuid, s.ts, turnOf(s));
       e.payload = { old_cwd: st.last_cwd, new_cwd: r.cwd };
-      e.provenance = { kind: 'transcript', rule_version: 'ext-v1', source_event: 'cwd', source_event_id: s.uuid };
+      e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.ext, source_event: 'cwd', source_event_id: s.uuid };
       e._key = `${s.uuid}|cwd_changed`;
       emit(e);
     }
@@ -920,7 +1013,7 @@ export function mapRecords(records, args) {
       e.content_state = 'included';
       e.extensions = { ...e.extensions, 'vibetrail.instructions': files.filter((f) => isStr(f.content)).map((f) => ({ path: nz(f.path), content: f.content })) };
     }
-    e.provenance = { kind: 'transcript', rule_version: 'ext-v1', source_event: 'instructions', source_event_id: s.uuid };
+    e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.ext, source_event: 'instructions', source_event_id: s.uuid };
     e._key = `${s.uuid}|instructions_loaded`;
     emit(e);
   };
@@ -970,7 +1063,7 @@ export function mapRecords(records, args) {
     if (s.human || s.slash) {
       if (st.pending !== null) emitAfter(s);
       else if (capContent) emitPrompt(s);
-    }
+    } else if (capContent && mainRec(r) && isQueuedHuman(r)) emitQueued(r, s);
   };
 
   const checkpoint = () => {

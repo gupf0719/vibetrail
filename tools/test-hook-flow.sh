@@ -24,7 +24,8 @@ REPO=$T/demo-proj; mkdir -p "$REPO"; REPO=$(cd "$REPO" && pwd -P)
 # settings 也必须指到临时目录：09-15 第 16 段跑 init 时漏了它，把真实的 ~/.claude/settings.json 里的 hook 命令写成了临时目录（事后已恢复）
 REAL_SETTINGS=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json
 REAL_SUM=$( { cat "$REAL_SETTINGS" 2>/dev/null || true; } | cksum)
-export VIBETRAIL_HOME=$T/vt VIBETRAIL_CLAUDE_PROJECTS=$T/claude/projects VIBETRAIL_CLAUDE_SETTINGS=$T/claude/settings.json VIBETRAIL_STABLE_WAIT=0 VIBETRAIL_FOREGROUND=1
+# VIBETRAIL_STOP_WAIT=0：这里的 transcript 多数没有答完标记，Stop 不等（K24 单独一节按真实时序测）
+export VIBETRAIL_HOME=$T/vt VIBETRAIL_CLAUDE_PROJECTS=$T/claude/projects VIBETRAIL_CLAUDE_SETTINGS=$T/claude/settings.json VIBETRAIL_STABLE_WAIT=0 VIBETRAIL_FOREGROUND=1 VIBETRAIL_STOP_WAIT=0
 . "$SELF/vibetrail-lib.sh"; VT_HOME=$VIBETRAIL_HOME
 # 全采正文默认开（用户 09-16）。下面这一大批断言钉的是「只带元数据」那个形态——它现在是 capture_content=0 的行为，
 # 仍然是支持的模式，显式关掉开关跑；全采的端到端在最后一节单测
@@ -51,18 +52,20 @@ replay(){ # 按 scenario 的步骤回放：append 追加一行（cwd 换成临�
     rm -rf "$TDIR"; mkdir -p "$TDIR"; : > "$TR"
     while IFS= read -r step; do
         if [ "$(printf '%s' "$step" | jq 'has("append")')" = "true" ]; then
-            printf '%s' "$step" | jq -c --arg cwd "$REPO" '.append | .cwd = $cwd' >> "$TR"
+            printf '%s' "$step" | jq -c --arg cwd "$REPO" '.append | .cwd = $cwd | walk(if type == "string" and startswith("/tmp/demo-proj") then $cwd + .[14:] else . end)' >> "$TR"
         else
             ev=$(printf '%s' "$step" | jq -r '.hook.hook_event_name')
             hook "$ev" "$(payload "$ev")"
         fi
     done < <(jq -c '.steps[]' "$SC")
 }
-# spool 里分歧、轮次、hook 事件在同一条流里；这里只拿分歧那部分（rule_version diverge-v1）与全量分歧映射比。
-# 打断的 turn.end 会补上 hook 记的 HEAD / 脏否 / commit，全量映射那边没有 hook 证据，比之前两边都去掉这几项
-NORM='del(.payload.vcs.head_sha, .payload.vcs.dirty, .commits, .extensions["vibetrail.commit_method"], .extensions["vibetrail.commit_attribution"])'
-spool_events(){ cat "$SPOOL"/*.jsonl 2>/dev/null | jq -S -c "select(.provenance.rule_version == \"diverge-v1\") | $NORM" | sort; }
-full_map(){ bash "$SELF/vibetrail-map" "$TR" --no-turns --sid "$SID" --project-id "$REPO" --workspace-id "$REPO" --ledger /dev/null | jq -S -c "$NORM" | sort; }
+# spool 里分歧、轮次、hook 事件在同一条流里；这里只拿分歧那部分（rule_version diverge-v2）与全量分歧映射比。
+# 打断的 turn.end 会补上 hook 记的 HEAD / 脏否 / commit，全量映射那边没有 hook 证据，比之前两边都去掉这几项；
+# K22 的 files[] 只有 hook 那边（有工作区根）才有，也去掉
+NORM='del(.payload.vcs.head_sha, .payload.vcs.dirty, .commits, .files, .extensions["vibetrail.commit_method"], .extensions["vibetrail.commit_attribution"], .extensions["vibetrail.files_dropped"])'
+spool_events(){ cat "$SPOOL"/*.jsonl 2>/dev/null | jq -S -c "select(.provenance.rule_version == \"diverge-v2\") | $NORM" | sort; }
+# K17：全量映射那边 project_id / workspace_id 照 hook 的算法取（登记表 > origin > 目录名；持久化的 UUID），两边才对得上
+full_map(){ bash "$SELF/vibetrail-map" "$TR" --no-turns --sid "$SID" --project-id "$(basename "$REPO")" --workspace-id "$(head -1 "$VT_HOME/workspaces/$(vt_sha "$REPO")")" --ledger /dev/null | jq -S -c "$NORM" | sort; }
 
 echo "════ 0. 脚本里没有「变量名后直接跟非 ASCII 字符」，入口脚本都固定了 C locale ════"
 # macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟变量名的中文首字节算进变量名：变量名后紧跟「）」时，找的是「V 加上「）」的首字节」这个变量（用户 09-15 装机时踩到）。
@@ -87,6 +90,10 @@ check "state 记下 checkpoint 与消费到的字节" 'jq -e ".consumed_bytes ==
 check "没有错误日志" '[ ! -s "$VT_HOME/logs/errors.log" ]'
 check "正常追加不算重写：state 里 rewrites 为 0、带文件指纹" 'jq -e ".rewrites == 0 and (.fprint | test(\"^[0-9]+:[0-9a-f]{40}:[0-9a-f]{40}$\"))" "$VT_HOME/state/$SID/main.json" >/dev/null'
 check "被观测仓里零写入（A8）" '[ -z "$(git -C "$REPO" status --porcelain)" ]'
+# K17（采集端协议）：project_id 是简单项目名（这个仓没有远端 → 目录名），workspace_id 是第一次见到时生成、持久化在 workspaces/ 的 UUID；两者都不含路径
+WID=$(head -1 "$VT_HOME/workspaces/$(vt_sha "$REPO")" 2>/dev/null)
+check "K17: 每条事件 project_id = demo-proj（目录名，没有远端）、workspace_id 是 UUID 且与 workspaces/ 里持久化的一致（路径只在 extensions 的 worktree 里，D11）" \
+    'printf "%s" "$WID" | grep -Eq "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" && cat "$SPOOL"/*.jsonl | jq -s -e --arg w "$WID" --arg r "$REPO" "all(.[]; .project_id == \"demo-proj\" and .workspace_id == \$w and ((.project_id + .workspace_id) | contains(\$r) | not))" >/dev/null'
 
 echo "════ 3. 重复触发不重复写 ════"
 ndiv(){ spool_events | wc -l | tr -d ' '; }
@@ -139,16 +146,16 @@ printf '%s\n' '{"agentType":"general-purpose","description":"查","spawnDepth":1
   rec s1d s1a P1 user '[{"type":"tool_result","tool_use_id":"st1","content":"Permission to use Bash with command ls has been denied.","is_error":true}]' '{"agentId":"s1","isSidechain":true}'
 } > "$TDIR/$SID/subagents/agent-s1.jsonl"
 hook Stop "$(payload Stop)"
-check "子 agent 的拒绝进 spool，实例 s1、父实例 main、parent_call_id 取 meta" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"diverge-v1\")) | length == 2 and all(.[]; .agent_instance_id == \"s1\" and .parent_agent_instance_id == \"main\" and .parent_call_id == \"toolu_x\")" >/dev/null'
-check "子 agent 起：文件第一条记录出 subagent.start（类型、任务取 meta）；父会话里还没有它的调用结果，那次模型调用先不写出" \
-    'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "(map(select(.type == \"subagent.start\")) | length == 1 and .[0].payload == {agent_type: \"general-purpose\", task: \"查\"} and .[0].parent_call_id == \"toolu_x\") and (map(select(.type == \"message.assistant\")) | length == 0)" >/dev/null'
+check "子 agent 的拒绝进 spool，实例 s1、父实例 main、parent_call_id 取 meta" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"diverge-v2\")) | length == 2 and all(.[]; .agent_instance_id == \"s1\" and .parent_agent_instance_id == \"main\" and .parent_call_id == \"toolu_x\")" >/dev/null'
+check "子 agent 起：文件第一条记录出 subagent.start（类型取 meta；这里关着全采，不带 task、标 omitted，K23）；父会话里还没有它的调用结果，那次模型调用先不写出" \
+    'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "(map(select(.type == \"subagent.start\")) | length == 1 and .[0].payload == {agent_type: \"general-purpose\"} and .[0].content_state == \"omitted\" and .[0].parent_call_id == \"toolu_x\") and (map(select(.type == \"message.assistant\")) | length == 0)" >/dev/null'
 # 同步 agent 结束：父会话里出现派它的那次 Agent 调用的结果（带 agentId、status、耗时、token）
 rec s1done u5 prompt-5 user '[{"type":"tool_result","tool_use_id":"toolu_x","content":[{"type":"text","text":"查不了"}]}]' \
     '{"toolUseResult":{"status":"completed","agentId":"s1","agentType":"general-purpose","content":[{"type":"text","text":"查不了"}],"totalDurationMs":1200,"totalTokens":300,"totalToolUseCount":1}}' >> "$TR"
 hook Stop "$(payload Stop)"
 check "父会话里有了调用结果：subagent.end 记在主会话那一块（实例 s1、父 main、调用 toolu_x、completed、耗时与 token）" \
     'cat "$SPOOL"/*-main.jsonl | jq -s -e "map(select(.type == \"subagent.end\" and .agent_instance_id == \"s1\")) | length == 1 and .[0].parent_call_id == \"toolu_x\" and .[0].payload.status.code == \"completed\" and .[0].extensions[\"vibetrail.agent\"] == {duration_ms: 1200, total_tokens: 300, tool_use_count: 1}" >/dev/null'
-check "子 agent 的那次模型调用这时写出：实例 s1、不带正文；被拒的调用不伪造 tool.end" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"call-v1\")) | length == 1 and .[0].type == \"message.assistant\" and .[0].agent_instance_id == \"s1\" and .[0].content_state == \"omitted\" and (.[0].payload | has(\"text\") | not) and .[0].extensions[\"vibetrail.call\"].tool_calls == [\"Bash\"]" >/dev/null'
+check "子 agent 的那次模型调用这时写出：实例 s1、不带正文；被拒的调用不伪造 tool.end" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"call-v2\")) | length == 1 and .[0].type == \"message.assistant\" and .[0].agent_instance_id == \"s1\" and .[0].content_state == \"omitted\" and (.[0].payload | has(\"text\") | not) and .[0].extensions[\"vibetrail.call\"].tool_calls == [\"Bash\"]" >/dev/null'
 check "完成信号记进 state/<sid>/agents.json" 'jq -e ".done.s1 == \"2026-09-15T12:00:00.000Z\" and .calls_done.toolu_x != null" "$VT_HOME/state/$SID/agents.json" >/dev/null'
 
 # 并行的另一个子 agent s2 是后台派出的（调用结果当场返回 isAsync），它的一次调用只写了一半（2.1.260 边生成边执行工具：tool_use 一个一个写，结果夹在中间）
@@ -160,9 +167,9 @@ rec s2launch s1done prompt-5 user '[{"type":"tool_result","tool_use_id":"toolu_y
   rec s2r s2a P1 user '[{"type":"tool_result","tool_use_id":"s2t1","content":"def add"}]' '{"agentId":"s2","isSidechain":true}'
 } > "$TDIR/$SID/subagents/agent-s2.jsonl"
 hook Stop "$(payload Stop)"
-check "还在跑的子 agent：读到一半的那次调用先不写，工具结果照写" 'cat "$SPOOL"/*-agent-s2.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"call-v1\") | .type) == [\"tool.end\"]" >/dev/null'
+check "还在跑的子 agent：读到一半的那次调用先不写，工具结果照写" 'cat "$SPOOL"/*-agent-s2.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"call-v2\") | .type) == [\"tool.end\"]" >/dev/null'
 check "后台派出的 s2：subagent.start 只有一条（父会话的启动结果与子 agent 文件第一条是同一个事件，先到的算）" \
-    'cat "$SPOOL"/*.jsonl | jq -s -e "map(select(.type == \"subagent.start\" and .agent_instance_id == \"s2\")) | length == 1 and .[0].parent_call_id == \"toolu_y\" and .[0].payload.task == \"并行\"" >/dev/null'
+    'cat "$SPOOL"/*.jsonl | jq -s -e "map(select(.type == \"subagent.start\" and .agent_instance_id == \"s2\")) | length == 1 and .[0].parent_call_id == \"toolu_y\" and (.[0].payload | has(\"task\") | not)" >/dev/null'
 { rec s2b s2r P1 assistant '[]' '{"agentId":"s2","isSidechain":true,"message":{"id":"sm2","model":"claude-sonnet-5","role":"assistant","content":[{"type":"tool_use","id":"s2t2","name":"Grep","input":{"pattern":"add"}}]}}'
   rec s2s s2b P1 user '[{"type":"tool_result","tool_use_id":"s2t2","content":"calc.py:1"}]' '{"agentId":"s2","isSidechain":true}'
   rec s2c s2s P1 assistant '[]' '{"agentId":"s2","isSidechain":true,"message":{"id":"sm3","model":"claude-sonnet-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"查完了。"}]}}'
@@ -173,7 +180,7 @@ check "后台 agent 还没发完成通知：Stop 时它最后那次回答先不�
 NOTE_S2=$(jq -n -c '"<task-notification>\n<task-id>s2</task-id>\n<tool-use-id>toolu_y</tool-use-id>\n<status>completed</status>\n<summary>Agent \"并行\" completed</summary>\n<result>查完了。</result>\n</task-notification>"')
 rec s2note s2launch prompt-5 user "$NOTE_S2" '{"origin":{"kind":"task-notification"}}' >> "$TR"
 hook Stop "$(payload Stop)"
-check "s2 结束后：夹着工具结果的那次调用仍是一条、两个工具都在，最后一次回答也写出" 'cat "$SPOOL"/*-agent-s2.jsonl 2>/dev/null | jq -s -e "map(select(.type == \"message.assistant\" and .provenance.rule_version == \"call-v1\") | .extensions[\"vibetrail.call\"].tool_calls) == [[\"Read\", \"Grep\"], []]" >/dev/null'
+check "s2 结束后：夹着工具结果的那次调用仍是一条、两个工具都在，最后一次回答也写出" 'cat "$SPOOL"/*-agent-s2.jsonl 2>/dev/null | jq -s -e "map(select(.type == \"message.assistant\" and .provenance.rule_version == \"call-v2\") | .extensions[\"vibetrail.call\"].tool_calls) == [[\"Read\", \"Grep\"], []]" >/dev/null'
 check "通知出 subagent.end（实例 s2、调用 toolu_y、completed）" \
     'cat "$SPOOL"/*.jsonl | jq -s -e "map(select(.type == \"subagent.end\" and .agent_instance_id == \"s2\")) | length == 1 and .[0].parent_call_id == \"toolu_y\" and .[0].payload.status.code == \"completed\"" >/dev/null'
 # s2 被续上（SendMessage）又开始写：记录时间晚于上一次完成信号，续上的那次调用写一半时不写出。SendMessage 自己的结果（resumedAgentId）不是完成信号
@@ -221,7 +228,7 @@ SID2=22222222-3333-4444-8555-666666666666
   rec b3 b2 q1 user '[{"type":"text","text":"[Request interrupted by user]"}]' | jq -c --arg s "$SID2" '.sessionId = $s'
 } > "$TDIR/$SID2.jsonl"
 hook SessionStart "$(payload SessionStart '{"source":"startup"}')"
-check "别的会话的打断被补做进它自己的 spool 目录" 'cat "$VT_HOME/spool/$PKEY/$SID2"/*.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"diverge-v1\") | .type) == [\"message.assistant\", \"turn.end\"]" >/dev/null'
+check "别的会话的打断被补做进它自己的 spool 目录" 'cat "$VT_HOME/spool/$PKEY/$SID2"/*.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"diverge-v2\") | .type) == [\"message.assistant\", \"turn.end\"]" >/dev/null'
 
 echo "════ 10. scope=user：未登记的仓也采 ════"
 vt_unregister "$REPO"; rm -rf "$VT_HOME/state" "$VT_HOME/spool"
@@ -353,6 +360,8 @@ stopped='map(select(.type == "turn.end" and .extensions["vibetrail.kind"] == "in
 k7case 1 auto "" 0
 check "auto、没挂 PermissionRequest：按停止——不发 permission.decision，发 turn.end(interrupted)、kind = interrupt_tool，被打断的 Bash 照发 tool.request" \
     '[ "$(k7ev "[(map(select(.type == \"permission.decision\")) | length), ($stopped | length), ($stopped | .[0].payload.status.code), ($stopped | .[0].extensions[\"vibetrail.split_by\"]), ($stopped | .[0].extensions[\"vibetrail.permission_mode\"]), (map(select(.type == \"tool.request\" and .payload.call_id == \"tk7\")) | length)]")" = "[0,1,\"interrupted\",\"permission_mode\",\"auto\",1]" ]'
+check "K21: 按停止打断的那次调用还有一条 tool.end(cancelled)（协议：工具中断导致轮次终止时两条都发）" \
+    '[ "$(k7ev "map(select(.type == \"tool.end\" and .payload.call_id == \"tk7\")) | [length, .[0].payload.status.code, .[0].payload.status.category]")" = "[1,\"cancelled\",\"cancellation\"]" ]'
 k7case 2 default "" 0
 check "default、没挂 PermissionRequest：仍算拒绝，注明按 permissionMode 分的" \
     '[ "$(k7ev "[(map(select(.type == \"permission.decision\")) | .[0].extensions | [.[\"vibetrail.split_by\"], .[\"vibetrail.permission_mode\"]]), ($stopped | length)]")" = "[[\"permission_mode\",\"default\"],0]" ]'
@@ -463,9 +472,19 @@ check "第二个仓没登记：补采不碰它" '[ ! -e "$VT_HOME/spool/$PK2" ]'
 check "projects pick：候选里有第二个仓（删掉的 worktree 并到主仓），选 a 全部登记" \
     'out=$(printf "a\n" | bash "$SELF/vibetrail" projects pick 2>&1); [ "$(printf "%s\n" "$out" | grep -E "^ *[0-9]+\. " | grep -c "$REPO2")" = 1 ] && vt_registered "$REPO2"'
 hook SessionStart "$(payload SessionStart '{"source":"startup"}')"
-check "在第一个仓里开会话、补采到第二个仓的会话：记在第二个仓的 spool 目录，project_id / workspace_id 是第二个仓的" \
-    '[ "$(cat "$VT_HOME/spool/$PK2/$SIDA"/*.jsonl 2>/dev/null | jq -s -c "[length > 0, (map(.project_id) | unique), (map(.workspace_id) | unique)]")" = "[true,[\"github.com/acme/second\"],[\"$REPO2\"]]" ] && [ ! -e "$VT_HOME/spool/$PKEY/$SIDA" ]'
-check "删掉的 desktop worktree 留下的会话照样补，归主仓" '[ -n "$(cat "$VT_HOME/spool/$PK2/$SIDB"/*.jsonl 2>/dev/null)" ]'
+# K17：project_id 取 origin 的仓库名（git@github.com:acme/second.git → second，不再是 github.com/acme/second），workspace_id 是持久化的 UUID（不再是路径）
+WID2=$(head -1 "$VT_HOME/workspaces/$(vt_sha "$REPO2")" 2>/dev/null)
+check "在第一个仓里开会话、补采到第二个仓的会话：记在第二个仓的 spool 目录，project_id 是它 origin 的仓库名 second、workspace_id 是它自己的 UUID" \
+    'printf "%s" "$WID2" | grep -Eq "^[0-9a-f-]{36}$" && [ "$WID2" != "$WID" ] && [ "$(cat "$VT_HOME/spool/$PK2/$SIDA"/*.jsonl 2>/dev/null | jq -s -c "[length > 0, (map(.project_id) | unique), (map(.workspace_id) | unique)]")" = "[true,[\"second\"],[\"$WID2\"]]" ] && [ ! -e "$VT_HOME/spool/$PKEY/$SIDA" ]'
+check "删掉的 desktop worktree 留下的会话照样补，归主仓（同一个 workspace_id）" '[ "$(cat "$VT_HOME/spool/$PK2/$SIDB"/*.jsonl 2>/dev/null | jq -s -r "map(.workspace_id) | unique | .[]")" = "$WID2" ]'
+check "K17: 同一个仓再来一个会话，workspace_id 不变（第一次见到时生成，之后一直沿用）" \
+    '[ "$(head -1 "$VT_HOME/workspaces/$(vt_sha "$REPO2")")" = "$WID2" ] && [ "$(cat "$VT_HOME/spool/$PK2"/*/*.jsonl | jq -s -r "map(.workspace_id) | unique | length")" = 1 ]'
+check "projects add --name：显式配置的项目名优先于 origin 的仓库名，list 里列出来，映射默认取值也跟着" \
+    'bash "$SELF/vibetrail" projects add "$REPO2" --name payment-service >/dev/null 2>&1 && bash "$SELF/vibetrail" projects list 2>/dev/null | grep -q "$REPO2   project_id=payment-service" \
+     && [ "$(bash "$SELF/vibetrail-map" "$TD2/$SIDA.jsonl" --no-turns --sid "$SIDA" --ledger /dev/null 2>/dev/null | jq -s -r "map(.project_id) | unique | .[]")" = "payment-service" ] \
+     && [ "$(head -1 "$VT_HOME/projects/$(vt_sha "$REPO2")")" = "$REPO2" ]'
+vt_register "$REPO2"   # 去掉 --name（写回只有路径的登记表）
+printf '%s\n' "$REPO2" > "$VT_HOME/projects/$(vt_sha "$REPO2")"
 check "init（不在终端里跑，不问）：最后列出登记表，两个仓都在" \
     'out=$( cd "$REPO" && bash "$SELF/vibetrail" init --no-register 2>&1 ); printf "%s" "$out" | grep -q "只采下面这些登记过的仓" && printf "%s" "$out" | grep -q "$REPO2" && printf "%s" "$out" | grep -qF "· $REPO"'
 
@@ -480,7 +499,7 @@ check "projects remove --drop：不再登记，它已采、还没发出去的数
 echo "════ 17. 09-16 复核修补（K14 / K15 / K16，OPEN-ISSUES）：独立沙箱 home，不依赖前面各节的状态 ════"
 K=$T/k-home; KP=$K/claude/projects/$(vt_slug "$REPO"); mkdir -p "$K/.claude" "$KP"
 KSID=11111111-2222-4333-8444-555555555555
-jq -c --arg cwd "$REPO" '.steps[] | select(.append) | .append | .cwd = $cwd' "$SC" > "$KP/$KSID.jsonl"
+jq -c --arg cwd "$REPO" '.steps[] | select(.append) | .append | .cwd = $cwd | walk(if type == "string" and startswith("/tmp/demo-proj") then $cwd + .[14:] else . end)' "$SC" > "$KP/$KSID.jsonl"
 kcli(){ ( cd "$REPO" && VIBETRAIL_HOME=$K/.vibetrail VIBETRAIL_CLAUDE_SETTINGS=$K/.claude/settings.json \
           VIBETRAIL_CLAUDE_PROJECTS=$K/claude/projects bash "$SELF/vibetrail" "$@" 2>&1 ); }
 kevents(){ find "$K/.vibetrail/spool" -name '*.jsonl' ! -name '.*' -exec cat {} + 2>/dev/null | grep -c .; }
@@ -519,14 +538,19 @@ PYEOF
 }
 check "K16②: stdin 写完不关，hook 照样在 4 秒内退出" 'k16b'
 
-# K14：uninstall 留下 state/*/ids；重装后补做不把老会话再写一遍，spool 条数不翻倍
+# K14：uninstall 留下 state/*/ids；重装后补做不把老会话再写一遍，spool 条数不翻倍。K17：workspaces/ 里的工作区 id 也留着，重装后不换
 kcli projects add >/dev/null; kcli sync >/dev/null
 n1=$(kevents)
+kw1=$(head -1 "$K/.vibetrail/workspaces/$(vt_sha "$REPO")" 2>/dev/null)
 kcli uninstall >/dev/null
-check "K14: uninstall 后 spool 与 ids 还在，state 里别的删了" \
-    '[ "$(kevents)" = "$n1" ] && [ -f "$K/.vibetrail/state/$KSID/ids" ] && [ ! -e "$K/.vibetrail/state/$KSID/main.json" ]'
+check "K14: uninstall 后 spool 与 ids 还在，state 里别的删了；K17 的工作区 id 也留着" \
+    '[ "$(kevents)" = "$n1" ] && [ -f "$K/.vibetrail/state/$KSID/ids" ] && [ ! -e "$K/.vibetrail/state/$KSID/main.json" ] && [ -n "$kw1" ] && [ "$(head -1 "$K/.vibetrail/workspaces/$(vt_sha "$REPO")")" = "$kw1" ]'
 kcli init >/dev/null; kcli sync >/dev/null
 check "K14: 重装再补做，spool 条数不变（$n1 条，没有翻倍）" '[ "$n1" -gt 0 ] && [ "$(kevents)" = "$n1" ]'
+rm -rf "$K/.vibetrail/state/$KSID"; kcli sync >/dev/null
+check "K17: 重装后重新采到的事件 workspace_id 与卸载前相同（云端不会把同一个仓的历史分成两份）" \
+    '[ "$(find "$K/.vibetrail/spool" -name "*.jsonl" ! -name ".*" -exec cat {} + | jq -s -r "map(.workspace_id) | unique | .[]")" = "$kw1" ]'
+check "doctor：报本仓上报时的 project_id 与 workspace_id" 'o=$(kcli doctor); printf "%s" "$o" | grep -q "project_id=demo-proj，workspace_id=$kw1"'
 
 # K15③：state/<sid>/ 30 天没动、spool 里也没有它的待发块，补做时整个删掉；有待发块的留着（ids 还要挡重复）
 mkdir -p "$K/.vibetrail/state/stale-sid" "$K/.vibetrail/state/kept-sid" "$K/.vibetrail/spool/x/kept-sid"
@@ -644,6 +668,49 @@ printf 'node=%s\n' "$NV/old/bin/node" > "$NV/vt/config"
 o=$(VIBETRAIL_HOME=$NV/vt sh "$SELF/vibetrail" version 2>&1); rc=$?
 check "config 里记的是旧 node、PATH 里有新的：退到 PATH 里的照常跑（否则重跑 init 也绕不出来）" \
     '[ "$rc" = 0 ] && printf "%s" "$o" | grep -q "^vibetrail "'
+
+echo "════ 21. K24：Stop 时等 Claude Code 的答完标记落盘再关轮；别的 Stop hook 拦下时不提前发 turn.end；等不到才按 Stop 当场关（D7 老路）════"
+# 真实时序：模型答完 → Stop hook 触发（这时 transcript 末尾是最后一条回复）→ 别的 Stop hook 跑完 → Claude Code 写 stop_hook_summary（本机实测晚 1.9～3.9 s）。
+# 这里把 Stop hook 丢后台，1 秒后再把标记追加进 transcript
+k24(){ # k24 <会话后缀> <等待秒数> <标记：summary|blocked|none> → 后台 Stop、追加标记、等它退出；spool 目录在 K24SPOOL
+    local sid0=$SID tr0=$TR t0
+    SID=88888888-0000-4000-8000-00000000000$1; TR=$TDIR/$SID.jsonl; K24SPOOL=$VT_HOME/spool/$PKEY/$SID
+    { rec w1 "" pw$1 user '"改一下"' | jq -c '.parentUuid = null'
+      rec w2 w1 pw$1 assistant '[]' "$(printf '{"message":{"id":"wm%s","model":"claude-opus-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"改好了。"}]}}' "$1")"
+    } > "$TR"
+    t0=$(date +%s)
+    ( VIBETRAIL_STOP_WAIT=$2 hook Stop "$(payload Stop "{\"prompt_id\":\"pw$1\"}")" ) & local bg=$!
+    sleep 1
+    case "$3" in
+        summary) jq -n -c --arg sid "$SID" --arg q "pw$1" '{type: "system", subtype: "stop_hook_summary", uuid: ("ws" + $q), parentUuid: "w2", sessionId: $sid, promptId: $q, preventedContinuation: false, hookCount: 2, timestamp: "2026-09-15T12:00:03.000Z"}' >> "$TR";;
+        blocked) jq -n -c --arg sid "$SID" --arg q "pw$1" '{type: "attachment", uuid: ("wb" + $q), parentUuid: "w2", sessionId: $sid, promptId: $q, attachment: {type: "hook_blocking_error", hookName: "Stop", hookEvent: "Stop", blockingError: "还有测试没跑"}, timestamp: "2026-09-15T12:00:03.000Z"}' >> "$TR";;
+    esac
+    wait $bg; K24T=$(( $(date +%s) - t0 ))
+    SID=$sid0; TR=$tr0
+}
+k24ev(){ cat "$K24SPOOL"/*.jsonl 2>/dev/null | jq -S -s -c "$1"; }
+k24 1 8 summary
+check "K24: 标记 1 秒后落盘：Stop 等到了它才关轮——一条 turn.end，依据 stop_hook_summary、关轮 summary，没等满 8 秒" \
+    '[ "$(k24ev "map(select(.type == \"turn.end\")) | [length, .[0].extensions[\"vibetrail.end_evidence\"], .[0].extensions[\"vibetrail.closed_by\"], .[0].payload.status.code]")" = "[1,\"stop_hook_summary\",\"summary\",\"completed\"]" ] && [ "$K24T" -lt 6 ]'
+k24 2 8 blocked
+check "K24: 别的 Stop hook 拦下了这次停止：不发 turn.end（协议：轮次仍在继续，不得提前发送）" \
+    '[ "$(k24ev "map(select(.type == \"turn.end\")) | length")" = 0 ] && [ "$K24T" -lt 6 ]'
+# 拦下之后模型接着干、再次 Stop、这次标记落盘：只此一条 turn.end
+sid0=$SID; tr0=$TR; SID=88888888-0000-4000-8000-000000000002; TR=$TDIR/$SID.jsonl
+{ rec w3 wbpw2 pw2 assistant '[]' '{"message":{"id":"wm2b","model":"claude-opus-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"测试也跑了。"}]},"timestamp":"2026-09-15T12:00:10.000Z"}'
+  jq -n -c --arg sid "$SID" '{type: "system", subtype: "stop_hook_summary", uuid: "wspw2b", parentUuid: "w3", sessionId: $sid, promptId: "pw2", preventedContinuation: false, hookCount: 2, timestamp: "2026-09-15T12:00:12.000Z"}'
+} >> "$TR"
+VIBETRAIL_STOP_WAIT=8 hook Stop "$(payload Stop '{"prompt_id":"pw2","stop_hook_active":true}')"
+check "K24: 拦下后模型补完、再次 Stop、标记已落盘：这一轮只有一条 turn.end（completed，依据答完标记）" \
+    '[ "$(k24ev "map(select(.type == \"turn.end\")) | [length, .[0].payload.status.code, .[0].extensions[\"vibetrail.end_evidence\"]]")" = "[1,\"completed\",\"stop_hook_summary\"]" ]'
+SID=$sid0; TR=$tr0
+k24 3 1 none
+check "K24: 等不到标记（上限 1 秒）：走 D7 的老路——按 Stop 当场关，依据 hook_stop、关轮 stop" \
+    '[ "$(k24ev "map(select(.type == \"turn.end\")) | [length, .[0].extensions[\"vibetrail.end_evidence\"], .[0].extensions[\"vibetrail.closed_by\"]]")" = "[1,\"hook_stop\",\"stop\"]" ] && [ "$K24T" -ge 1 ] && [ "$K24T" -lt 5 ]'
+k24 4 8 summary
+check "K24: 标记本来就在（重跑 Stop）：不等，立刻关" \
+    'VIBETRAIL_STOP_WAIT=8 hook Stop "$(SID=88888888-0000-4000-8000-000000000004 TR=$TDIR/88888888-0000-4000-8000-000000000004.jsonl payload Stop "{\"prompt_id\":\"pw4\"}")"; [ "$(k24ev "map(select(.type == \"turn.end\")) | length")" = 1 ]'
+check "K24 这一节没有错误日志" '[ ! -s "$VT_HOME/logs/errors.log" ]'
 
 check "测试没有动真实的 settings.json（${REAL_SETTINGS}）" '[ "$( { cat "$REAL_SETTINGS" 2>/dev/null || true; } | cksum)" = "$REAL_SUM" ]'
 echo

@@ -6,7 +6,7 @@
 # 1. 在沙箱里建一个 git 仓当被观测项目，跑 vibetrail init（写沙箱的 settings.json；init 不登记任何仓），再 projects add 登记它
 # 2. 按 scenario.json 回放一段会话：往沙箱的 transcript 追加记录；轮到 hook 时，用沙箱 settings.json 里 init 真实写下的那条命令去跑，
 #    stdin 给 Claude Code 同样形状的 payload（prompt_id 取当轮的 promptId）。第 1 轮中途在仓里真的提交一次，演示 commit ↔ 轮次。
-#    每次 Stop 之后再写一条 stop_hook_summary：Claude Code 的「答完」标记，desktop 要等下一句人话才把它落盘（09-15 核过），所以 turn.end 不等它，Stop 时就发（DESIGN D7）。
+#    每次 Stop 之后再写一条 stop_hook_summary：Claude Code 的「答完」标记，desktop 要等下一句人话才把它落盘（09-15 核过），真实安装先等它落盘再关轮（K24，最多 10 秒）；沙箱里 VIBETRAIL_STOP_WAIT=0 不等、Stop 时就发（DESIGN D7 的老路）。
 #    会话结束前再加一轮：第一次 Stop 被别的 Stop hook 拦下（拦停反馈先落盘），模型补完再 Stop——这一轮只出一条 turn.end，带两次提交
 # 3. vibetrail list / show / doctor，最后列出 spool 目录与被观测仓的 git status（零写入），再用 report.sh 生成一份 markdown 报告
 # 跑完沙箱留着，想翻原始文件就进去看；不想留就 rm -rf 它。
@@ -17,7 +17,7 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); TOOLS=$(cd "$HERE/../../tools" && pwd); SC=$HERE/scenario.json
 D=${1:-$(mktemp -d "${TMPDIR:-/tmp}/vibetrail-demo.XXXXXX")}; mkdir -p "$D"; D=$(cd "$D" && pwd -P)
 export VIBETRAIL_HOME=$D/home/.vibetrail VIBETRAIL_CLAUDE_SETTINGS=$D/home/.claude/settings.json \
-       VIBETRAIL_CLAUDE_PROJECTS=$D/home/.claude/projects VIBETRAIL_STABLE_WAIT=0 VIBETRAIL_FOREGROUND=1
+       VIBETRAIL_CLAUDE_PROJECTS=$D/home/.claude/projects VIBETRAIL_STABLE_WAIT=0 VIBETRAIL_FOREGROUND=1 VIBETRAIL_STOP_WAIT=0
 unset CLAUDE_CODE_SESSION_ID AI_AGENT          # 在 Claude Code 里跑本脚本时别把外层会话的环境带进来
 export CLAUDE_CODE_ENTRYPOINT=cli
 hr(){ printf '\n\033[1m━━ %s\033[0m\n' "$*"; }
@@ -93,7 +93,8 @@ while IFS= read -r step; do
     if [ "$(printf '%s' "$step" | jq 'has("append")')" = true ]; then
         # 记录的时间戳换成此刻（场景里写的是 09-11 的固定时间），与 hook 事件的时间对得上
         printf '%s' "$step" | jq -c --arg cwd "$REPO" \
-            '.append | .cwd = $cwd | .timestamp = (now | (floor | todate | sub("Z$"; "")) + "." + ((. * 1000 | floor) % 1000 | tostring | ("00" + .)[-3:]) + "Z")' >> "$TR"
+            '.append | .cwd = $cwd | .timestamp = (now | (floor | todate | sub("Z$"; "")) + "." + ((. * 1000 | floor) % 1000 | tostring | ("00" + .)[-3:]) + "Z")
+             | walk(if type == "string" and startswith("/tmp/demo-proj") then $cwd + .[14:] else . end)' >> "$TR"   # 示例里的文件路径也指到沙箱仓（turn.end.files[] 才算得出相对路径）
         sleep 0.05
         continue
     fi
@@ -112,7 +113,7 @@ while IFS= read -r step; do
     printf '  %2d %-18s exit=%s stdout=%s  prompt_id=%s\n' "$n" "$ev" "$rc" "$( [ -z "$out" ] && echo 空 || echo "非空！" )" "$(jq -r '.prompt_id // "-"' "$D/payload.json")"
     if [ "$ev" = Stop ]; then   # Stop hook 跑完才有的「答完」标记（desktop 等下一句人话才落盘；场景文件是 09-11 录的，那时还没这条）
         summary ""
-        echo "     ↳ 这一轮的 turn.end：$(cat "$VIBETRAIL_HOME"/spool/*/*/*.jsonl | jq -s -r --arg p "$(jq -r .prompt_id "$D/payload.json")" '[.[] | select(.type == "turn.end" and .turn_id == $p)] | length') 条（Stop 时就写了，不等 summary）"
+        echo "     ↳ 这一轮的 turn.end：$(cat "$VIBETRAIL_HOME"/spool/*/*/*.jsonl | jq -s -r --arg p "$(jq -r .prompt_id "$D/payload.json")" '[.[] | select(.type == "turn.end" and .turn_id == $p)] | length') 条（Stop 时就写；沙箱里 VIBETRAIL_STOP_WAIT=0 不等答完标记，真实安装先等它落盘再关轮、最多 10 秒）"
     fi
 done < "$D/steps.jsonl"
 

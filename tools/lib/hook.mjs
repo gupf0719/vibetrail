@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
-import { mapRecords } from './map.mjs';
+import { mapRecords, RULE_VERSIONS } from './map.mjs';
 
 export const VT_RUNTIME_VERSION = '0.2.0-dev';
 const VT_NS = '6c90e594-0cb4-59d0-9186-740d215c8b7f';   // uuid5(NS_URL, "vibetrail")，DESIGN §4.2
@@ -63,12 +63,53 @@ export function vtMainCheckout(dir) {          // git worktree list 第一条；
 }
 export const vtProjectKey = (main) => `${path.basename(main).replace(/[^A-Za-z0-9._-]/g, '_')}-${vtSha(main)}`;
 export const vtRegistered = (main) => isFile(path.join(VT_HOME, 'projects', vtSha(main)));
-export function vtRegister(dir) {
+// 登记表 projects/<sha>：第一行是主 checkout 路径（所有读它的地方都只取第一行），之后可选 project_id=<名>（K17 的显式配置，projects add --name）
+export function vtRegister(dir, name = '') {
   const m = vtMainCheckout(dir);
   if (!m) return null;
   mkdirp(path.join(VT_HOME, 'projects'));
-  fs.writeFileSync(path.join(VT_HOME, 'projects', vtSha(m)), m + '\n');
+  const f = path.join(VT_HOME, 'projects', vtSha(m));
+  const extra = (readText(f) || '').split('\n').slice(1).filter((l) => l !== '' && !(name && l.startsWith('project_id=')));
+  fs.writeFileSync(f, [m, ...(name ? [`project_id=${name}`] : []), ...extra].join('\n') + '\n');
   return m;
+}
+// K17（采集端协议「项目和工作区标识」，09-16 对照核出，push 前必须改）：
+//   project_id   简单可读的项目名：登记表里显式写的（projects add --name）> origin 远端的仓库名（git@host:team/payment-service.git → payment-service）
+//                > 主 checkout 的目录名。不得含用户名、token、本机完整路径。09-16 以前发的是 github.com/acme/xxx 这种主机加路径、没远端时是本机路径
+//   workspace_id 不透明的稳定字符串：第一次见到这个工作区时生成 UUID，持久化在 ~/.vibetrail/workspaces/<sha1 前 16 位(主 checkout 路径)>，
+//                collector 不解析它、按 user + workspace_id + agent + session 关联会话——推出去之后再换，同一个仓的历史在云端分成两份。
+//                按主 checkout 一个（worktree 共享，与登记表、spool 的分区键一致；每个 worktree 一个会把 desktop 每次开的 worktree 都碎成新工作区），接 collector 时再确认。
+//                uninstall 像 ids 一样留着（重装后不换）；--purge 才删。两家三方都没有这一层：teamai 报完整路径加服务端分配的数字 id，Pilot 报 owner/repo 加完整路径
+export const repoNameOf = (url) => {
+  const u = String(url || '').trim().replace(/\/+$/, '').replace(/\.git$/i, '').replace(/\/+$/, '');
+  return u.split(/[/:\\]/).filter(Boolean).pop() || '';
+};
+export function vtProjectName(workspace) {
+  const reg = readText(path.join(VT_HOME, 'projects', vtSha(workspace)));
+  if (reg) for (const l of reg.split('\n').slice(1)) if (l.startsWith('project_id=') && l.slice(11).trim() !== '') return l.slice(11).trim().slice(0, 256);
+  const origin = git(workspace, ['remote', 'get-url', 'origin']);
+  const name = (origin ? repoNameOf(origin) : '') || path.basename(workspace) || 'unknown';
+  return name.slice(0, 256);
+}
+export const workspaceIdPath = (workspace) => path.join(VT_HOME, 'workspaces', vtSha(workspace));
+const isUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v || ''));
+export function vtWorkspaceId(workspace) {
+  const f = workspaceIdPath(workspace);
+  const cur = (readText(f) || '').split('\n')[0].trim();
+  if (isUuid(cur)) return cur;
+  mkdirp(path.dirname(f));
+  const id = crypto.randomUUID();
+  try { fs.writeFileSync(f, `${id}\n${workspace}\n`, { flag: 'wx' }); return id; }   // 两个 hook 同时第一次见到：只有一个写成，另一个读它的
+  catch {
+    const again = (readText(f) || '').split('\n')[0].trim();
+    return isUuid(again) ? again : eventId('workspace', workspace);   // 写不进去（只读的 home）：退到按路径算的 UUIDv5，至少稳定
+  }
+}
+export function vtWorktrees(workspace) {     // 主 checkout 在前，之后是它的每个 worktree（K22 的文件路径按这些根算相对路径）
+  const out = [workspace];
+  const wl = git(workspace, ['worktree', 'list', '--porcelain']) || '';
+  for (const l of wl.split('\n')) if (l.startsWith('worktree ')) { const p = vtRealpath(l.slice(9)); if (!out.includes(p)) out.push(p); }
+  return out;
 }
 export function vtUnregister(dir) {
   const m = vtMainCheckout(dir);
@@ -345,7 +386,7 @@ export function hookEvents(event, p, ctx) {    // → [事件…]（0 或 1 条�
   };
   const withTurn = (e) => {
     if (typeof p.prompt_id === 'string' && p.prompt_id !== '') { e.turn_id = p.prompt_id; }
-    else { e.turn_id = 'inferred-' + now; e.provenance = { kind: 'inferred', rule_version: 'turn-v1', source_event: hname }; }
+    else { e.turn_id = 'inferred-' + now; e.provenance = { kind: 'inferred', rule_version: RULE_VERSIONS.turn, source_event: hname }; }
     return e;
   };
   const hdr = (name, payload) => {
@@ -410,8 +451,9 @@ export function mapFile(file, opts) {
     }
     opts = { ...opts, parent_instance: parent };
   }
-  // project_id / workspace_id 没给就取第一条带 cwd 记录的 cwd（原 vibetrail-map 的默认值）
-  if (!opts.project_id || !opts.workspace_id) {
+  // project_id / workspace_id / 工作区根没给（map-file 命令行、测试）：按第一条带 cwd 记录的 cwd 推——cwd 在本机的 git 仓里就与 hook 同一套
+  // （主 checkout 的项目名、持久化的工作区 UUID、它的 worktree 当根），不在就用 cwd 的目录名、按 cwd 这个字符串持久化的 UUID、cwd 当根（K17 / K22）
+  if (!opts.project_id || !opts.workspace_id || !opts.workspace_roots) {
     let cwd = '';
     try {
       const head = fs.readFileSync(file, 'utf8').slice(0, 1024 * 1024);
@@ -421,10 +463,14 @@ export function mapFile(file, opts) {
       }
     } catch {}
     if (!cwd) cwd = 'unknown';
-    opts = { ...opts, project_id: opts.project_id || cwd, workspace_id: opts.workspace_id || cwd };
+    const main = cwd !== 'unknown' && isDir(cwd) ? vtMainCheckout(cwd) : null;
+    opts = { ...opts,
+      project_id: opts.project_id || (main ? vtProjectName(main) : (path.basename(cwd) || 'unknown')),
+      workspace_id: opts.workspace_id || vtWorkspaceId(main || cwd),
+      workspace_roots: opts.workspace_roots || (main ? vtWorktrees(main) : [cwd]) };
   }
   const {
-    sid, project_id, workspace_id, parent_instance = 'main', meta = null,
+    sid, project_id, workspace_id, workspace_roots = null, parent_instance = 'main', meta = null,
     start_line = 1, start_byte = null, from_line = 0, seenFile = '', hook_turns = {}, hook_perms = [],
     perm_since = '', perm_periods = null, split_decisions = {}, close_last = '', stop_turn = '', turns = true, capture_content = '1', vt_version = VT_RUNTIME_VERSION,
     done_ts = null,
@@ -485,11 +531,11 @@ export function mapFile(file, opts) {
     try { records.push(JSON.parse(line)); } catch { /* 半行 / 坏行：整条跳过，账本按跳过计 */ }
   }
   const { events, ledger } = mapRecords(records, {
-    sid, project_id, workspace_id, parent_instance, start_line: firstLine, from_line, meta,
+    sid, project_id, workspace_id, workspace_roots, parent_instance, start_line: firstLine, from_line, meta,
     seen_uuids: seenFile && isFile(seenFile)
       ? readText(seenFile).split('\n').filter(Boolean).map((l) => { const [u, n] = l.split('\t'); return [u, Number(n)]; })
       : [],
-    hook_turns, hook_perms, perm_since, perm_periods, split_decisions, known_agents, done_ts, close_last, stop_turn, turns, vt_version, rule_version: 'diverge-v1', capture_content,
+    hook_turns, hook_perms, perm_since, perm_periods, split_decisions, known_agents, done_ts, close_last, stop_turn, turns, vt_version, rule_version: RULE_VERSIONS.diverge, capture_content,
   });
 
   // 下次的起读字节：checkpoint 行的偏移
@@ -531,10 +577,10 @@ export function runHook(event, payload) {
   const main = cwd ? vtMainCheckout(cwd) : null;
   if (scope === 'project' && !(main && vtRegistered(main))) return;
   let ctx = {};
+  // K17：project_id 是简单项目名、workspace_id 是持久化的 UUID（见 vtProjectName / vtWorkspaceId）；workspace 仍是主 checkout 路径，
+  // 只用来分区 spool、找 transcript 目录、算 K22 的相对路径（roots = 主 checkout + 它的 worktree），不再进事件
   const setProject = (workspace) => {
-    const origin = git(workspace, ['remote', 'get-url', 'origin']);
-    const project = (origin ? origin.replace(/^[a-z+]+:\/\/([^@/]*@)?/, '').replace(/^[^@/]*@/, '').replace(/:/, '/').replace(/\.git$/, '') : '') || workspace;
-    ctx = { ...ctx, workspace, project, pkey: vtProjectKey(workspace) };
+    ctx = { ...ctx, workspace, project_id: vtProjectName(workspace), workspace_id: vtWorkspaceId(workspace), roots: vtWorktrees(workspace), pkey: vtProjectKey(workspace) };
   };
   setProject(main || vtRealpath(cwd || '.'));
   const SD = path.join(VT_HOME, 'state', sid);
@@ -542,7 +588,7 @@ export function runHook(event, payload) {
   const surface = process.env.CLAUDE_CODE_ENTRYPOINT || '';
 
   const emitHook = (name, vcs, extra = {}) => {
-    const events = hookEvents(name, p, { project_id: ctx.project, workspace_id: ctx.workspace, vt_version: VT_RUNTIME_VERSION,
+    const events = hookEvents(name, p, { project_id: ctx.project_id, workspace_id: ctx.workspace_id, vt_version: VT_RUNTIME_VERSION,
       agent_version: agentVersion, surface, now: nowIso(), vcs, extra });
     if (events.length === 0) return;
     let filled;
@@ -628,7 +674,7 @@ export function runHook(event, payload) {
     }
     let out;
     try {
-      out = mapFile(f, { sid: s2, project_id: ctx.project, workspace_id: ctx.workspace,
+      out = mapFile(f, { sid: s2, project_id: ctx.project_id, workspace_id: ctx.workspace_id, workspace_roots: ctx.roots,
         start_line: ckl, start_byte: ckb, from_line: lines, seenFile,
         hook_turns: name === 'main' ? vtHookTurns(s2) : {},
         hook_perms: vtHookPerms(s2), perm_periods: vtPermPeriods(), split_decisions: vtSplits(s2),
@@ -678,6 +724,44 @@ export function runHook(event, payload) {
       let s; try { s = fs.statSync(f).size; } catch { return; }
       if (s === prev) { same++; if (same >= 2) return; } else same = 0;
       prev = s; sleepSync(150);
+    }
+  };
+  // K24（协议「Stop hook 阻止 Agent 停止时，轮次仍在继续，不得提前发送 turn.end」）：Stop 时先等 Claude Code 自己的答完标记
+  // （system/stop_hook_summary，写在全部 Stop hook 跑完之后）或拦停反馈（hook_blocking_error 附件、「Stop hook feedback:」）落盘，再解析：
+  // 有标记就按标记关轮（拦停了就不关），等不到（默认上限 stop_wait=10 s，config 可改）才走 D7 的老路——按 Stop 当场关，被拦下后再 Stop 时补一条 stops 更大的。
+  // 本机实测（09-16，52 轮）标记落盘比最后一条回复晚 p50 1.9 s、最大 3.9 s，10 s 上限足够；我们的 Stop hook 是 async、不拖慢别人，
+  // 多等这几秒人感觉不到。看的是主会话文件末尾 1 MB：最后一条真回复之后有标记就算到了
+  const stopMarkerState = (f) => {                 // 'summary' | 'blocked' | 'none'
+    let size; try { size = fs.statSync(f).size; } catch { return 'none'; }
+    const off = Math.max(0, size - 1024 * 1024);
+    let txt;
+    try { const fd = fs.openSync(f, 'r'); const buf = Buffer.alloc(size - off); fs.readSync(fd, buf, 0, size - off, off); fs.closeSync(fd); txt = buf.toString('utf8'); }
+    catch { return 'none'; }
+    const lines = txt.split('\n');
+    if (off > 0) lines.shift();                    // 第一段多半是半行
+    let asst = -1, summary = -1, blocked = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (!lines[i]) continue;
+      let r; try { r = JSON.parse(lines[i]); } catch { continue; }
+      if (!r || typeof r !== 'object' || r.isSidechain === true || r.agentId) continue;
+      if (r.type === 'assistant' && r.message?.model !== '<synthetic>') asst = i;
+      else if (r.type === 'system' && r.subtype === 'stop_hook_summary') summary = i;
+      else if ((r.type === 'attachment' && /^hook_(blocking_error|additional_context)$/.test(String(r.attachment?.type ?? '')) && /^(Stop|SubagentStop)$/.test(String(r.attachment?.hookEvent ?? '')))
+        || (r.type === 'user' && JSON.stringify(r.message?.content ?? '').includes('Stop hook feedback:'))) blocked = i;
+    }
+    if (summary > asst && summary >= blocked) return 'summary';
+    if (blocked > asst) return 'blocked';
+    return 'none';
+  };
+  const waitStopMarker = (f) => {
+    const limit = Number(process.env.VIBETRAIL_STOP_WAIT ?? vtConf('stop_wait', '10'));
+    if (!(limit > 0)) return 'off';
+    const deadline = Date.now() + limit * 1000;
+    for (;;) {
+      const s = stopMarkerState(f);
+      if (s !== 'none') return s;
+      if (Date.now() >= deadline) return 'timeout';
+      sleepSync(250);
     }
   };
   // ---- 补做：本仓与所有登记过的仓，每个 worktree 对应的 Claude 项目目录 ----
@@ -776,7 +860,7 @@ export function runHook(event, payload) {
     case 'UserPromptSubmit': turnStart(); break;
     case 'Stop':
       turnStop();
-      if (isFile(tpath)) { waitStable(tpath); processSession(sid, tpath, 'stop', promptId); }
+      if (isFile(tpath)) { waitStable(tpath); waitStopMarker(tpath); processSession(sid, tpath, 'stop', promptId); }
       break;
     case 'SessionEnd': {
       const snap = vtGitSnapshot(cwd);
