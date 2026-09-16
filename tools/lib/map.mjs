@@ -191,10 +191,36 @@ const SIZE_CAP = 1048576 - 1024;   // 协议单条 1 MiB，留 1 KiB 余量（�
 export const RULE_VERSIONS = { diverge: 'diverge-v2', turn: 'turn-v2', call: 'call-v2', ext: 'ext-v2' };
 
 // K22：turn.end.files[] 的路径要相对工作区根、不能 .. 、不能以 / 开头、不能有 \ 与控制字符（schema 的 path 正则）
-const PATH_OK = /^(?!\/)(?![A-Za-z]:)(?!.*\\)(?!.*(?:^|\/)\.{1,2}(?:\/|$))(?!.*\/\/)(?![\s\S]*[ -])[^/]+(?:\/[^/]+)*$/;
+const PATH_OK = /^(?!\/)(?![A-Za-z]:)(?!.*\\)(?!.*(?:^|\/)\.{1,2}(?:\/|$))(?!.*\/\/)(?![\s\S]*[\x00-\x1f])[^/]+(?:\/[^/]+)*$/;
 const stripPrivate = (p) => String(p).replace(/^\/private(\/(?:tmp|var)(?:\/|$))/, '$1');   // macOS：/private/tmp 与 /tmp 是同一处
 const FILE_TOOLS = { Edit: 'modify', MultiEdit: 'modify', NotebookEdit: 'modify', Write: 'modify', Read: 'read' };
 const OP_RANK = { create: 3, modify: 2, read: 1 };
+// 本机路径不出本机（用户 09-16 定「相对路径」）：工作区内的目录 / 文件按根算相对路径（根本身是 .），根外的把 /Users/<名> 或 /home/<名> 换成 ~，
+// 不看当前 HOME（fixture 里别人的家目录也一样处理）。用在 ext.claude.cwd_changed、instructions_loaded 的 path 上；tool.request 的参数是正文（K6），不动
+const tilde = (p) => String(p).replace(/^\/(?:(?:Users|home)\/[^/]+|root)(?=\/|$)/, '~');
+// 目录类字段（cwd、worktree）的写法：主 checkout 里的相对主 checkout（本身是 .，desktop 的 worktree 是 .claude/worktrees/<名>，保留是哪个 worktree），
+// 其余换成 ~ 形。roots 的第一个是主 checkout（hook 传 vtWorktrees 的结果）
+export function displayDir(abs, roots) {
+  if (!isStr(abs) || abs === '') return abs;
+  const p = stripPrivate(abs).replace(/\/+$/, '') || '/';
+  const main = (isArr(roots) ? roots : []).filter(isStr).map((r) => stripPrivate(r).replace(/\/+$/, '')).find((r) => r !== '');
+  if (main) {
+    if (p === main) return '.';
+    if (p.startsWith(main + '/')) return p.slice(main.length + 1);
+  }
+  return tilde(p);
+}
+// A11 完整性钉子：认识的记录类型 / 附件类型 / system 子类型（2026-09-16 本机 34 份文件实测 + 代码里用到的）。清单之外的计进账本 new.unknown_types，
+// doctor 告警——不认识不等于错，Claude Code 每个版本都会加类型；D13 去掉 8 个 hook 之后没有 hook 侧对账了，这是唯一的「有新东西」哨兵
+const KNOWN_TYPES = new Set(['user', 'assistant', 'system', 'attachment', 'summary', 'progress', 'queue-operation', 'last-prompt', 'custom-title',
+  'bridge-session', 'atis-latch', 'file-history-snapshot', 'file-history-delta', 'mode']);
+const KNOWN_ATTACHMENTS = new Set(['deferred_tools_delta', 'deferred_tools_record', 'skill_listing', 'remote_session_change', 'agent_listing_delta',
+  'mcp_instructions_delta', 'auto_mode', 'total_tokens_reminder', 'batching_reminder_sent', 'queued_command', 'silent_turn_reminder', 'edited_text_file',
+  'edited_image_file', 'environment', 'model', 'instructions', 'nested_memory', 'session_context', 'date', 'date_change', 'prompt_snapshot',
+  'read_truncation_notice', 'thinking_stripped', 'compact_file_reference', 'file', 'directory', 'hook_blocking_error', 'hook_additional_context',
+  'async_hook_response', 'todo_reminder', 'plan_mode', 'output_style', 'diagnostics', 'lsp_diagnostics', 'ide_selection', 'ide_opened_file',
+  'opened_file_in_ide', 'selected_lines_in_ide', 'command_permissions', 'invoked_skills', 'ultramemory_context', 'trigger_reminder']);
+const KNOWN_SYSTEM = new Set(['stop_hook_summary', 'api_error', 'compact_boundary', 'turn_duration', 'local_command', 'informational', 'bridge_status']);
 
 export function mapRecords(records, args) {
   const {
@@ -204,7 +230,7 @@ export function mapRecords(records, args) {
     known_agents = {}, done_ts = null,
     close_last = '', stop_turn = '', turns = true,
     vt_version = '', rule_version = RULE_VERSIONS.diverge, capture_content = '1',
-    workspace_roots = null,
+    workspace_roots = null, workflow_runs = {},
   } = args;
   const capContent = capture_content !== '0';
   // K22：工作区的根（主 checkout 与它的 worktree，hook 侧给；没给就没有 files[]）。最长的根先匹配，desktop 的 worktree 在主 checkout 下面
@@ -222,6 +248,9 @@ export function mapRecords(records, args) {
     }
     return null;
   };
+  // 「不出本机」的两种写法（用户 09-16 定相对路径）：目录（cwd）相对主 checkout；文件（CLAUDE.md 等）与 files[] 同一套相对路径，根外换成 ~ 形
+  const safeDir = (abs) => displayDir(abs, workspace_roots);
+  const safeFile = (abs) => (isStr(abs) ? alt(relPath(abs), displayDir(abs, workspace_roots)) : abs);
 
   const prior = {};
   for (const p of seen_uuids) prior[p[0]] = p[1];
@@ -245,12 +274,17 @@ export function mapRecords(records, args) {
     turn_usage: {}, turn_model: null,
     seen: {}, denials: [], stops: [], perm_mode: null, pending: null,
     pturn: null, call: null, calls_seen: [], prev_end_ts: null,
-    agents: { launched: {}, done: {}, calls_done: {} }, agent_started: false, last_cwd: null,
+    agents: { launched: {}, done: {}, calls_done: {}, workflows: {} }, agent_started: false, last_cwd: null,
+    // 子 agent 文件自己改 / 读的文件（整份文件一个集合，不分轮；K22 的子 agent 部分），关它的 subagent.end 时带上
+    agent_files: { files: {}, files_outside: 0 }, agent_id: null,
     last_ts: null, version: null, entrypoint: null, branch: null,
     ledger: {
       in: {}, in_total: {}, out: {}, events: {}, absorbed_for_tool_use: 0, unpaired_for_tool_use: 0,
       lookup: { index: 0, regex: 0, missing: 0 }, stop_press: 0, dedup: 0, records: 0, skipped_no_uuid: 0, skipped_non_object: 0,
       sentinel: { marker: 0, marker_without_hit: 0 }, replayed: 0, inherited: 0, turns: { started: 0, ended: {} }, sources: [],
+      // A11：只数这次新读到的行（ln > from_line），调用方按会话累计进 state、doctor 汇总。恒等式：seen = records + skipped_non_object + skipped_no_uuid + replayed + inherited
+      new: { seen: 0, records: 0, skipped_non_object: 0, skipped_no_uuid: 0, replayed: 0, inherited: 0, content_dropped: 0,
+        sentinel: { marker: 0, marker_without_hit: 0 }, unknown_types: {} },
     },
     out: [],
   };
@@ -262,6 +296,7 @@ export function mapRecords(records, args) {
     delete e.raw;
     e.content_state = 'omitted';
     e.extensions = { ...e.extensions, 'vibetrail.content_dropped': 'size' };
+    st.ledger.new.content_dropped += 1;
     return e;
   };
   const fitSize = (e) => (capContent && Buffer.byteLength(JSON.stringify(e), 'utf8') > SIZE_CAP ? dropContent(e) : e);
@@ -364,9 +399,21 @@ export function mapRecords(records, args) {
       truncated = Object.keys(pt.files).length - list.length;
     }
     if (list.length > 0) e.files = list;
-    if (truncated > 0 || pt.files_outside > 0) {
-      e.extensions = { ...e.extensions, 'vibetrail.files_dropped': { ...(pt.files_outside > 0 ? { outside_workspace: pt.files_outside } : {}), ...(truncated > 0 ? { over_limit: truncated } : {}) } };
+    const outside = alt(nz(pt.files_outside), 0);
+    if (truncated > 0 || outside > 0) {
+      e.extensions = { ...e.extensions, 'vibetrail.files_dropped': { ...(outside > 0 ? { outside_workspace: outside } : {}), ...(truncated > 0 ? { over_limit: truncated } : {}) } };
     }
+  };
+  // 子 agent 的文件集合：以前几次读到的（调用方从 agents.json 经 known_agents 传进来）并上这次读到的，同一文件取最重的操作
+  const mergeFiles = (a, b) => {
+    const out = { ...(isObj(a) ? a : {}) };
+    for (const [p, op] of Object.entries(isObj(b) ? b : {})) if (out[p] === undefined || OP_RANK[op] > OP_RANK[out[p]]) out[p] = op;
+    return out;
+  };
+  const agentHolder = (aid, own) => {
+    const k = isObj(knownAgents[aid]) ? knownAgents[aid] : {};
+    return { files: mergeFiles(k.files, own ? st.agent_files.files : null),
+      files_outside: Math.max(alt(nz(k.files_outside), 0), own ? st.agent_files.files_outside : 0) };
   };
 
   const hookTurn = (id) => { const h = isObj(hook_turns) ? nz(hook_turns[id]) : null; return alt(h, {}); };
@@ -615,6 +662,7 @@ export function mapRecords(records, args) {
         'vibetrail.commit_attribution': gc ? 'agent_tool' : 'inferred' };
     }
     if (!sub && st.pturn !== null && st.pturn.id === t.id) attachFiles(e, st.pturn);   // K22：打断结束的轮也带 files[]
+    if (sub) attachFiles(e, agentHolder(s.agent, true));                                // 子 agent 被打断：它自己改过的文件也带上
     const rawData = { ...h }; delete rawData.as_kind; delete rawData.split_by; delete rawData.permission_mode; delete rawData.stop_calls;
     e.raw = { event_name: 'diverge.' + h.kind, data: rawData };
     // K13：打断发的 turn.end 以前不带 closed_by / stops（本机 252 条全空），读的一方连「同 turn_id 取 stops 最大」都用不上
@@ -757,11 +805,13 @@ export function mapRecords(records, args) {
         : (isHumanDenial(txt) || isClassifier(txt) || isInfra(txt) || txt.startsWith("The user doesn't want to")) ? null
         : { code: 'failed', category: 'failure' };
       if (status === null) continue;
-      // K22：成功的文件工具记进当前轮（主会话才有轮；子 agent 文件里 pturn 一直是 null）
-      if (b.is_error !== true && mainRec(r) && st.pturn !== null && FILE_TOOLS[tu.name] !== undefined && isObj(tu.input)) {
+      // K22：成功的文件工具记进当前轮（主会话）；子 agent 文件里没有轮，记进整份文件的集合，关它的 subagent.end 时带上
+      const holder = mainRec(r) ? st.pturn : (s.agent !== null ? st.agent_files : null);
+      if (b.is_error !== true && holder !== null && FILE_TOOLS[tu.name] !== undefined && isObj(tu.input)) {
         const p = alt(nz(tu.input.file_path), nz(tu.input.notebook_path));
-        const op = (tu.name === 'Write' && isObj(r.toolUseResult) && r.toolUseResult.type === 'create') ? 'create' : FILE_TOOLS[tu.name];
-        noteFile(st.pturn, p, op);
+        // 新建看 toolUseResult.type；子 agent 文件里没有 toolUseResult（09-16 实测），退到结果正文「File created successfully」
+        const created = tu.name === 'Write' && (isObj(r.toolUseResult) ? r.toolUseResult.type === 'create' : /^File created successfully/.test(txt));
+        noteFile(holder, p, created ? 'create' : FILE_TOOLS[tu.name]);
       }
       const b1 = epochms(s.ts), a1 = epochms(tu.ts);
       const wall = (b1 !== null && a1 !== null && b1 >= a1) ? b1 - a1 : null;
@@ -889,11 +939,12 @@ export function mapRecords(records, args) {
   const agentEndStatus = (v) => {
     const x = String(alt(v, 'completed'));
     if (x === 'completed') return { code: 'completed', category: 'success' };
+    if (x === 'unknown') return { code: 'unknown', category: 'unknown' };
     if (/^(stopped|killed|cancelled|canceled|interrupted|aborted)$/.test(x)) return { code: codeify(x), category: 'cancellation' };
     return { code: codeify(x), category: 'failure' };   // K18：failed 等是 failure，不是 error
   };
   // 与原先 SubagentStart / SubagentStop hook 发的 _key 相同（<agentId>|subagent.start / end）：同一个 agent 只算一条，哪一路先到用哪一路
-  const agentStart = (s, aid, parent, agentType, callId, task) => {
+  const agentStart = (s, aid, parent, agentType, callId, task, ext = null) => {
     const e = base(s, 'subagent.start', s.uuid, s.ts, turnOf(s));
     e.agent_instance_id = aid;
     e.parent_agent_instance_id = parent;
@@ -903,10 +954,11 @@ export function mapRecords(records, args) {
     e.payload = { agent_type: agentType, ...(withTask ? { task } : {}) };
     e.content_state = capContent ? 'included' : 'omitted';
     e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.turn, source_event_id: s.uuid };
+    if (isObj(ext)) e.extensions = { ...e.extensions, ...ext };
     e._key = `${aid}|subagent.start`;
     emit(e);
   };
-  const agentEnd = (s, aid, status, agentType, callId, lastMessage, facts) => {
+  const agentEnd = (s, aid, status, agentType, callId, lastMessage, facts, ext = null) => {
     const e = base(s, 'subagent.end', s.uuid, s.ts, turnOf(s));
     e.agent_instance_id = aid;
     e.parent_agent_instance_id = alt(s.agent, 'main');             // 收到完成信号的这份文件就是父实例
@@ -916,6 +968,16 @@ export function mapRecords(records, args) {
     if (withMsg) e.content_state = 'included';
     e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.turn, source_event_id: s.uuid };
     if (isObj(facts) && Object.keys(facts).length > 0) e.extensions = { ...e.extensions, 'vibetrail.agent': facts };
+    if (isObj(ext)) e.extensions = { ...e.extensions, ...ext };
+    // K22 子 agent 部分：它自己改 / 读的文件——调用方先映射子 agent 文件、把集合存进 agents.json，再映射父文件时经 known_agents 传进来。
+    // 同时并进收到结束信号的这一轮（主会话）或父 agent 的集合（子 agent 文件），「这一轮改了哪些文件」才包括子 agent 改的
+    const h = agentHolder(aid, false);
+    attachFiles(e, h);
+    const target = s.agent === null ? (st.pturn !== null && !st.pturn.closed ? st.pturn : null) : st.agent_files;
+    if (target !== null) {
+      target.files = mergeFiles(target.files, h.files);
+      target.files_outside = alt(nz(target.files_outside), 0) + h.files_outside;
+    }
     e._key = `${aid}|subagent.end`;
     emit(e);
     // 完成信号的时间：子 agent 文件最后一条不晚于它，才算写完（SendMessage 续上的 agent 之后还会往文件里写，要等下一个信号）
@@ -924,17 +986,33 @@ export function mapRecords(records, args) {
   };
   const textOfBlocks = (v) => (isStr(v) ? v : isArr(v) ? v.filter(isObj).filter((b) => b.type === 'text').map((b) => alt(nz(b.text), '')).join('\n') : '');
   const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  // K11（09-16 用 Workflow 实测）：workflow 起的 agent 在 <sid>/subagents/workflows/<runId>/ 下，meta 里没有 toolUseId，
+  // 与主会话只靠两处挂上：Workflow 调用的启动结果（toolUseResult.taskType = local_workflow，带 runId、taskId）与之后的 <task-notification>（task-id 是 taskId）。
+  // 每个 agent 跑完没跑完看同目录的 journal.jsonl（调用方读好，经 workflow_runs 传进来：{runId: {task_id, call_id, agents: {agentId: {status, result, label, phase}}}}）
+  const runs = isObj(workflow_runs) ? workflow_runs : {};
+  const runByTask = (taskId) => {
+    for (const [rid, run] of Object.entries(runs)) {
+      const known = isObj(st.agents.workflows[rid]) ? st.agents.workflows[rid] : {};
+      if (isObj(run) && (run.task_id === taskId || known.task_id === taskId)) return { rid, run, call_id: alt(nz(known.call_id), nz(run.call_id)) };
+    }
+    return null;
+  };
   const subagentSignals = (r, s) => {
-    // 起（同步派出的）：子 agent 文件的第一条记录；类型、任务描述、派它的调用取同名 meta.json
+    // 起（同步派出的）：子 agent 文件的第一条记录；类型、任务描述、派它的调用取同名 meta.json（workflow 的 agent 由调用方补上 toolUseId 与 workflowRunId）
     if (s.agent !== null && !st.agent_started && start_line === 1) {
       st.agent_started = true;
+      const wf = isObj(meta) && isStr(meta.workflowRunId) ? { 'vibetrail.workflow': { run_id: meta.workflowRunId, ...opt('phase', nz(meta.workflowPhase)) } } : null;
       agentStart(s, s.agent, parent_instance, alt(isObj(meta) && isStr(meta.agentType) && meta.agentType !== '' ? meta.agentType : null, 'unknown'),
-        isObj(meta) ? nz(meta.toolUseId) : null, isObj(meta) ? nz(meta.description) : null);
+        isObj(meta) ? nz(meta.toolUseId) : null, isObj(meta) ? nz(meta.description) : null, wf);
     }
     const results = r.type === 'user' && isArr(msgOf(r).content) ? msgOf(r).content.filter((b) => isObj(b) && b.type === 'tool_result') : [];
     const tres = isObj(r.toolUseResult) ? r.toolUseResult : null;
     const one = results.length === 1 ? results[0] : null;
     const launched = tres && (tres.isAsync === true || tres.status === 'async_launched');
+    // workflow 的启动结果：记下 runId → 派它的调用、taskId（存进 agents.json，之后的通知与 workflow agent 文件都靠它挂回来）
+    if (one && tres && tres.taskType === 'local_workflow' && isStr(tres.runId)) {
+      st.agents.workflows[tres.runId] = { ...opt('call_id', nz(one.tool_use_id)), ...opt('task_id', nz(tres.taskId)) };
+    }
     // 起（后台派出的）：调用结果当场返回 isAsync + agentId。本机 265 次后台 agent 没有自己的 transcript 文件，只能从这里知道它起了；
     // 记进账本，调用方存进 state，之后的 <task-notification> 靠它认出是子 agent
     if (one && launched && isStr(tres.agentId)) {
@@ -951,11 +1029,19 @@ export function mapRecords(records, args) {
       agentEnd(s, tres.agentId, tres.status, alt(isStr(tres.agentType) && tres.agentType !== '' ? tres.agentType : null, agentTypeOf(tres.agentId, cid)),
         cid, textOfBlocks(tres.content), facts);
     }
-    // 同步的 agent 出错（本机 15 次）拿不到 agentId，只能按 meta 里的 toolUseId 认：记下完成时间，子 agent 文件好收尾
+    // 按 meta 里的 toolUseId 认结束：同步的 agent 出错（本机 15 次）拿不到 agentId；子 agent 文件里整个没有 toolUseResult（09-16 实测：
+    // 被子 agent 派出的同步 agent，结束只有一条 tool_result），以前这两种都不发 subagent.end。meta 有 toolUseId 就说明这个 agent 真的起过，
+    // 调用结果就是它的结束：出错是 failed（正文像打断 / 取消的算 cancelled），否则 completed；主会话里带 toolUseResult.agentId 的上面已经发过
     for (const b of results) {
       const cid = nz(b.tool_use_id);
       if (!isStr(cid) || agentByCall[cid] === undefined) continue;
-      if (b.is_error === true || (one && !launched)) markDone(st.agents.calls_done, cid, s.ts);
+      const txt = errText(b.content);
+      if ((launched && one === b) || /^Async agent launched/.test(txt)) continue;   // 后台派出的：结束看之后的 <task-notification>
+      markDone(st.agents.calls_done, cid, s.ts);
+      if (tres && isStr(tres.agentId) && one === b) continue;
+      const aid = agentByCall[cid];
+      const status = b.is_error !== true ? 'completed' : /interrupt|cancel|abort|stopped|killed/i.test(txt) ? 'cancelled' : 'failed';
+      agentEnd(s, aid, status, agentTypeOf(aid, cid), cid, b.is_error !== true ? textOfBlocks(b.content) : null, {});
     }
     // 止（后台的）：<task-notification>，<task-id> 就是 agentId（偶尔一条带几个），<status> completed / failed / killed / stopped。
     // 两种形态：模型空闲时是 origin.kind = task-notification 的 user 记录，忙时是 queued_command 附件（本机 511 条，只 33 个两边都有）
@@ -971,8 +1057,19 @@ export function mapRecords(records, args) {
         const usage = notif.match(/<usage>([\s\S]*?)<\/usage>/)?.[1] ?? '';
         const tag = (n) => { const m = usage.match(new RegExp(`<${n}>\\s*(\\d+)\\s*</${n}>`)); return m ? Number(m[1]) : null; };
         for (const aid of ids) {
-          // 后台 shell 任务、监视器也发这种通知：只认子 agent（有它的 meta / 文件，或记下过它的后台启动）
-          if (!agentKnown(aid)) continue;
+          // 后台 shell 任务、监视器也发这种通知：只认子 agent（有它的 meta / 文件，或记下过它的后台启动）与 workflow（task-id 是它的 taskId）
+          if (!agentKnown(aid)) {
+            const w = runByTask(aid);
+            if (w === null) continue;
+            // workflow 跑完：给这次 run 里跑完的每个 agent 发 subagent.end，父实例是主会话、派它的调用是那次 Workflow 调用
+            for (const [wa, info] of Object.entries(isObj(w.run.agents) ? w.run.agents : {})) {
+              if (!isObj(info) || !isStr(info.status)) continue;
+              agentEnd(s, wa, info.status, alt(isStr(info.agent_type) && info.agent_type !== '' ? info.agent_type : null, 'workflow-subagent'),
+                alt(callId, w.call_id), info.status === 'completed' && isStr(info.result) ? info.result : null, {},
+                { 'vibetrail.workflow': { run_id: w.rid, ...opt('phase', nz(info.phase)), ...opt('label', nz(info.label)) } });
+            }
+            continue;
+          }
           const k = alt(nz(st.agents.launched[aid]), alt(nz(knownAgents[aid]), {}));
           const cid = ids.length === 1 ? alt(callId, nz(k.call_id)) : nz(k.call_id);
           const facts = ids.length === 1 ? { ...opt('duration_ms', tag('duration_ms')), ...opt('total_tokens', alt(tag('subagent_tokens'), tag('total_tokens'))), ...opt('tool_use_count', tag('tool_uses')) } : {};
@@ -981,12 +1078,12 @@ export function mapRecords(records, args) {
       }
     }
   };
-  // 切目录：相邻两条记录的 cwd 不同（本机 21 份文件里 326 次）
+  // 切目录：相邻两条记录的 cwd 不同（本机 21 份文件里 326 次）。目录按「不出本机」的写法（工作区内相对、根外 ~ 形）
   const cwdChange = (r, s) => {
     if (!isStr(r.cwd)) return;
     if (st.last_cwd !== null && r.cwd !== st.last_cwd) {
       const e = base(s, 'ext.claude.cwd_changed', s.uuid, s.ts, turnOf(s));
-      e.payload = { old_cwd: st.last_cwd, new_cwd: r.cwd };
+      e.payload = { old_cwd: safeDir(st.last_cwd), new_cwd: safeDir(r.cwd) };
       e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.ext, source_event: 'cwd', source_event_id: s.uuid };
       e._key = `${s.uuid}|cwd_changed`;
       emit(e);
@@ -1003,15 +1100,16 @@ export function mapRecords(records, args) {
     const files = nested ? [{ path: alt(nz(at.content.path), nz(at.path)), type: nz(at.content.type), content: nz(at.content.content) }]
       : (isArr(at.files) ? at.files : []).filter(isObj);
     const e = base(s, 'ext.claude.instructions_loaded', s.uuid, s.ts, turnOf(s));
+    // 路径按「不出本机」的写法：仓里的 CLAUDE.md 相对工作区根，~/.claude/ 下的换成 ~ 形
     e.payload = {
-      files: files.map((f) => ({ ...opt('path', nz(f.path)), ...opt('type', nz(f.type)),
+      files: files.map((f) => ({ ...opt('path', safeFile(nz(f.path))), ...opt('type', nz(f.type)),
         ...(isStr(f.content) ? { bytes: Buffer.byteLength(f.content, 'utf8'), sha256: crypto.createHash('sha256').update(f.content, 'utf8').digest('hex') } : {}) })),
       ...opt('reason', nested ? 'nested_traversal' : nz(at.reason)), ...(at.changed === true ? { changed: true } : {}),
-      ...opt('removed', isArr(at.removed) ? at.removed : null),
+      ...opt('removed', isArr(at.removed) ? at.removed.map((x) => safeFile(x)) : null),
     };
     if (capContent) {
       e.content_state = 'included';
-      e.extensions = { ...e.extensions, 'vibetrail.instructions': files.filter((f) => isStr(f.content)).map((f) => ({ path: nz(f.path), content: f.content })) };
+      e.extensions = { ...e.extensions, 'vibetrail.instructions': files.filter((f) => isStr(f.content)).map((f) => ({ path: safeFile(nz(f.path)), content: f.content })) };
     }
     e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.ext, source_event: 'instructions', source_event_id: s.uuid };
     e._key = `${s.uuid}|instructions_loaded`;
@@ -1023,18 +1121,30 @@ export function mapRecords(records, args) {
     st.out = [];
     st.ln += 1;
     const ln = st.ln;
-    if (!isObj(r)) { st.ledger.skipped_non_object += 1; return; }
-    if (!isStr(r.uuid)) { st.ledger.skipped_no_uuid += 1; return; }
+    const isNew = ln > from_line;
+    const NEW = st.ledger.new;
+    if (isNew) NEW.seen += 1;
+    if (!isObj(r)) { st.ledger.skipped_non_object += 1; if (isNew) NEW.skipped_non_object += 1; return; }
+    // A11：清单之外的记录类型 / 附件类型 / system 子类型只计数（doctor 告警），照常往下走
+    if (isNew) {
+      const ty = nz(r.type);
+      if (!KNOWN_TYPES.has(ty)) inc(NEW.unknown_types, 'type:' + String(ty));
+      else if (ty === 'attachment') { const a = isObj(r.attachment) ? nz(r.attachment.type) : null; if (!KNOWN_ATTACHMENTS.has(a)) inc(NEW.unknown_types, 'attachment:' + String(a)); }
+      else if (ty === 'system') { const sb = nz(r.subtype); if (!KNOWN_SYSTEM.has(sb)) inc(NEW.unknown_types, 'system:' + String(sb)); }
+    }
+    if (!isStr(r.uuid)) { st.ledger.skipped_no_uuid += 1; if (isNew) NEW.skipped_no_uuid += 1; return; }
     const s = slim(r, ln);
     const hits = diverge(r);
-    if (st.run_uuids[r.uuid] || (st.prior[r.uuid] !== undefined && st.prior[r.uuid] !== ln)) { st.ledger.replayed += 1; return; }
+    if (st.run_uuids[r.uuid] || (st.prior[r.uuid] !== undefined && st.prior[r.uuid] !== ln)) { st.ledger.replayed += 1; if (isNew) NEW.replayed += 1; return; }
     // K8（🔴，09-16 复核：本机 7.6% 的事件落在复制来的轮上，trace 与 token 在云端算两遍）：desktop 续接会话会把旧会话的开头
     // 原样复制进新文件，记录 uuid、promptId 都不变、只有文件换了——但每条记录的 sessionId 字段仍是原会话的。
     // 所以「记录 sessionId 与文件 sid 不同」就是复制来的历史，整条跳过、账本记 inherited；它在原会话的文件里已经报过。
     // 子 agent 文件里 sessionId 是父会话 id、与 sid 一致，不受影响；没有 sessionId 的记录（老版本）照常处理
-    if (sid && isStr(r.sessionId) && r.sessionId !== sid) { st.ledger.inherited += 1; return; }
+    if (sid && isStr(r.sessionId) && r.sessionId !== sid) { st.ledger.inherited += 1; if (isNew) NEW.inherited += 1; return; }
     st.run_uuids[r.uuid] = true;
     st.ledger.records += 1;
+    if (isNew) NEW.records += 1;
+    if (s.agent !== null && st.agent_id === null) st.agent_id = s.agent;
     st.last_ts = alt(nz(r.timestamp), st.last_ts);
     st.version = alt(nz(r.version), st.version);
     st.entrypoint = alt(nz(r.entrypoint), st.entrypoint);
@@ -1057,7 +1167,8 @@ export function mapRecords(records, args) {
     if (ln > from_line) st.ledger.sources.push([s.uuid, ln]);
     if (isStr(r.toolUseResult) && r.toolUseResult.startsWith('User rejected tool use')) {
       st.ledger.sentinel.marker += 1;
-      if (!hits.some((h) => h.kind === 'permission_denied')) st.ledger.sentinel.marker_without_hit += 1;
+      if (isNew) NEW.sentinel.marker += 1;
+      if (!hits.some((h) => h.kind === 'permission_denied')) { st.ledger.sentinel.marker_without_hit += 1; if (isNew) NEW.sentinel.marker_without_hit += 1; }
     }
     for (const h of hits) handle(r, s, h);
     if (s.human || s.slash) {
@@ -1096,6 +1207,8 @@ export function mapRecords(records, args) {
     turns: { ...st.ledger.turns, open: alt(st.pturn ? st.pturn.id : null, null), open_line: alt(st.pturn ? st.pturn.line : null, null),
       closed: alt(st.pturn ? st.pturn.closed : null, false), model: alt(st.pturn ? st.pturn.model : null, st.turn_model) },
     trace: { call_open: st.call !== null }, last_ts: st.last_ts,
-    split_decisions_new: splitsNew, split_reused: splitsReused, agents: st.agents };
+    split_decisions_new: splitsNew, split_reused: splitsReused, agents: st.agents,
+    // 子 agent 文件自己改 / 读的文件（整份文件；每次都从头读所以是全集，调用方按最重操作并进 agents.json）
+    ...(st.agent_id !== null ? { agent_files: { [st.agent_id]: st.agent_files.files }, agent_files_outside: { [st.agent_id]: st.agent_files.files_outside } } : {}) };
   return { events, ledger };
 }
