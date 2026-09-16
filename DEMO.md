@@ -16,7 +16,7 @@ bash experiments/collect-demo/demo.sh
 在哪个目录跑都行，`init` 不会登记任何仓：
 
 ```bash
-cd /Users/gupengfei/program/code/vibetrail
+cd <vibetrail 仓的目录>
 bash tools/vibetrail init
 ```
 
