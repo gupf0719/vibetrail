@@ -12,6 +12,8 @@
 //   7. min_by 取第一个最小元素；空数组给 null。max/min 按 jq 的排序（null 最小）
 //   8. 对象 `+` 是浅合并、右边赢；del 删键；缺失的键读出来是 null
 
+import crypto from 'node:crypto';
+
 // ---------- jq 语义小工具 ----------
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isArr = Array.isArray;
@@ -667,7 +669,8 @@ export function mapRecords(records, args) {
     const emsg = alt(nz(err.formatted), alt(nz(err.message), null));
     e.payload = { ...opt('retry_attempt', nz(r.retryAttempt)), ...opt('retry_in_ms', nz(r.retryInMs)), ...opt('max_retries', nz(r.maxRetries)),
       ...opt('source', nz(r.source)), ...opt('error', isStr(emsg) ? cut(emsg, 200) : null), ...opt('status', alt(nz(err.status), null)) };
-    e.provenance = { kind: 'transcript', rule_version: 'call-v1', source_event_id: s.uuid };
+    // 协议要求 ext.* 带 source_event（今天更新的 schema）；这一路是 transcript 出的，填来源记录的子类型
+    e.provenance = { kind: 'transcript', rule_version: 'call-v1', source_event: 'api_error', source_event_id: s.uuid };
     e.extensions = { ...e.extensions, ...opt('vibetrail.response_id', req ? req.mid : null) };
     e._key = s.uuid + '|api_error';
     emit(e);
@@ -713,6 +716,29 @@ export function mapRecords(records, args) {
     }
   };
 
+  // 全采：system prompt。它在 attachment/prompt_snapshot 里（≥ 2.1.258，DESIGN §6.3），一个会话里会重复快照几十次，
+  // 所以按正文的 sha256 做幂等键——同一份只发一条（再次出现时 _key 相同，本机 ids 与云端都按 event_id 挡掉）。
+  // 协议 1.0 没有 system_instructions 字段，且明说「不得把系统提示伪装成普通 Assistant 文本，无法标准化时使用扩展事件」，
+  // 所以走扩展事件 ext.claude.prompt_snapshot，正文进 extensions["vibetrail.system_prompt"]
+  const promptSnapshot = (r, s) => {
+    if (!capContent) return;
+    if (!(r.type === 'attachment' && isObj(r.attachment) && r.attachment.type === 'prompt_snapshot')) return;
+    // 2.1.27x 给的是「分段字符串数组」（本机实测 16 段约 14 KB），老版本可能是整串或块数组：三种都吃下
+    const raw = r.attachment.systemPrompt;
+    const text = isStr(raw) ? raw
+      : isArr(raw) ? raw.map((x) => (isStr(x) ? x : isObj(x) && isStr(x.text) ? x.text : '')).filter((x) => x.length > 0).join('\n')
+      : '';
+    if (text.length === 0) return;
+    const sha = crypto.createHash('sha256').update(text, 'utf8').digest('hex');
+    const e = base(s, 'ext.claude.prompt_snapshot', s.uuid, s.ts, { id: alt(st.turn, s.uuid), inferred: st.turn === null });
+    e.content_state = 'included';
+    e.payload = { bytes: Buffer.byteLength(text, 'utf8'), sha256: sha };
+    e.provenance = { kind: 'transcript', rule_version: 'call-v1', source_event: 'prompt_snapshot', source_event_id: s.uuid };
+    e.extensions = { ...e.extensions, 'vibetrail.system_prompt': text };
+    e._key = 'ext|prompt_snapshot|' + sha.slice(0, 16);
+    emit(e);
+  };
+
   // ---- 一条记录 ----
   const step = (r) => {
     st.out = [];
@@ -742,6 +768,7 @@ export function mapRecords(records, args) {
     }
     turnAccumulate(r, s);
     turnStopMarker(r, s);
+    promptSnapshot(r, s);
     if (turns) traceStep(r, s);
     if (ln > from_line) st.ledger.sources.push([s.uuid, ln]);
     if (isStr(r.toolUseResult) && r.toolUseResult.startsWith('User rejected tool use')) {

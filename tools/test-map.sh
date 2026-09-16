@@ -232,6 +232,27 @@ check "1 MiB: 同一批里没超限的照常带正文（人话、工具参数）
 check "1 MiB: 每条事件都在协议上限内" 'all(.[]; (tojson | utf8bytelength) < 1048576)' "$b"
 schema_check < "$b" > "$T/schema.big" && ok || ko "1 MiB: $(cat "$T/schema.big")"
 
+# system prompt（≥ 2.1.258 的 transcript 自带，在 attachment/prompt_snapshot 里）：全采时一条 ext.claude.prompt_snapshot，
+# 正文进 extensions、按 sha256 去重（一个会话里会重复快照几十次）；协议要求 ext.* 带 provenance.source_event
+{ jq -n -c '{type:"user",uuid:"su1",parentUuid:null,promptId:"sp1",message:{role:"user",content:"改一下"},isSidechain:false,cwd:"/tmp/fx",sessionId:"fx-sys",version:"2.1.266",entrypoint:"cli",gitBranch:"main",timestamp:"2026-09-16T01:00:00.000Z"}'
+  jq -n -c '{type:"attachment",uuid:"sp-a1",parentUuid:"su1",promptId:"sp1",attachment:{type:"prompt_snapshot",systemPrompt:["You are Claude Code.","工具定义……"]},isSidechain:false,cwd:"/tmp/fx",sessionId:"fx-sys",version:"2.1.266",entrypoint:"cli",gitBranch:"main",timestamp:"2026-09-16T01:00:01.000Z"}'
+  jq -n -c '{type:"attachment",uuid:"sp-a2",parentUuid:"sp-a1",promptId:"sp1",attachment:{type:"prompt_snapshot",systemPrompt:["You are Claude Code.","工具定义……"]},isSidechain:false,cwd:"/tmp/fx",sessionId:"fx-sys",version:"2.1.266",entrypoint:"cli",gitBranch:"main",timestamp:"2026-09-16T01:00:02.000Z"}'
+  jq -n -c '{type:"system",subtype:"api_error",uuid:"sp-e1",parentUuid:"sp-a2",promptId:"sp1",source:"request_retry",retryAttempt:1,maxRetries:3,error:"{\"message\":\"overloaded\",\"status\":529}",isSidechain:false,cwd:"/tmp/fx",sessionId:"fx-sys",version:"2.1.266",entrypoint:"cli",gitBranch:"main",timestamp:"2026-09-16T01:00:03.000Z"}'
+} > "$T/sys.jsonl"
+bash "$SELF/vibetrail-map" "$T/sys.jsonl" --capture-content 1 --sid fx-sys --project-id /tmp/fx --workspace-id /tmp/fx > "$T/sys.events" 2>/dev/null
+y=$T/sys.events
+check "system prompt: 两次快照只发一条（按正文 sha256 去重），正文进 extensions、payload 只有 bytes 与 sha256" \
+    '[.[] | select(.type=="ext.claude.prompt_snapshot")] | length == 1
+     and (.[0].extensions["vibetrail.system_prompt"] | test("You are Claude Code"))
+     and (.[0].payload | keys | sort) == ["bytes","sha256"] and .[0].content_state == "included"' "$y"
+check "ext.* 都带 provenance.source_event（协议今天更新后要求；prompt_snapshot 与 api_error 都是 transcript 出的）" \
+    'all(.[] | select(.type | startswith("ext.")); .provenance.source_event != null)
+     and any(.[]; .type=="ext.claude.api_error" and .provenance.source_event == "api_error")' "$y"
+schema_check < "$y" > "$T/schema.sys" && ok || ko "system prompt: $(cat "$T/schema.sys")"
+bash "$SELF/vibetrail-map" "$T/sys.jsonl" --capture-content 0 --sid fx-sys --project-id /tmp/fx --workspace-id /tmp/fx > "$T/sys0.events" 2>/dev/null
+check "system prompt: 关掉开关就不发（api_error 照发）" \
+    '([.[] | select(.type=="ext.claude.prompt_snapshot")] | length == 0) and any(.[]; .type=="ext.claude.api_error")' "$T/sys0.events"
+
 # hook 不传 --capture-content，走的是 config：这条链路单独钉一下，三种情形（开 / 关 / 没写＝默认开）
 for m in on off default; do
     mkdir -p "$T/cfg-$m"

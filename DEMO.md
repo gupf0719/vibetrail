@@ -80,7 +80,10 @@ bash tools/vibetrail init
 来源是 `hook-<事件名小写>`（hook 当场给的，如 `hook-userpromptsubmit`）、`main`（解析主会话 transcript 得出的）或 `agent-<id>`（子 agent 的 transcript）。每行一条 paas-coding-hook 协议 1.0 事件，直接 `cat` 就能看。
 这就是将来要 push 的全部内容。**2026-09-16 起默认全采正文**（用户定，推翻原先的「只带元数据」）：人的 prompt、模型输出、
 工具参数与结果原样进事件（`payload.text` / `payload.input` / `payload.output`），thinking 进 `extensions["vibetrail.reasoning"]`，
-**不脱敏**。单条超协议上限 1 MiB 的，整条去掉正文、标 `content_state=omitted`，事件本身照发。
+**不脱敏**。**system prompt** 也采：它在 `attachment/prompt_snapshot` 里（≥ 2.1.258 的 transcript 自带），
+发成一条 `ext.claude.prompt_snapshot`（正文进 `extensions["vibetrail.system_prompt"]`，payload 只有 bytes 与 sha256），
+按正文的 sha256 去重——一个会话里快照几十次也只发一条。
+单条超协议上限 1 MiB 的，整条去掉正文、标 `content_state=omitted`，事件本身照发。
 只要元数据：在 `~/.vibetrail/config` 里写 `capture_content=0`——那时只有分歧那几条带正文（被拒的命令、被打断的回复、之后人的下一句）。
 
 | 什么时候 | 出现什么 |
