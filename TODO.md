@@ -60,7 +60,7 @@
 - [x] commit ↔ 轮次推导（09-15）：轮起 / 轮止快照（`state/<sid>/turns/`），本轮 commit = `rev-list 起..止` + 本轮 reflog 里新建的提交，归因看 transcript 里 agent 有没有跑
   `git commit`（DESIGN §3.5）；demo.sh 第 1 轮中途真的提交一次，turn.end 带上了。原写的「`vibetrail show` 按 commit 查改走它」不做了：按 commit 查是读取端的事（D5），
   现在的 `vibetrail show` 是本地预览。Bash stdout 里短 sha 的旁证还没做。
-- [ ] **运行时换成 Node 单文件 `.mjs`、去掉 jq**（用户 09-16 定：「node硬依赖问题不大，把jq全换成mjs吧」；DESIGN D12；换语言不换设计，磁盘上的一切不变）。
+- [x] **运行时换成 Node 单文件 `.mjs`、去掉 jq**（2026-09-16 移植完毕：①`0bb521b` ②`b3985be` ③`e404b67` ④`aeda56b`；test-map / test-hook-flow / test-extract 全绿，12 份真实 transcript 7 万条事件两引擎逐条一致，106 MB 那份 63 s → 21 s）（用户 09-16 定：「node硬依赖问题不大，把jq全换成mjs吧」；DESIGN D12；换语言不换设计，磁盘上的一切不变）。
   **jq 版从此冻结**：只修 🔴，别的会话别再往 `.jq` 里加东西。估两到三天。
   1. 布局：`tools/vibetrail-hook`、`tools/vibetrail` 各留一个 ≤ 30 行的 POSIX sh 包装（读 config 的 `node=`，`exec node vibetrail.mjs …`；找不到 node 也 exit 0、只记 errors.log）；
      `tools/vibetrail.mjs` 入口按 argv 分发 hook / cli / push；`tools/lib/` 下 `map.mjs`（原 map-events.jq + diverge-rules.jq + hook-events.jq）、`hook.mjs`（原 vibetrail-hook + vibetrail-lib.sh + vibetrail-map）、
@@ -77,7 +77,7 @@
      ⑤ 之后才在 JS 里做下面「09-16 复核核出的修补」，再写 push。
   3. 测试：第一步 bash 回归脚本不动，只把被测程序换掉（断言处的 jq 只在开发机用，运行时不再依赖 jq）；第二步换 `node:test`。fixtures / golden / scenario.json 原样沿用。
   4. 风险要盯：行为漂移（靠 golden 与 hook 回归兜）；同步 hook 从 20 ms 变 70～135 ms；desktop 启动的 hook 没有 PATH（包装只用 config 里的绝对路径）；两套并存期间别的会话往 jq 里加东西（冻结）。
-- [ ] **09-16 复核核出的修补**（本机 124,666 条真实事件 + teamai / Pilot 源码对照，见 OPEN-ISSUES；都小，**移植完在 JS 里做**，顺序按影响排）：
+- [x] **09-16 复核核出的修补**（2026-09-16：K8 / K12 / K13 `51f8716`，K14 / K15①③ / K16 `4235fca`，各带回归；K15 ②④⑤ 与 U16 仍开着）（本机 124,666 条真实事件 + teamai / Pilot 源码对照，见 OPEN-ISSUES；都小，**移植完在 JS 里做**，顺序按影响排）：
   K8 复制历史按记录 `sessionId` 跳过（🔴，7.6% 的事件在复制的轮上、trace 翻倍）→ K13 打断的 turn.end 补 `closed_by` / `stops`、打断后置 closed →
   K12 只在人话 / 斜杠命令处开轮或打 `turn_kind` → K15 ①③（capabilities 加 `tool.end`、state 目录清理）→ K14 uninstall 留 ids → K16 命令串 `2>/dev/null || true` 与 stdin 超时。
   每条各补一个回归用例（见下面「回归」）。U16（四个只记事件头的事件默认登不登记）等用户定。
