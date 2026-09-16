@@ -60,6 +60,9 @@
 - [x] commit ↔ 轮次推导（09-15）：轮起 / 轮止快照（`state/<sid>/turns/`），本轮 commit = `rev-list 起..止` + 本轮 reflog 里新建的提交，归因看 transcript 里 agent 有没有跑
   `git commit`（DESIGN §3.5）；demo.sh 第 1 轮中途真的提交一次，turn.end 带上了。原写的「`vibetrail show` 按 commit 查改走它」不做了：按 commit 查是读取端的事（D5），
   现在的 `vibetrail show` 是本地预览。Bash stdout 里短 sha 的旁证还没做。
+- [x] **init 引导填上报 token、使用前的准备**（2026-09-16，用户「Init要引导用户填token」「项目使用的文档提示一下使用前的准备，比如node版本这些」）：token 存 `~/.vibetrail/token`（600），
+  终端里跑 init 没填过就问一次（不回显，回车 / Ctrl-C 跳过），`vibetrail token [--status | --clear]`，doctor 报填没填、权限过宽告警；DEMO §0 列 node ≥ 20、git、Claude Code 版本、系统、hook 开关、token、演示与测试另要的 jq / python3；
+  命令行 sh 包装先查 node 版本。顺手修 `projects pick` 在终端里敲回车不返回（原先读到 EOF）。pty 回归在 test-hook-flow 第 19、20 段。
 - [x] **只挂 5 个 hook**（2026-09-16，DESIGN D13，关 OPEN-ISSUES U16、K15②）：SessionStart / UserPromptSubmit / Stop / SessionEnd / PermissionRequest；子 agent 起止（同步的调用结果、后台的启动结果与 `<task-notification>`）、API 出错结束的轮、
   CLAUDE.md 加载、切目录改在 Stop 时从 transcript 推，子 agent「写完了」看父会话里完成信号的时间（`state/<sid>/agents.json`）；`tool.end` 标耗时来源。init 只登 5 个、清旧条目，doctor 点名还挂着的旧事件；
   test-map 198 项、test-hook-flow 94 项、test-extract 27 项全绿，五处变异各自变红。

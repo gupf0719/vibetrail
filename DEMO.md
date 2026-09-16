@@ -2,6 +2,18 @@
 
 > 2026-09-16。现在只落本机，push 还没做。原理与取舍见 [DESIGN.md](DESIGN.md)。
 
+## 0. 使用前的准备
+
+| 要什么 | 要求 | 怎么查 / 怎么办 |
+|---|---|---|
+| **node** | **≥ 20**，运行时唯一的依赖（hook 与命令行都是 node 跑的） | `node -v`。`init` 把 node 的绝对路径记进 `~/.vibetrail/config`，hook 不靠 PATH；用 nvm / volta / Homebrew 换了 node 之后重跑一次 `init`。版本不够时命令行会直接说是哪个 node、什么版本 |
+| **git** | 要采的项目是 git 仓（按主 checkout 登记，每轮记 HEAD 与 commit）；macOS 自带的就行 | `git --version` |
+| **Claude Code** | CLI 或 desktop 都行，实测过 2.1.260～2.1.270。system prompt 要 ≥ 2.1.258 的 transcript 才有 | `init` 按本机每个 Claude Code 版本只登记它认识的事件；装了或升级了之后重跑一次 `init` |
+| **系统** | macOS（实测）；Linux 应该能跑，没测过；Windows 不支持（入口是 POSIX sh 包装） | |
+| **hook 没被关掉** | 用户设置里没有 `disableAllHooks: true`；公司电脑的托管设置里没有 `allowManagedHooksOnly: true`。这两种情况下 hook 一次都不触发，而且看不出异常 | 装完跑 `vibetrail doctor`，会点名是哪份文件里的哪个键 |
+| **上报 token** | OnePaaS 的 API Access Token（push 时放进 `Onepaas-Api-Access-Token` 请求头）。联调阶段可以不填，服务端记到默认用户；正式接入前要填 | 在终端里跑 `init` 会问一次（输入不回显，回车跳过）；以后用 `~/.vibetrail/bin/vibetrail token` 填或换 |
+| 只有跑演示、测试才要 | `jq`（`demo.sh`、`report.sh` 与测试脚本；1.6 也行）；`python3` + `jsonschema`（测试里的协议 schema 校验，缺了跳过并提示） | `jq --version`；`python3 -c 'import jsonschema'` |
+
 ## 1. 先在沙箱里看一遍（不碰真实环境）
 
 ```bash
@@ -26,9 +38,16 @@ bash tools/vibetrail init
 | `~/.vibetrail/backup/` | settings 的备份：`settings.json.before-vibetrail` 是第一次装之前的原样（只存一次、永不覆盖；原来没有 settings 就没有它），另外每次改动前存一份带时间的（留最近 10 份）。重跑 `init` 没有变化时不写也不备份 |
 | `~/.vibetrail/bin/` | 运行时 |
 | `~/.vibetrail/config` | scope（默认 project，只采登记过的仓）、node 路径、device_id 等 |
+| `~/.vibetrail/token` | 上报 token（权限 600，不写进 config）。在终端里跑 `init` 时没填过会问一次，回车跳过；不在终端里跑只提示怎么填 |
 | `~/.vibetrail/projects/` | 登记的仓（`init` 不自动加） |
 
 `init` 最后会列出登记表和「用过 Claude Code、还没登记的仓」。被观测的仓里什么都不写。
+
+填或换上报 token（粘贴后回车，输入不回显；`--status` 看填没填，只显示末 4 位；`--clear` 删掉）：
+
+```bash
+~/.vibetrail/bin/vibetrail token
+```
 
 ## 3. 选要采的仓
 
@@ -125,8 +144,8 @@ bash experiments/collect-demo/report.sh -o experiments/collect-demo/out/report.m
 ~/.vibetrail/bin/vibetrail uninstall
 ```
 
-`doctor` 查运行时（MANIFEST 逐个校验）、node 版本与**映射器跑不跑得通**（真 import 一次 `lib/map.mjs` 再拿一条假记录跑一遍：映射器起不来的话 transcript 那一路一条都不出，而 hook 仍然全部 exit 0）、hook 条目（包括命令指向的脚本在不在）、hook 有没有被全局开关关掉（`disableAllHooks` / 企业策略的 `allowManagedHooksOnly`）、有没有重复挂载（同一事件挂在 HOME 与项目两处会触发两遍）、登记表、有没有落后没采的会话、错误日志（映射失败单独点出条数）。
-卸载只去掉 settings 里自己的条目和运行时，已采的数据、配置、登记表留着；加 `--purge` 连 `~/.vibetrail` 整个删掉。
+`doctor` 查运行时（MANIFEST 逐个校验）、node 版本（≥ 20）与**映射器跑不跑得通**（真 import 一次 `lib/map.mjs` 再拿一条假记录跑一遍：映射器起不来的话 transcript 那一路一条都不出，而 hook 仍然全部 exit 0）、hook 条目（包括命令指向的脚本在不在）、hook 有没有被全局开关关掉（`disableAllHooks` / 企业策略的 `allowManagedHooksOnly`）、有没有重复挂载（同一事件挂在 HOME 与项目两处会触发两遍）、登记表、有没有落后没采的会话、错误日志（映射失败单独点出条数）、上报 token 填没填（只显示末 4 位，文件别人能读时告警）。
+卸载只去掉 settings 里自己的条目和运行时，已采的数据、配置、上报 token、登记表留着；加 `--purge` 连 `~/.vibetrail` 整个删掉。
 
 ## 演示时要说清楚的
 

@@ -4,10 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import readline from 'node:readline';
 import {
   VT_HOME, VT_RUNTIME_VERSION, vtConf, vtSha, vtSlug, vtRealpath, vtMainCheckout, vtProjectKey,
   vtRegistered, vtRegister, vtUnregister, vtPruneRemoved, settingsPath, claudeProjects, runHook,
-  vtPermPeriods, formatPermPeriods,
+  vtPermPeriods, formatPermPeriods, tokenPath, vtToken,
 } from './hook.mjs';
 
 const say = (s = '') => process.stdout.write(s + '\n');
@@ -50,6 +51,92 @@ const findNode = () => {
   if (c && isFile(c)) return c;
   return process.execPath;
 };
+
+// ---- 读一行输入 ----
+// 终端里：hidden 时自己用 raw 模式读、不回显（粘贴 token 用），否则交给 readline（回车就返回）；管道里读第一行。
+// Ctrl-C 返回 null，由调用方当「跳过」。原先 projects pick 用 readFileSync(0) 读，终端里要等到 EOF，敲完回车不返回（09-16 用 pty 复现）
+function ask(prompt, { hidden = false } = {}) {
+  const tty = Boolean(process.stdin.isTTY);
+  if (!tty) {                                             // 管道 / 文件：写的一方会关，读到 EOF 取第一行
+    process.stdout.write(prompt);
+    let all = '';
+    try { all = fs.readFileSync(0, 'utf8'); } catch {}
+    return Promise.resolve((all.split('\n')[0] ?? '').replace(/\r$/, ''));
+  }
+  if (hidden) {
+    return new Promise((resolve) => {
+      const stdin = process.stdin;
+      let buf = '';
+      const done = (v) => {
+        stdin.removeListener('data', onData);
+        try { stdin.setRawMode(false); } catch {}
+        stdin.pause();
+        process.stdout.write('\n');
+        resolve(v);
+      };
+      const onData = (chunk) => {
+        for (const ch of String(chunk)) {
+          if (ch === '\r' || ch === '\n') { done(buf.replace(/\[20[01]~/g, '')); return; }   // 顺手去掉括号粘贴模式的包裹
+          if (ch === '') { done(null); return; }                                   // Ctrl-C
+          if (ch === '') { if (buf === '') { done(null); return; } continue; }     // 空行上 Ctrl-D
+          if (ch === '' || ch === '\b') { buf = [...buf].slice(0, -1).join(''); continue; }
+          if (ch < ' ') continue;
+          buf += ch;
+        }
+      };
+      // 先进 raw 模式再打提示：反过来的话，提示出来之后马上到的按键还归终端的行模式管——会被回显，Ctrl-C 会被吞掉（pty 复现过）
+      stdin.setEncoding('utf8');
+      stdin.setRawMode(true);
+      stdin.on('data', onData);
+      stdin.resume();
+      process.stdout.write(prompt);
+    });
+  }
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: Boolean(process.stdout.isTTY) });
+    let settled = false;
+    const fin = (v) => { if (settled) return; settled = true; rl.close(); resolve(v); };
+    rl.on('SIGINT', () => { process.stdout.write('\n'); fin(null); });
+    rl.on('close', () => fin(null));                      // Ctrl-D
+    rl.question(prompt, (a) => fin(a));
+  });
+}
+
+const maskToken = (t) => (t.length >= 16 ? `末 4 位 ${t.slice(-4)}` : `${t.length} 个字符`);   // 短的一位都不露
+function saveToken(t) {
+  mkdirp(VT_HOME);
+  const f = tokenPath(), tmp = `${f}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, t + '\n', { mode: 0o600 });
+  fs.chmodSync(tmp, 0o600);                               // umask 可能把 mode 改宽，再定一次
+  fs.renameSync(tmp, f);
+}
+// 问一次 token：填了就存，回车 / Ctrl-C 跳过。返回 saved / skip / bad
+async function promptToken() {
+  say('上报 token：OnePaaS 的 API Access Token。push 时放进 Onepaas-Api-Access-Token 请求头，服务端按它认是谁的数据。');
+  say(`  存在 ${tokenPath()}（权限 600），不写进 config、不进日志。联调阶段可以不填（服务端记到默认用户），正式接入前要填。`);
+  const t = await ask(process.stdin.isTTY ? '  粘贴 token 后回车（输入不回显），直接回车跳过：' : '  从标准输入读 token：', { hidden: true });
+  if (!process.stdin.isTTY) say('');
+  if (t === null || t.trim() === '') { say(`  · 没填，跳过（以后跑 ${VT_HOME}/bin/vibetrail token）`); return 'skip'; }
+  const v = t.trim();
+  if (!/^[\x21-\x7e]{8,4096}$/.test(v)) { say('  ✗ 不像 token（要 8～4096 个可见 ASCII 字符，中间不能有空格或换行），没存'); return 'bad'; }
+  saveToken(v);
+  say(`  ✓ 已保存（${maskToken(v)}）`);
+  return 'saved';
+}
+export async function cmdToken(argv) {
+  const a = argv[0] ?? '';
+  if (a === '--status') {
+    const t = vtToken();
+    say(t ? `✓ 上报 token 已填（${maskToken(t)}，${tokenPath()}）` : `· 还没填上报 token（${tokenPath()} 不在）`);
+    return 0;
+  }
+  if (a === '--clear') {
+    try { fs.unlinkSync(tokenPath()); say(`✓ 已删掉 ${tokenPath()}`); } catch { say(`  本来就没有 ${tokenPath()}`); }
+    return 0;
+  }
+  if (a !== '') die(`token 不认识的参数：${a}（vibetrail token [--status | --clear]）`);
+  return (await promptToken()) === 'bad' ? 1 : 0;
+}
 
 // ---- 本机的 Claude Code 可执行文件与它们认识的事件 ----
 function claudeBinaries() {
@@ -271,7 +358,7 @@ function showRegistered() {
 }
 
 // ---- init ----
-export function cmdInit(argv) {
+export async function cmdInit(argv) {
   let scope = '', mode = 'auto';
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -282,6 +369,8 @@ export function cmdInit(argv) {
   }
   if (!['', 'project', 'user'].includes(scope)) die('--scope 只能是 project 或 user');
   if (!['auto', 'core', 'all'].includes(mode)) die('--events 只能是 auto / core / all');
+  // 使用前的准备（DEMO §0）：node ≥ 20。sh 包装已经查过，这里兜直接 node vibetrail.mjs init 的情形——记进 config 的 node 必须够版本
+  if (Number(process.versions.node.split('.')[0]) < 20) die(`node 版本太低：${process.execPath} 是 ${process.version}，vibetrail 要 node ≥ 20`);
   try { execFileSync('git', ['--version'], { stdio: 'ignore' }); } catch { die('没找到 git'); }
   const cur = settingsRead();
   const SELF = path.dirname(path.dirname(new URL(import.meta.url).pathname));   // tools/
@@ -375,6 +464,13 @@ export function cmdInit(argv) {
   confSet('permission_request_periods', formatPermPeriods(periods));
   confDel('permission_request_since');
 
+  // 3b. 上报 token（用户 09-16：init 要引导填）。终端里没填过就问一次，回车跳过；不在终端里（脚本、测试）不问，只提示怎么填
+  say('');
+  const tok = vtToken();
+  if (tok) say(`✓ 上报 token 已填（${maskToken(tok)}；换一个：${VT_HOME}/bin/vibetrail token）`);
+  else if (process.stdin.isTTY && process.stdout.isTTY) await promptToken();
+  else say(`· 还没填上报 token：在终端里跑 ${VT_HOME}/bin/vibetrail token 粘贴（联调阶段可以不填，服务端记到默认用户）`);
+
   // 4. 不登记任何仓，只列出登记表与候选
   if (vtConf('scope', 'project') === 'project') {
     say(''); showRegistered();
@@ -414,20 +510,18 @@ export function cmdUninstall(argv) {
       }
     } catch {}
     say(`✓ 已删除 ${VT_HOME}/bin、logs，以及 state 里除 ids 与拒绝判定之外的内容`);
-    say(`  留着：spool（还没发出去的数据）、${kept} 个会话已写入的 event_id 清单与拒绝判定（重装后不重复写、结论不翻）、config、登记表、settings 备份；连它们一起删用 --purge`);
+    say(`  留着：spool（还没发出去的数据）、${kept} 个会话已写入的 event_id 清单与拒绝判定（重装后不重复写、结论不翻）、config、上报 token、登记表、settings 备份；连它们一起删用 --purge`);
   }
   say('  被观测的仓里本来就没写过东西，不用还原');
 }
 
 // ---- projects ----
-function pickProjects() {
+async function pickProjects() {
   const cands = candidateProjects();
   if (cands.length === 0) { say(`  没在 ${claudeProjects()} 下找到用过 Claude Code 的 git 仓；在要采的仓里跑 ${VT_HOME}/bin/vibetrail projects add`); return; }
   say('用过 Claude Code 的仓（按最近活跃排，✓ = 已登记）：');
   cands.forEach((x, i) => say(`  ${String(i + 1).padStart(2)}. ${vtRegistered(x.p) ? '✓' : ' '} ${x.p}   （${x.n} 个会话，最近 ${fmtEpoch(x.mt)}）`));
-  process.stdout.write('输编号登记，编号前加 - 去掉（空格分隔，如 2 -1），a 全部登记，直接回车不改：');
-  let ans = '';
-  try { ans = fs.readFileSync(0, 'utf8').split('\n')[0] ?? ''; } catch { ans = ''; }
+  let ans = (await ask('输编号登记，编号前加 - 去掉（空格分隔，如 2 -1），a 全部登记，直接回车不改：')) ?? '';
   ans = ans.trim();
   if (!ans) { say(''); return; }
   if (ans === 'a' || ans === 'A') ans = cands.map((_, i) => String(i + 1)).join(' ');
@@ -451,7 +545,7 @@ function pickProjects() {
   say(`  新登记 ${added} 个，去掉 ${removed} 个`);
 }
 
-export function cmdProjects(argv) {
+export async function cmdProjects(argv) {
   const sub = argv[0] ?? 'list';
   if (sub === 'list') {
     let names = []; try { names = fs.readdirSync(path.join(VT_HOME, 'projects')).sort(); } catch {}
@@ -486,7 +580,7 @@ export function cmdProjects(argv) {
     } else if (k > 0) {
       say(`  它已采、还没发出去的 ${k} 块还在 spool，将来 push 时照样发；不想发：vibetrail projects remove ${m} --drop`);
     }
-  } else if (sub === 'pick') pickProjects();
+  } else if (sub === 'pick') await pickProjects();
   else die('projects 只认 list / add / remove / pick');
 }
 
@@ -805,6 +899,12 @@ export async function cmdDoctor() {
   const ep = vtConf('endpoint', '');
   if (ep) ok(`端点：${ep}`);
   else say('  · 端点没配置：只落本机 spool、不发（push 还没做，DESIGN §4）');
+  const tok = vtToken();
+  if (tok) {
+    let mode = 0; try { mode = fs.statSync(tokenPath()).mode & 0o777; } catch {}
+    if (mode & 0o077) note(`上报 token 文件别人也能读（权限 ${mode.toString(8)}）——chmod 600 ${tokenPath()}`);
+    else ok(`上报 token 已填（${maskToken(tok)}）`);
+  } else say(`  · 没填上报 token：联调阶段服务端记到默认用户，正式接入前要填（${VT_HOME}/bin/vibetrail token）`);
 
   say('');
   if (fatal) { say('✗ 有致命项，采集当前不工作'); return 1; }
@@ -815,6 +915,7 @@ export async function cmdDoctor() {
 export const USAGE = `vibetrail：机器级安装、登记与本地查看（DESIGN §5）
 
   vibetrail init [--scope project|user] [--events auto|core|all]
+  vibetrail token [--status | --clear]
   vibetrail uninstall [--purge]
   vibetrail projects [list | add [目录] | remove [目录] [--drop] | pick]
   vibetrail list
@@ -828,9 +929,10 @@ export async function cli(argv) {
   const cmd = argv[0] ?? '';
   const rest = argv.slice(1);
   switch (cmd) {
-    case 'init': cmdInit(rest); return 0;
+    case 'init': await cmdInit(rest); return 0;
+    case 'token': return await cmdToken(rest);
     case 'uninstall': cmdUninstall(rest); return 0;
-    case 'projects': cmdProjects(rest); return 0;
+    case 'projects': await cmdProjects(rest); return 0;
     case 'list': cmdList(); return 0;
     case 'show': cmdShow(rest); return 0;
     case 'sync': cmdSync(); return 0;

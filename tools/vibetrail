@@ -1,15 +1,24 @@
 #!/bin/sh
 # vibetrail CLI 的包装（DESIGN D12）：找到 node，把参数原样转给 vibetrail.mjs。
 # 与 vibetrail-hook 同一套找法：config 里记的 node 优先，其次 PATH。
-# 与 vibetrail-hook 不同的是，CLI 是人手跑的，找不到 node 就明说，不静默退出。
+# 与 vibetrail-hook 不同的是，CLI 是人手跑的，找不到 node、版本不够就明说，不静默退出。
+# 版本门槛只在这里查（node --version 很快）：hook 每次触发都多起一个进程不值，init 记下的 node 已经查过，doctor 复查。
+# config 里记的 node 版本不够（换过 nvm / volta 之后常见）就退到 PATH 里的，否则重跑 init 也绕不出来。
 # 固定 C locale：解析一律按 C（bash 3.2 的变量名坑，见 old/jq/vibetrail 头部）
 export LC_ALL=C
 SELF=$(cd "$(dirname "$0")" && pwd)
 VT_HOME=${VIBETRAIL_HOME:-$HOME/.vibetrail}
+node_major(){ v=$("$1" --version 2>/dev/null); v=${v#v}; v=${v%%.*}; case $v in ''|*[!0-9]*) echo 0;; *) echo "$v";; esac; }
 NODE=$(sed -n 's/^node=//p' "$VT_HOME/config" 2>/dev/null | tail -1)
-[ -n "$NODE" ] && [ -x "$NODE" ] || NODE=$(command -v node 2>/dev/null)
+if [ -z "$NODE" ] || [ ! -x "$NODE" ] || [ "$(node_major "$NODE")" -lt 20 ]; then
+    NODE=$(command -v node 2>/dev/null)
+fi
 if [ -z "$NODE" ]; then
     printf '✗ 没找到 node（vibetrail 的运行时要 node ≥ 20）。装好 node 后重跑 vibetrail init\n' >&2
+    exit 1
+fi
+if [ "$(node_major "$NODE")" -lt 20 ]; then
+    printf '✗ node 版本太低：%s 是 %s，vibetrail 要 node ≥ 20。升级后重跑 vibetrail init\n' "$NODE" "$("$NODE" --version 2>/dev/null)" >&2
     exit 1
 fi
 exec "$NODE" "$SELF/vibetrail.mjs" "$@"

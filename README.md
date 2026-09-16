@@ -33,13 +33,17 @@ vibetrail init（每台机器一次）
 
 简明步骤与数据路径见 [DEMO.md](DEMO.md)。
 
+**使用前的准备**（详见 [DEMO.md §0](DEMO.md)）：**node ≥ 20**（运行时唯一的依赖，`node -v` 查）；git；Claude Code（CLI 或 desktop，实测 2.1.260～2.1.270）；
+macOS（Linux 没测过，Windows 不支持）；hook 没被 `disableAllHooks` / 企业托管的 `allowManagedHooksOnly` 关掉（装完 `vibetrail doctor` 会查）；
+上报 token 联调阶段可以不填，`init` 在终端里会问一次。只有跑演示与测试才要 `jq`，测试里的 schema 校验另要 `python3` + `jsonschema`。
+
 先在沙箱里看一遍（临时目录，不碰真实的 `~/.claude` 与 `~/.vibetrail`；回放一段示例会话，第 1 轮中途真的提交一次）：
 
 ```bash
 bash experiments/collect-demo/demo.sh
 ```
 
-在自己机器上装（在哪个目录跑都行，不会登记任何仓；默认 scope=project，只采登记过的仓），再选要采的仓：
+在自己机器上装（在哪个目录跑都行，不会登记任何仓；默认 scope=project，只采登记过的仓；在终端里跑会问一次上报 token，回车跳过），再选要采的仓：
 
 ```bash
 bash tools/vibetrail init
@@ -56,7 +60,7 @@ bash tools/vibetrail init
 ```
 
 - `vibetrail list` 列出 spool 里的每个块文件，文件在 `~/.vibetrail/spool/<项目>/<会话>/*.jsonl`，每行一条协议事件，直接 `cat` 就能看。
-- `vibetrail doctor` 自检；`vibetrail uninstall` 卸载（只去掉 settings 里自己的条目，spool 留着，`--purge` 才全删）。
+- `vibetrail token` 填或换上报 token（不回显，存 `~/.vibetrail/token`，权限 600）；`vibetrail doctor` 自检；`vibetrail uninstall` 卸载（只去掉 settings 里自己的条目，spool 留着，`--purge` 才全删）。
 - 什么时候出现什么：说一句话就有 `turn.start`（带 HEAD）；模型答完（Stop）后，这一轮的 `turn.end`（状态、用量、本轮 commit）、每次模型调用的 `message.assistant` 与每次工具调用的 `tool.end`（trace，不带正文，DESIGN D8）、分歧事件一起落盘。
   Stop hook 触发就是模型答完，当场写（Claude Code 自己的答完标记 `stop_hook_summary` 已落盘就按它关，desktop 2.1.270 实测与 Stop 同一秒；没有才按 Stop 关）；别的 Stop hook 把这次 Stop 拦下时，模型补完再 Stop 会再写一条更新的（DESIGN D7）。
   你按停止打断的轮要等下一个 hook 才写（打断没有 hook，desktop 实测）；打断正在跑的工具按有没有弹过权限框分成「按停止打断工具」与「拒绝」（DESIGN D9）。

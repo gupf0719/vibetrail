@@ -37,6 +37,10 @@ export function vtConf(key, dflt = '') {
   for (const line of txt.split('\n')) if (line.startsWith(key + '=')) v = line.slice(key.length + 1);
   return v === '' ? dflt : v;
 }
+// 上报 token（push 时放进 Onepaas-Api-Access-Token 请求头，服务端按它认人）。单独一个文件、权限 600，不放 config——
+// config 常被整份贴出来问问题；用户 09-16 要 init 引导填
+export const tokenPath = () => path.join(VT_HOME, 'token');
+export const vtToken = () => (readText(tokenPath()) || '').trim();
 export const vtSha = (s) => sha1(Buffer.from(String(s), 'utf8')).slice(0, 16);
 export const vtSlug = (p) => String(p).replace(/[^A-Za-z0-9]/g, '-');
 export const vtRealpath = (p) => { try { return fs.realpathSync(p); } catch { return p; } };

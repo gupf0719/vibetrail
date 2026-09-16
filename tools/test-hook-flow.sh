@@ -2,7 +2,7 @@
 # 回归：hook 分发入口 + 分歧一路挂 hook（TODO G7 第 2 步）。用 experiments/collect-demo/scenario.json 在临时目录里真实回放：
 # 临时 git 仓当被观测项目，临时目录当 ~/.vibetrail 与 ~/.claude/projects，逐步追加 transcript、逐个触发 hook。
 # 断言：A4 未登记零写入；登记后 spool == 对最终 transcript 的一次全量映射；stdout 永远为空、exit 0；重复触发不重复写；
-# 锁被占时跳过、之后补上；半行等写完再读；文件被重写后不重复；打断后没有 Stop 也不漏；子 agent（起止与「写完了」看父会话里的信号，还在跑的不写半截调用）；只挂 5 个 hook（退役事件不做事、init 清旧条目）；回放副本；SessionStart 补做别的会话；scope=user；压缩时重写的旧工具结果不重发 tool.end；连续调用的请求开始；init 重跑不动 settings；K7 分拒绝与按停止；内部 agent、API 重试、origin.kind、轮里插话；项目级多仓各记各的、projects pick。
+# 锁被占时跳过、之后补上；半行等写完再读；文件被重写后不重复；打断后没有 Stop 也不漏；子 agent（起止与「写完了」看父会话里的信号，还在跑的不写半截调用）；只挂 5 个 hook（退役事件不做事、init 清旧条目）；上报 token（init 引导、不回显、600）与终端里的交互输入；回放副本；SessionStart 补做别的会话；scope=user；压缩时重写的旧工具结果不重发 tool.end；连续调用的请求开始；init 重跑不动 settings；K7 分拒绝与按停止；内部 agent、API 重试、origin.kind、轮里插话；项目级多仓各记各的、projects pick。
 # 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
 # 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
 export LC_ALL=C
@@ -559,6 +559,91 @@ jq --arg hk "$H/.vibetrail/bin/vibetrail-hook" '.hooks.CwdChanged = [{hooks: [{t
 o=$(hcli doctor)
 check "doctor：还挂着旧事件（CwdChanged）→ 提示重跑 init，不算致命" \
     'printf "%s" "$o" | grep -q "还挂着已不用的事件：CwdChanged" && ! printf "%s" "$o" | grep -q "缺核心事件"'
+
+echo "════ 19. 上报 token（用户 09-16：init 要引导填）：不在终端里只提示；vibetrail token 存成 600、不回显；终端里 init 问一次，回车 / Ctrl-C 跳过 ════"
+TK=$T/token-home; mkdir -p "$TK/.claude" "$TK/projects/$(vt_slug "$REPO")"
+printf '{"type":"user","uuid":"tk1","cwd":"%s","sessionId":"tk","timestamp":"2026-09-16T00:00:00.000Z","message":{"role":"user","content":"hi"}}\n' "$REPO" > "$TK/projects/$(vt_slug "$REPO")/tk.jsonl"
+tkcli(){ ( cd "$REPO" && VIBETRAIL_HOME=$TK/.vibetrail VIBETRAIL_CLAUDE_SETTINGS=$TK/.claude/settings.json VIBETRAIL_CLAUDE_PROJECTS=$TK/projects bash "$SELF/vibetrail" "$@" 2>&1 ); }
+TOKV=onepaas-test-token-0123456789abcdef
+o=$(tkcli init --events all </dev/null)
+check "不在终端里跑 init：不问，只提示用 vibetrail token 填，不建 token 文件" \
+    'printf "%s" "$o" | grep -q "还没填上报 token" && printf "%s" "$o" | grep -q "vibetrail token" && [ ! -e "$TK/.vibetrail/token" ]'
+o=$(printf '%s\n' "$TOKV" | tkcli token)
+check "vibetrail token 从管道读：存成 600，输出里只有末 4 位、没有 token 本身" \
+    '[ "$(cat "$TK/.vibetrail/token")" = "$TOKV" ] && [ "$(stat -f %Lp "$TK/.vibetrail/token" 2>/dev/null || stat -c %a "$TK/.vibetrail/token")" = 600 ] && ! printf "%s" "$o" | grep -qF "$TOKV" && printf "%s" "$o" | grep -q "末 4 位 cdef"'
+o=$(printf 'has space in it\n' | tkcli token); rc=$?
+check "不像 token 的（中间有空格）：不存、退出码非零，原来的 token 不动" '[ "$rc" != 0 ] && [ "$(cat "$TK/.vibetrail/token")" = "$TOKV" ]'
+o=$(tkcli doctor)
+check "doctor：报 token 已填，只露末 4 位" 'printf "%s" "$o" | grep -q "上报 token 已填（末 4 位 cdef）" && ! printf "%s" "$o" | grep -qF "$TOKV"'
+chmod 644 "$TK/.vibetrail/token"; o=$(tkcli doctor); chmod 600 "$TK/.vibetrail/token"
+check "doctor：token 文件别人也能读 → 告警" 'printf "%s" "$o" | grep -q "别人也能读（权限 644）"'
+o=$(tkcli init --events all </dev/null)
+check "已经填过：init 说已填，不再提示去填" 'printf "%s" "$o" | grep -q "上报 token 已填（末 4 位 cdef" && ! printf "%s" "$o" | grep -q "还没填上报 token"'
+tkcli uninstall >/dev/null
+check "uninstall（不带 --purge）留着 token，与 config 一样" '[ "$(cat "$TK/.vibetrail/token")" = "$TOKV" ]'
+o=$(tkcli token --clear)
+check "token --clear 删掉" '[ ! -e "$TK/.vibetrail/token" ]'
+
+# 终端里：用 pty 真跑（python3 自带 pty 模块）。场景：init 问 token 时粘贴、token 时按 Ctrl-C、projects pick 敲编号回车
+tk_pty(){ python3 - "$SELF" "$TK" "$REPO" "$TOKV" "$1" <<'PYEOF'
+import os, pty, select, subprocess, sys, time
+self_dir, home, repo, tok, scenario = sys.argv[1:6]
+env = dict(os.environ, VIBETRAIL_HOME=home + '/.vibetrail', VIBETRAIL_CLAUDE_SETTINGS=home + '/.claude/settings.json',
+           VIBETRAIL_CLAUDE_PROJECTS=home + '/projects')
+args, wait_for, key = {
+    'init': (['init', '--events', 'all'], '直接回车跳过：', tok.encode() + b'\r'),
+    'ctrlc': (['token'], '直接回车跳过：', b'\x03'),
+    'pick': (['projects', 'pick'], '直接回车不改：', b'1\r'),
+}[scenario]
+m, s = pty.openpty()
+p = subprocess.Popen(['bash', self_dir + '/vibetrail', *args], stdin=s, stdout=s, stderr=s, env=env, cwd=repo, close_fds=True)
+os.close(s)
+out, sent, end = b'', False, time.time() + 30
+while time.time() < end:
+    if not sent and wait_for.encode() in out:
+        os.write(m, key); sent = True
+    r, _, _ = select.select([m], [], [], 0.05)
+    if r:
+        try:
+            chunk = os.read(m, 65536)
+        except OSError:
+            chunk = b''
+        if not chunk:
+            break
+        out += chunk
+if p.poll() is None:
+    p.kill(); print('还没退出（输入之后卡住）'); sys.exit(1)
+text = out.decode('utf8', 'replace')
+f = home + '/.vibetrail/token'
+if not sent:
+    print('没等到提示'); sys.exit(1)
+if p.returncode != 0:
+    print('退出码', p.returncode); sys.exit(1)
+if scenario == 'init':
+    ok = os.path.exists(f) and open(f).read().strip() == tok and tok not in text and (os.stat(f).st_mode & 0o777) == 0o600
+elif scenario == 'ctrlc':
+    ok = '没填，跳过' in text and not os.path.exists(f)
+else:
+    ok = '✓ 登记' in text or '已经登记过' in text
+if not ok:
+    print(text[-600:]); sys.exit(1)
+PYEOF
+}
+check "终端里 init：没填过就问一次，粘贴的 token 不回显，存成 600" 'tk_pty init'
+tkcli token --clear >/dev/null
+check "终端里 vibetrail token 按 Ctrl-C：当跳过，退出码 0，不留文件（终端复原由 node 退出时做）" 'tk_pty ctrlc'
+check "终端里 projects pick 敲编号回车就返回（原先读到 EOF 才返回，要再按 Ctrl-D）" 'tk_pty pick'
+
+echo "════ 20. 使用前的准备（DEMO §0）：node 版本不够时命令行明说；config 里记的旧 node 不够就退到 PATH 里的 ════"
+NV=$T/node-gate; mkdir -p "$NV/old/bin" "$NV/vt"
+printf '#!/bin/sh\necho v18.19.0\n' > "$NV/old/bin/node"; chmod +x "$NV/old/bin/node"
+o=$(VIBETRAIL_HOME=$NV/vt PATH="$NV/old/bin:/usr/bin:/bin" sh "$SELF/vibetrail" version 2>&1); rc=$?
+check "PATH 里只有 node 18：退出码非零，说清是哪个 node、什么版本、要 ≥ 20" \
+    '[ "$rc" != 0 ] && printf "%s" "$o" | grep -q "node 版本太低" && printf "%s" "$o" | grep -q "v18.19.0" && printf "%s" "$o" | grep -q "≥ 20"'
+printf 'node=%s\n' "$NV/old/bin/node" > "$NV/vt/config"
+o=$(VIBETRAIL_HOME=$NV/vt sh "$SELF/vibetrail" version 2>&1); rc=$?
+check "config 里记的是旧 node、PATH 里有新的：退到 PATH 里的照常跑（否则重跑 init 也绕不出来）" \
+    '[ "$rc" = 0 ] && printf "%s" "$o" | grep -q "^vibetrail "'
 
 check "测试没有动真实的 settings.json（${REAL_SETTINGS}）" '[ "$( { cat "$REAL_SETTINGS" 2>/dev/null || true; } | cksum)" = "$REAL_SUM" ]'
 echo
