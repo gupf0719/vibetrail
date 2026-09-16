@@ -615,6 +615,7 @@ D2 的「正文与指针分开」在 D5 后反转：分歧事件自带能判责�
 | 进程包装 / fetch 拦截器（Pilot 的路） | desktop 不经过 wrapper；拦截器要注入进程；system prompt 新版 transcript 自带（§6.3） |
 | 改造 Pilot 而不是自建 hook | 用户 09-11「肯定不止靠pilot，我知道他做不到，要改造」；默认自建，U7 |
 | Go 单二进制 | 没有常驻进程，不值一个新栈（§5.3） |
+| 本机「最近一次 hook 触发」心跳检查 | 用来兜住 doctor 查不出来的静默不触发（安全模式、`--settings` 指了别的文件、settings 被别的工具覆盖）。用户 09-16 否掉：云端按「登记过的仓该有数据却一直没有」同样能发现，本机不值得再定一个「多久算不对劲」的阈值。文件里读得出来的那两个开关（`disableAllHooks`、托管设置的 `allowManagedHooksOnly`）doctor 已经查，读不出来的在同一条消息里明说 |
 | 一起采 Codex / Cursor | Pilot 三分之一代码在适配各家格式；地基（hook 热加载、`CLAUDE_CODE_SESSION_ID` 等于文件名）是 Claude Code 特有的实测。默认不做，U9 |
 
 ## 8. 审计记录线（不属 G7，仍在仓内）
