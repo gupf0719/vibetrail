@@ -24,8 +24,12 @@ const canon = (o) => JSON.stringify(o, sortKeys);         // 按 JSON 语义比�
 const stamp = () => new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
 const SETTINGS = () => settingsPath();
 
-const CORE_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'SubagentStop', 'SessionEnd', 'Notification'];
-const OPT_EVENTS = ['SubagentStart', 'PostToolUseFailure', 'PermissionRequest', 'PermissionDenied', 'StopFailure', 'InstructionsLoaded', 'CwdChanged'];
+// 用户 09-16 定只挂 5 个（原来 13 个）：子 agent 起止、工具失败、分类器拦下、API 出错结束一轮、CLAUDE.md 加载、切目录
+// 都改在 Stop 时从 transcript 推（map.mjs），Notification 原来只是个「空闲了读一遍」的触发器。
+// PermissionRequest 留着：弹没弹权限框 transcript 里没有，K7 靠它分「人拒绝」与「按停止打断工具」
+const CORE_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd'];
+const OPT_EVENTS = ['PermissionRequest'];
+const RETIRED_EVENTS = ['SubagentStart', 'SubagentStop', 'PostToolUseFailure', 'Notification', 'PermissionDenied', 'StopFailure', 'InstructionsLoaded', 'CwdChanged'];
 export const RUNTIME_FILES = ['vibetrail', 'vibetrail.mjs', 'lib/map.mjs', 'lib/hook.mjs', 'lib/cli.mjs', 'vibetrail-hook'];
 
 function confSet(key, value) {                            // 改或加一行，别的行原样留着
@@ -127,18 +131,14 @@ const hookScriptOf = (cmd) => {
   const m = String(cmd).match(/^[^']*'(.*)' [A-Za-z]+(?: 2>\/dev\/null \|\| true)?$/);
   return m ? m[1].replace(/'\\''/g, "'") : '';
 };
-function entriesJson(events) {                            // 每个事件一个 matcher 组（Notification 两组），timeout 显式给（§3.4）
+function entriesJson(events) {                            // 每个事件一个组，timeout 显式给（§3.4）
   const out = [];
   for (const ev of events) {
-    let t = 30, a = true, ms = [''];
+    let t = 30, a = true;
     if (ev === 'SessionStart' || ev === 'UserPromptSubmit') { t = 10; a = false; }
     else if (ev === 'SessionEnd') { t = 5; a = false; }
-    else if (ev === 'Stop' || ev === 'SubagentStop') { t = 120; }
-    else if (ev === 'Notification') { ms = ['permission_prompt', 'idle_prompt']; }
-    for (const m of ms) {
-      out.push({ event: ev, group: { ...(m ? { matcher: m } : {}),
-        hooks: [{ type: 'command', command: hookCommand(ev), timeout: t, ...(a ? { async: true } : {}) }] } });
-    }
+    else if (ev === 'Stop') { t = 120; }
+    out.push({ event: ev, group: { hooks: [{ type: 'command', command: hookCommand(ev), timeout: t, ...(a ? { async: true } : {}) }] } });
   }
   return out;
 }
@@ -356,7 +356,7 @@ export function cmdInit(argv) {
   }
   if (mode === 'auto') {
     if (bins.length) say(`  按本机 ${bins.length} 个 Claude Code 可执行文件都认识的事件登记（--events all 可全登记）`);
-    else say('  ⚠ 没找到 Claude Code 可执行文件，只登记老版本也有的 6 个事件');
+    else say(`  ⚠ 没找到 Claude Code 可执行文件，只登记老版本也有的 ${CORE_EVENTS.length} 个事件`);
   }
   if (written) {
     if (existed) say(`  改之前的备份在 ${VT_HOME}/backup/${fs.existsSync(path.join(VT_HOME, 'backup', 'settings.json.before-vibetrail')) ? '（装之前的原样是 settings.json.before-vibetrail）' : ''}`);
@@ -538,7 +538,8 @@ function describe(e) {
       + (c.started_at ? '  用时 ' + dur((secs(e.occurred_at) - secs(c.started_at)) * 1000) : '');
   } else if (t === 'tool.end') {
     const m = { success: '成功', error: '出错', cancelled: '取消' };
-    d = `${e.payload.tool_name} ${m[e.payload.status.code] ?? e.payload.status.code}  ${dur(e.payload.duration_ms)}`;
+    const k = { reported: '（工具自报）', wall_clock: '（按记录时间差，含等待）' }[e.extensions?.['vibetrail.duration_kind']] ?? '';
+    d = `${e.payload.tool_name} ${m[e.payload.status.code] ?? e.payload.status.code}  ${dur(e.payload.duration_ms)}${e.payload.duration_ms !== undefined ? k : ''}`;
   } else if (t === 'message.user' || t === 'message.assistant') d = `“${clip(e.payload.text, 100)}”`;
   else if (t === 'subagent.start') d = `${e.payload.agent_type} 父=${e.parent_agent_instance_id}`;
   else if (t === 'subagent.end') d = `${e.payload.status.code} ${e.payload.agent_type ?? ''}`;
@@ -667,8 +668,11 @@ export async function cmdDoctor() {
     if (have.length === 0) bad(`${SETTINGS()} 里没有 vibetrail 的 hook 条目——跑 vibetrail init`);
     else {
       const missEv = CORE_EVENTS.filter((e) => !have.includes(e));
-      if (missEv.length === 0) ok(`hook 条目：${have.join(' ')} `);
+      const cur = have.filter((e) => !RETIRED_EVENTS.includes(e));
+      if (missEv.length === 0) ok(`hook 条目：${cur.join(' ')} `);
       else bad(`hook 条目缺核心事件: ${missEv.join(' ')}`);
+      const retired = have.filter((e) => RETIRED_EVENTS.includes(e));
+      if (retired.length) note(`还挂着已不用的事件：${retired.join(' ')}——重跑 vibetrail init 会去掉（不去也不会多发，hook 入口直接忽略；只是每次白起一个进程）`);
       const wrong = [];
       for (const gs of Object.values(s.hooks ?? {})) for (const g of Array.isArray(gs) ? gs : []) for (const h of g?.hooks ?? []) {
         if (!isOurs(h)) continue;
@@ -722,7 +726,7 @@ export async function cmdDoctor() {
       const [evn, m] = key.split('\u001f');
       note(`hook 重复挂载：${evn}${m === '*' ? '' : ' matcher=' + m}（${v.n} 条：${v.files.map((f) => f.replace((process.env.HOME || '') + '/', '~/')).join('、')}）`);
     }
-    say('     · 后果：这些事件每触发一次跑两遍 hook；session.start / session.end / ext.claude.* 会各多一份（它们的幂等键里带时间），');
+    say('     · 后果：这些事件每触发一次跑两遍 hook；session.start / session.end / ext.claude.permission_request 会各多一份（它们的幂等键里带时间），');
     say('       轮次与分歧那几类按 event_id 在本机 ids 就挡掉了。去掉多余的那份（init 只往 HOME 写，项目级的是人手加的）');
   }
 

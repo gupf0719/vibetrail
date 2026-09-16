@@ -189,6 +189,7 @@ export function mapRecords(records, args) {
     sid, project_id, workspace_id, parent_instance = 'main',
     start_line = 1, from_line = 0, meta = null,
     seen_uuids = [], hook_turns = {}, hook_perms = [], perm_since = '', perm_periods = null, split_decisions = {},
+    known_agents = {}, done_ts = null,
     close_last = '', stop_turn = '', turns = true,
     vt_version = '', rule_version = 'diverge-v1', capture_content = '1',
   } = args;
@@ -216,6 +217,7 @@ export function mapRecords(records, args) {
     turn_usage: {}, turn_model: null,
     seen: {}, denials: [], stops: [], perm_mode: null, pending: null,
     pturn: null, call: null, calls_seen: [], prev_end_ts: null,
+    agents: { launched: {}, done: {}, calls_done: {} }, agent_started: false, last_cwd: null,
     last_ts: null, version: null, entrypoint: null, branch: null,
     ledger: {
       in: {}, in_total: {}, out: {}, events: {}, absorbed_for_tool_use: 0, unpaired_for_tool_use: 0,
@@ -227,8 +229,8 @@ export function mapRecords(records, args) {
 
   // ---- 事件骨架 ----
   const dropContent = (e) => {
-    if (isObj(e.payload)) { delete e.payload.text; delete e.payload.input; delete e.payload.output; }
-    if (isObj(e.extensions)) delete e.extensions['vibetrail.reasoning'];
+    if (isObj(e.payload)) { delete e.payload.text; delete e.payload.input; delete e.payload.output; delete e.payload.last_message; }
+    if (isObj(e.extensions)) for (const k of ['vibetrail.reasoning', 'vibetrail.system_prompt', 'vibetrail.instructions']) delete e.extensions[k];
     delete e.raw;
     e.content_state = 'omitted';
     e.extensions = { ...e.extensions, 'vibetrail.content_dropped': 'size' };
@@ -377,11 +379,13 @@ export function mapRecords(records, args) {
       : pt.summary !== null ? 'stop_hook_summary'
       : stop !== null ? 'hook_stop'
       : nz(h.fail) != null ? 'stop_failure'
+      : pt.api_error ? 'api_error'
       : pt.end_turn ? 'end_turn' : 'none';
     const status = pt.denied ? { code: 'denied', category: 'denial', detail: 'turn stopped by a permission denial' }
       : (pt.summary && pt.summary.prevented === true) ? { code: 'hook_stopped', category: 'cancellation', detail: cut(alt(pt.summary.reason, ''), 4096) }
       : (evidence === 'stop_hook_summary' || evidence === 'hook_stop' || evidence === 'end_turn') ? { code: 'completed', category: 'success' }
       : evidence === 'stop_failure' ? { code: codeify(alt(isObj(h.fail) ? nz(h.fail.error) : null, 'error')), category: 'error' }
+      : evidence === 'api_error' ? { code: codeify(pt.api_error.error), category: 'error' }
       : { code: 'unknown', category: 'unknown' };
     const usage = usageOf(pt.usage), vcs = vcsMerge(st.branch, isObj(tend) ? tend.vcs : null), commits = commitsOf(tend);
     const e = base(s, 'turn.end', null, alt(pt.summary ? pt.summary.ts : null, alt(stop ? stop.at : null, pt.last_ts)), { id: pt.id, inferred: false });
@@ -617,7 +621,11 @@ export function mapRecords(records, args) {
   const turnAccumulate = (r, s) => {
     if (st.pturn === null || !mainRec(r)) return;
     st.pturn.last_ts = alt(s.ts, st.pturn.last_ts);
+    // 09-16 起不再挂 StopFailure：API 出错结束一轮时，Claude Code 会写一条 model=<synthetic> 的回复，带 isApiErrorMessage 与
+    // error（rate_limit / authentication_failed / server_error…，本机 107 条）。之后又有真回复就说明缓过来了，清掉
+    if (r.type === 'assistant' && r.isApiErrorMessage === true) st.pturn.api_error = { error: isStr(r.error) && r.error !== '' ? r.error : 'api_error', status: nz(r.apiErrorStatus) };
     if (s.type === 'assistant' && !s.synthetic) {
+      st.pturn.api_error = null;
       st.pturn.stop_blocked = false; st.pturn.block_pending = false; st.pturn.answered = true;
       st.pturn.end_turn = (isObj(r.message) ? nz(r.message.stop_reason) : null) === 'end_turn';
     }
@@ -666,13 +674,24 @@ export function mapRecords(records, args) {
         : { code: 'error', category: 'error' };
       if (status === null) continue;
       const b1 = epochms(s.ts), a1 = epochms(tu.ts);
-      const d = (b1 !== null && a1 !== null && b1 >= a1) ? b1 - a1 : null;
+      const wall = (b1 !== null && a1 !== null && b1 >= a1) ? b1 - a1 : null;
+      // K15②（用户 09-16 定）：Claude Code 自己记了耗时的工具（WebSearch 的 durationSeconds、WebFetch 的 durationMs、
+      // Agent 的 totalDurationMs）用它，标 reported；别的只能「结果记录时间 − 调用记录时间」，标 wall_clock——
+      // 后台工具、续接后才落盘的结果都会把等待算进去（本机最长 64 小时），协议要求推断出来的耗时必须标明。不设阈值。
+      // Pilot 不算耗时（只发调用、结果两个时刻），teamai 不记工具耗时。一条记录夹多个工具结果时 toolUseResult 分不清是谁的，只用 wall_clock
+      const tres = isObj(r.toolUseResult) && c.filter((x) => isObj(x) && x.type === 'tool_result').length === 1 ? r.toolUseResult : null;
+      const rep = !tres ? null : typeof tres.durationMs === 'number' ? tres.durationMs
+        : typeof tres.durationSeconds === 'number' ? tres.durationSeconds * 1000
+        : typeof tres.totalDurationMs === 'number' ? tres.totalDurationMs : null;
+      const d = rep !== null && rep >= 0 ? Math.round(rep) : wall;
+      const dkind = rep !== null && rep >= 0 ? 'reported' : wall !== null ? 'wall_clock' : null;
       const t = { id: alt(st.turn, s.uuid), inferred: st.turn === null };
       const e = base(s, 'tool.end', s.uuid, s.ts, t);
       e.content_state = capContent ? 'included' : 'omitted';
       e.payload = { tool_name: tu.name, call_id: cid, status, ...opt('duration_ms', d),
         ...(capContent ? opt('output', alt(nz(b.content), alt(nz(b.output), alt(nz(b.result), null)))) : {}) };
       e.provenance = { kind: 'transcript', rule_version: 'call-v1', source_event_id: s.uuid };
+      if (dkind) e.extensions = { ...e.extensions, 'vibetrail.duration_kind': dkind };
       e._key = cid + '|tool.end';
       emit(e);
     }
@@ -761,6 +780,151 @@ export function mapRecords(records, args) {
     emit(e);
   };
 
+  // ---- 09-16 起不再单独挂 hook 的几类：改从 transcript 推（用户 09-16 定只留 5 个 hook） ----
+  // 这个会话里已知的子 agent：{agentId: {call_id, agent_type}}，调用方从 subagents/*.meta.json 与 state 里记下的后台启动凑出来
+  const knownAgents = {};
+  if (isArr(known_agents)) { for (const a of known_agents) if (isStr(a)) knownAgents[a] = {}; }
+  else if (isObj(known_agents)) { for (const [k, v] of Object.entries(known_agents)) knownAgents[k] = isObj(v) ? v : {}; }
+  const agentByCall = {};
+  for (const [aid, v] of Object.entries(knownAgents)) if (isStr(v.call_id)) agentByCall[v.call_id] = aid;
+  const agentKnown = (aid) => knownAgents[aid] !== undefined || st.agents.launched[aid] !== undefined;
+  const agentTypeOf = (aid, cid) => {
+    const k = alt(nz(st.agents.launched[aid]), alt(nz(knownAgents[aid]), {}));
+    if (isStr(k.agent_type) && k.agent_type !== '') return k.agent_type;
+    const tu = isStr(cid) ? nz(st.tools[cid]) : null;
+    if (tu && isObj(tu.input) && isStr(tu.input.subagent_type) && tu.input.subagent_type !== '') return tu.input.subagent_type;
+    return tu && (tu.name === 'Agent' || tu.name === 'Task') ? 'general-purpose' : 'unknown';   // Agent 工具不给 subagent_type 时 Claude Code 用 general-purpose
+  };
+  const markDone = (m, k, ts) => { if (isStr(k) && isStr(ts)) m[k] = jqMax([nz(m[k]), ts]); };
+  const agentEndStatus = (v) => {
+    const x = String(alt(v, 'completed'));
+    if (x === 'completed') return { code: 'completed', category: 'success' };
+    if (/^(stopped|killed|cancelled|canceled|interrupted|aborted)$/.test(x)) return { code: codeify(x), category: 'cancellation' };
+    return { code: codeify(x), category: 'error' };
+  };
+  // 与原先 SubagentStart / SubagentStop hook 发的 _key 相同（<agentId>|subagent.start / end）：同一个 agent 只算一条，哪一路先到用哪一路
+  const agentStart = (s, aid, parent, agentType, callId, task) => {
+    const e = base(s, 'subagent.start', s.uuid, s.ts, turnOf(s));
+    e.agent_instance_id = aid;
+    e.parent_agent_instance_id = parent;
+    delete e.parent_call_id; if (isStr(callId)) e.parent_call_id = callId;
+    e.payload = { agent_type: agentType, ...opt('task', isStr(task) && task !== '' ? task : null) };
+    e.provenance = { kind: 'transcript', rule_version: 'turn-v1', source_event_id: s.uuid };
+    e._key = `${aid}|subagent.start`;
+    emit(e);
+  };
+  const agentEnd = (s, aid, status, agentType, callId, lastMessage, facts) => {
+    const e = base(s, 'subagent.end', s.uuid, s.ts, turnOf(s));
+    e.agent_instance_id = aid;
+    e.parent_agent_instance_id = alt(s.agent, 'main');             // 收到完成信号的这份文件就是父实例
+    delete e.parent_call_id; if (isStr(callId)) e.parent_call_id = callId;
+    const withMsg = capContent && isStr(lastMessage) && lastMessage.length > 0;
+    e.payload = { agent_type: agentType, status: agentEndStatus(status), ...(withMsg ? { last_message: lastMessage } : {}) };
+    if (withMsg) e.content_state = 'included';
+    e.provenance = { kind: 'transcript', rule_version: 'turn-v1', source_event_id: s.uuid };
+    if (isObj(facts) && Object.keys(facts).length > 0) e.extensions = { ...e.extensions, 'vibetrail.agent': facts };
+    e._key = `${aid}|subagent.end`;
+    emit(e);
+    // 完成信号的时间：子 agent 文件最后一条不晚于它，才算写完（SendMessage 续上的 agent 之后还会往文件里写，要等下一个信号）
+    markDone(st.agents.done, aid, s.ts);
+    markDone(st.agents.calls_done, callId, s.ts);
+  };
+  const textOfBlocks = (v) => (isStr(v) ? v : isArr(v) ? v.filter(isObj).filter((b) => b.type === 'text').map((b) => alt(nz(b.text), '')).join('\n') : '');
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const subagentSignals = (r, s) => {
+    // 起（同步派出的）：子 agent 文件的第一条记录；类型、任务描述、派它的调用取同名 meta.json
+    if (s.agent !== null && !st.agent_started && start_line === 1) {
+      st.agent_started = true;
+      agentStart(s, s.agent, parent_instance, alt(isObj(meta) && isStr(meta.agentType) && meta.agentType !== '' ? meta.agentType : null, 'unknown'),
+        isObj(meta) ? nz(meta.toolUseId) : null, isObj(meta) ? nz(meta.description) : null);
+    }
+    const results = r.type === 'user' && isArr(msgOf(r).content) ? msgOf(r).content.filter((b) => isObj(b) && b.type === 'tool_result') : [];
+    const tres = isObj(r.toolUseResult) ? r.toolUseResult : null;
+    const one = results.length === 1 ? results[0] : null;
+    const launched = tres && (tres.isAsync === true || tres.status === 'async_launched');
+    // 起（后台派出的）：调用结果当场返回 isAsync + agentId。本机 265 次后台 agent 没有自己的 transcript 文件，只能从这里知道它起了；
+    // 记进账本，调用方存进 state，之后的 <task-notification> 靠它认出是子 agent
+    if (one && launched && isStr(tres.agentId)) {
+      const cid = nz(one.tool_use_id);
+      const atype = agentTypeOf(tres.agentId, cid);
+      st.agents.launched[tres.agentId] = { ...opt('call_id', cid), agent_type: atype };
+      const tu = isStr(cid) ? nz(st.tools[cid]) : null;
+      agentStart(s, tres.agentId, alt(s.agent, 'main'), atype, cid, alt(nz(tres.description), tu && isObj(tu.input) ? nz(tu.input.description) : null));
+    }
+    // 止（同步的）：调用结果里有 agentId、status、耗时、token
+    if (one && tres && !launched && isStr(tres.agentId)) {
+      const facts = { ...opt('duration_ms', num(tres.totalDurationMs)), ...opt('total_tokens', num(tres.totalTokens)), ...opt('tool_use_count', num(tres.totalToolUseCount)) };
+      const cid = nz(one.tool_use_id);
+      agentEnd(s, tres.agentId, tres.status, alt(isStr(tres.agentType) && tres.agentType !== '' ? tres.agentType : null, agentTypeOf(tres.agentId, cid)),
+        cid, textOfBlocks(tres.content), facts);
+    }
+    // 同步的 agent 出错（本机 15 次）拿不到 agentId，只能按 meta 里的 toolUseId 认：记下完成时间，子 agent 文件好收尾
+    for (const b of results) {
+      const cid = nz(b.tool_use_id);
+      if (!isStr(cid) || agentByCall[cid] === undefined) continue;
+      if (b.is_error === true || (one && !launched)) markDone(st.agents.calls_done, cid, s.ts);
+    }
+    // 止（后台的）：<task-notification>，<task-id> 就是 agentId（偶尔一条带几个），<status> completed / failed / killed / stopped。
+    // 两种形态：模型空闲时是 origin.kind = task-notification 的 user 记录，忙时是 queued_command 附件（本机 511 条，只 33 个两边都有）
+    const notif = r.type === 'user' && isObj(r.origin) && r.origin.kind === 'task-notification' ? anyText(r).join('\n')
+      : (r.type === 'attachment' && isObj(r.attachment) && r.attachment.type === 'queued_command'
+        && r.attachment.commandMode === 'task-notification' && isStr(r.attachment.prompt)) ? r.attachment.prompt : null;
+    if (notif !== null) {
+      const ids = [...notif.matchAll(/<task-id>\s*([^<\s]+)\s*<\/task-id>/g)].map((m) => m[1]);
+      const status = notif.match(/<status>\s*([^<\s]+)\s*<\/status>/)?.[1] ?? null;
+      if (status !== null) {
+        const callId = notif.match(/<tool-use-id>\s*([^<\s]+)\s*<\/tool-use-id>/)?.[1] ?? null;
+        const result = notif.match(/<result>([\s\S]*?)<\/result>/)?.[1]?.trim() ?? null;
+        const usage = notif.match(/<usage>([\s\S]*?)<\/usage>/)?.[1] ?? '';
+        const tag = (n) => { const m = usage.match(new RegExp(`<${n}>\\s*(\\d+)\\s*</${n}>`)); return m ? Number(m[1]) : null; };
+        for (const aid of ids) {
+          // 后台 shell 任务、监视器也发这种通知：只认子 agent（有它的 meta / 文件，或记下过它的后台启动）
+          if (!agentKnown(aid)) continue;
+          const k = alt(nz(st.agents.launched[aid]), alt(nz(knownAgents[aid]), {}));
+          const cid = ids.length === 1 ? alt(callId, nz(k.call_id)) : nz(k.call_id);
+          const facts = ids.length === 1 ? { ...opt('duration_ms', tag('duration_ms')), ...opt('total_tokens', alt(tag('subagent_tokens'), tag('total_tokens'))), ...opt('tool_use_count', tag('tool_uses')) } : {};
+          agentEnd(s, aid, status, agentTypeOf(aid, cid), cid, ids.length === 1 ? result : null, facts);
+        }
+      }
+    }
+  };
+  // 切目录：相邻两条记录的 cwd 不同（本机 21 份文件里 326 次）
+  const cwdChange = (r, s) => {
+    if (!isStr(r.cwd)) return;
+    if (st.last_cwd !== null && r.cwd !== st.last_cwd) {
+      const e = base(s, 'ext.claude.cwd_changed', s.uuid, s.ts, turnOf(s));
+      e.payload = { old_cwd: st.last_cwd, new_cwd: r.cwd };
+      e.provenance = { kind: 'transcript', rule_version: 'ext-v1', source_event: 'cwd', source_event_id: s.uuid };
+      e._key = `${s.uuid}|cwd_changed`;
+      emit(e);
+    }
+    st.last_cwd = r.cwd;
+  };
+  // CLAUDE.md 加载：attachment/instructions 带 files[{path, type, content}] 与 reason（session_start / compaction），比原先的 hook 还全
+  const instructionsLoaded = (r, s) => {
+    if (!(r.type === 'attachment' && isObj(r.attachment))) return;
+    const at = r.attachment;
+    // 读到子目录里的文件时顺带加载的 CLAUDE.md 是 nested_memory（本机 7 条，content 是 {path, type, content}）
+    const nested = at.type === 'nested_memory' && isObj(at.content);
+    if (!(at.type === 'instructions' || nested)) return;
+    const files = nested ? [{ path: alt(nz(at.content.path), nz(at.path)), type: nz(at.content.type), content: nz(at.content.content) }]
+      : (isArr(at.files) ? at.files : []).filter(isObj);
+    const e = base(s, 'ext.claude.instructions_loaded', s.uuid, s.ts, turnOf(s));
+    e.payload = {
+      files: files.map((f) => ({ ...opt('path', nz(f.path)), ...opt('type', nz(f.type)),
+        ...(isStr(f.content) ? { bytes: Buffer.byteLength(f.content, 'utf8'), sha256: crypto.createHash('sha256').update(f.content, 'utf8').digest('hex') } : {}) })),
+      ...opt('reason', nested ? 'nested_traversal' : nz(at.reason)), ...(at.changed === true ? { changed: true } : {}),
+      ...opt('removed', isArr(at.removed) ? at.removed : null),
+    };
+    if (capContent) {
+      e.content_state = 'included';
+      e.extensions = { ...e.extensions, 'vibetrail.instructions': files.filter((f) => isStr(f.content)).map((f) => ({ path: nz(f.path), content: f.content })) };
+    }
+    e.provenance = { kind: 'transcript', rule_version: 'ext-v1', source_event: 'instructions', source_event_id: s.uuid };
+    e._key = `${s.uuid}|instructions_loaded`;
+    emit(e);
+  };
+
   // ---- 一条记录 ----
   const step = (r) => {
     st.out = [];
@@ -796,7 +960,7 @@ export function mapRecords(records, args) {
     turnAccumulate(r, s);
     turnStopMarker(r, s);
     promptSnapshot(r, s);
-    if (turns) traceStep(r, s);
+    if (turns) { traceStep(r, s); subagentSignals(r, s); cwdChange(r, s); instructionsLoaded(r, s); }
     if (ln > from_line) st.ledger.sources.push([s.uuid, ln]);
     if (isStr(r.toolUseResult) && r.toolUseResult.startsWith('User rejected tool use')) {
       st.ledger.sentinel.marker += 1;
@@ -816,8 +980,11 @@ export function mapRecords(records, args) {
 
   const atEof = () => {
     st.out = [];
-    if (turns && st.call !== null && close_last !== '') flushCall(true);
-    if (close_last === '' || st.pturn === null) return;
+    // if_done：子 agent 文件。09-16 起不挂 SubagentStop，「写完了」改由父文件里的完成信号判：
+    // 信号的时间不早于这份文件最后一条记录才把最后一次调用写出（SendMessage 续上的 agent 之后还会写，要等下一个信号）
+    const flush = close_last === 'if_done' ? (isStr(done_ts) && isStr(st.last_ts) && done_ts >= st.last_ts) : close_last !== '';
+    if (turns && st.call !== null && flush) flushCall(true);
+    if (close_last === '' || close_last === 'if_done' || st.pturn === null) return;
     const nullRec = { agent: null, uuid: null, ts: null };
     if (close_last === 'stop') {
       if (st.pturn.id === stop_turn && st.pturn.answered && !st.pturn.block_pending && !st.pturn.stop_blocked) closeTurn('stop', nullRec, true);
@@ -835,7 +1002,7 @@ export function mapRecords(records, args) {
     sources: st.ledger.sources,
     turns: { ...st.ledger.turns, open: alt(st.pturn ? st.pturn.id : null, null), open_line: alt(st.pturn ? st.pturn.line : null, null),
       closed: alt(st.pturn ? st.pturn.closed : null, false), model: alt(st.pturn ? st.pturn.model : null, st.turn_model) },
-    trace: { call_open: st.call !== null },
-    split_decisions_new: splitsNew, split_reused: splitsReused };
+    trace: { call_open: st.call !== null }, last_ts: st.last_ts,
+    split_decisions_new: splitsNew, split_reused: splitsReused, agents: st.agents };
   return { events, ledger };
 }

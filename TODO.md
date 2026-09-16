@@ -60,6 +60,9 @@
 - [x] commit ↔ 轮次推导（09-15）：轮起 / 轮止快照（`state/<sid>/turns/`），本轮 commit = `rev-list 起..止` + 本轮 reflog 里新建的提交，归因看 transcript 里 agent 有没有跑
   `git commit`（DESIGN §3.5）；demo.sh 第 1 轮中途真的提交一次，turn.end 带上了。原写的「`vibetrail show` 按 commit 查改走它」不做了：按 commit 查是读取端的事（D5），
   现在的 `vibetrail show` 是本地预览。Bash stdout 里短 sha 的旁证还没做。
+- [x] **只挂 5 个 hook**（2026-09-16，DESIGN D13，关 OPEN-ISSUES U16、K15②）：SessionStart / UserPromptSubmit / Stop / SessionEnd / PermissionRequest；子 agent 起止（同步的调用结果、后台的启动结果与 `<task-notification>`）、API 出错结束的轮、
+  CLAUDE.md 加载、切目录改在 Stop 时从 transcript 推，子 agent「写完了」看父会话里完成信号的时间（`state/<sid>/agents.json`）；`tool.end` 标耗时来源。init 只登 5 个、清旧条目，doctor 点名还挂着的旧事件；
+  test-map 198 项、test-hook-flow 94 项、test-extract 27 项全绿，五处变异各自变红。
 - [x] **运行时换成 Node 单文件 `.mjs`、去掉 jq**（2026-09-16 移植完毕：①`0bb521b` ②`b3985be` ③`e404b67` ④`aeda56b`；test-map / test-hook-flow / test-extract 全绿，12 份真实 transcript 7 万条事件两引擎逐条一致，106 MB 那份 63 s → 21 s）（用户 09-16 定：「node硬依赖问题不大，把jq全换成mjs吧」；DESIGN D12；换语言不换设计，磁盘上的一切不变）。
   **jq 版从此冻结**：只修 🔴，别的会话别再往 `.jq` 里加东西。估两到三天。
   1. 布局：`tools/vibetrail-hook`、`tools/vibetrail` 各留一个 ≤ 30 行的 POSIX sh 包装（读 config 的 `node=`，`exec node vibetrail.mjs …`；找不到 node 也 exit 0、只记 errors.log）；

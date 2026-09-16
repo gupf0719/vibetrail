@@ -319,6 +319,133 @@ check "K13: 打断的 turn.end 带 vibetrail.closed_by = interrupt 与 vibetrail
      and .[0].extensions["vibetrail.closed_by"] == "interrupt" and .[0].extensions["vibetrail.stops"] == 0' "$T/k13.events"
 check "K13: 打断后这一轮算关了（账本 turns.closed = true）" '.[0].turns.open == "ip1" and .[0].turns.closed == true' "$T/k13.ledger"
 
+echo "════ 8. 只挂 5 个 hook（用户 09-16 定）：原来靠另外 8 个 hook 给的，改从 transcript 推 ════"
+: > "$T/m8.err"
+M8(){ # 没给 --ledger 时账本打到 stderr：补一个 /dev/null，stderr 里只剩真的报错
+    case " $* " in *" --ledger "*) bash "$SELF/vibetrail-map" "$@" 2>>"$T/m8.err";; *) bash "$SELF/vibetrail-map" "$@" --ledger /dev/null 2>>"$T/m8.err";; esac; }
+AT(){ # AT <uuid> <parent> <sessionId> <promptId> <attachment JSON> [额外字段 JSON]：造一条 attachment 记录
+    local x=${6:-}; [ -n "$x" ] || x='{}'
+    jq -n -c --arg u "$1" --arg p "$2" --arg s "$3" --arg q "$4" --argjson a "$5" --argjson x "$x" \
+      '{type: "attachment", uuid: $u, parentUuid: $p, sessionId: $s, promptId: $q, attachment: $a, isSidechain: false, cwd: "/tmp/fx",
+        version: "2.1.266", entrypoint: "cli", gitBranch: "main", timestamp: "2026-09-16T02:00:00.000Z"} + $x'
+}
+TS(){ printf '{"timestamp":"2026-09-16T%s"}' "$1"; }
+with_ts(){ jq -c --arg t "2026-09-16T$1" '. + {timestamp: $t}'; }
+
+# StopFailure → API 出错结束一轮：Claude Code 写一条 model=<synthetic> 的回复，带 isApiErrorMessage 与 error（本机 162 条）
+APIERR='{"isApiErrorMessage":true,"error":"rate_limit","apiErrorStatus":429,"message":{"id":"syn1","model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"API Error: Rate limit reached"}]}}'
+{ R a1 ""  s8a ap1 user '"跑一下"'
+  R a2 a1  s8a ap1 assistant '[]' "$(AM am1 '[{"type":"text","text":"我先跑"}]')"
+  R a3 a2  s8a ap1 assistant '[]' "$APIERR"
+  R a4 a3  s8a ap2 user '"继续"'
+  R a5 a4  s8a ap2 assistant '[]' "$(printf '%s' "$APIERR" | jq -c '.message.id = "syn2" | .error = "server_error" | .apiErrorStatus = 500')"
+  R a6 a5  s8a ap2 assistant '[]' "$(AM am2 '[{"type":"text","text":"缓过来了"}]')"
+} > "$T/m8a.jsonl"
+M8 "$T/m8a.jsonl" --sid s8a --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 --close-last session_end > "$T/m8a.events"
+check "API 出错结束的一轮：turn.end 状态是那个错误（rate_limit / error），证据 api_error" \
+    '[.[] | select(.type=="turn.end" and .turn_id=="ap1")] | length == 1 and .[0].payload.status == {code: "rate_limit", category: "error"}
+     and .[0].extensions["vibetrail.end_evidence"] == "api_error"' "$T/m8a.events"
+check "出错之后同一轮里又有真回复：算缓过来了，照常 completed" \
+    '[.[] | select(.type=="turn.end" and .turn_id=="ap2")] | .[0].payload.status.code == "completed"' "$T/m8a.events"
+
+# InstructionsLoaded → attachment/instructions（files[{path,type,content}]、reason）与 nested_memory；CwdChanged → 相邻记录的 cwd 变了
+{ R c1 ""  s8c cp1 user '"看看子目录"'
+  AT c2 c1 s8c cp1 '{"type":"instructions","files":[{"path":"/tmp/fx/CLAUDE.md","type":"Project","content":"# 规则\n别删文件"},{"path":"/Users/x/.claude/memory/MEMORY.md","type":"AutoMem","content":"- 记住的事"}],"reason":"session_start"}'
+  R c3 c2  s8c cp1 assistant '[]' "$(AM cm1 '[{"type":"text","text":"进去看"}]' | jq -c '. + {cwd: "/tmp/fx/sub"}')"
+  AT c4 c3 s8c cp1 '{"type":"nested_memory","path":"/tmp/fx/sub/CLAUDE.md","content":{"path":"/tmp/fx/sub/CLAUDE.md","type":"Project","content":"子目录规则"}}' '{"cwd":"/tmp/fx/sub"}'
+  R c5 c4  s8c cp2 user '"回去"'
+} > "$T/m8c.jsonl"
+M8 "$T/m8c.jsonl" --sid s8c --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 1 > "$T/m8c.events"
+check "CLAUDE.md 加载：一次 attachment 一条 ext.claude.instructions_loaded，payload 逐个文件 path / type / bytes / sha256，正文进 extensions" \
+    '[.[] | select(.type=="ext.claude.instructions_loaded")] as $l | ($l | length) == 2
+     and ($l[0].payload.files | map(.path)) == ["/tmp/fx/CLAUDE.md","/Users/x/.claude/memory/MEMORY.md"] and $l[0].payload.reason == "session_start"
+     and ($l[0].payload.files[0] | .type == "Project" and .bytes == ("# 规则\n别删文件" | utf8bytelength) and (.sha256 | test("^[0-9a-f]{64}$")))
+     and $l[0].extensions["vibetrail.instructions"][1].content == "- 记住的事" and $l[0].content_state == "included"
+     and $l[1].payload.reason == "nested_traversal" and $l[1].payload.files[0].path == "/tmp/fx/sub/CLAUDE.md"
+     and all($l[]; .provenance.source_event == "instructions")' "$T/m8c.events"
+check "切目录：cwd 变一次一条 ext.claude.cwd_changed（第一条记录不算），old / new 都对" \
+    '[.[] | select(.type=="ext.claude.cwd_changed") | [.payload.old_cwd, .payload.new_cwd, .provenance.source_event_id, .provenance.source_event]]
+     == [["/tmp/fx","/tmp/fx/sub","c3","cwd"],["/tmp/fx/sub","/tmp/fx","c5","cwd"]]' "$T/m8c.events"
+schema_check < "$T/m8c.events" > "$T/schema.m8c" && ok || ko "instructions / cwd: $(cat "$T/schema.m8c")"
+M8 "$T/m8c.jsonl" --sid s8c --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 > "$T/m8c0.events"
+check "CLAUDE.md 加载：关掉全采只剩元数据（路径、大小、哈希），不带正文" \
+    '[.[] | select(.type=="ext.claude.instructions_loaded")] | length == 2 and all(.[]; .extensions["vibetrail.instructions"] == null and .content_state == null)' "$T/m8c0.events"
+
+# K15②：tool.end 的耗时标来源——工具自报的（WebFetch durationMs、WebSearch durationSeconds、Agent totalDurationMs）标 reported，
+# 别的是「结果记录 − 调用记录」标 wall_clock；一条记录夹几个工具结果时 toolUseResult 分不清是谁的，只用 wall_clock
+{ R d1 ""  s8d dp1 user '"查资料"' "$(TS 03:00:00.000Z)"
+  R d2 d1  s8d dp1 assistant '[]' "$(AM dm1 '[{"type":"tool_use","id":"toolu_f","name":"WebFetch","input":{"url":"https://example.com"}}]' | with_ts 03:00:01.000Z)"
+  R d3 d2  s8d dp1 user '[{"type":"tool_result","tool_use_id":"toolu_f","content":"ok"}]' '{"timestamp":"2026-09-16T03:00:09.000Z","toolUseResult":{"code":200,"durationMs":1234,"url":"https://example.com"}}'
+  R d4 d3  s8d dp1 assistant '[]' "$(AM dm2 '[{"type":"tool_use","id":"toolu_s","name":"WebSearch","input":{"query":"x"}},{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"sleep 1"}}]' | with_ts 03:00:10.000Z)"
+  R d5 d4  s8d dp1 user '[{"type":"tool_result","tool_use_id":"toolu_s","content":"r"}]' '{"timestamp":"2026-09-16T03:00:12.500Z","toolUseResult":{"query":"x","durationSeconds":2.25}}'
+  R d6 d5  s8d dp1 user '[{"type":"tool_result","tool_use_id":"toolu_b","content":"done"}]' '{"timestamp":"2026-09-16T03:00:15.000Z","toolUseResult":{"stdout":"done","interrupted":false}}'
+  R d7 d6  s8d dp1 assistant '[]' "$(AM dm3 '[{"type":"tool_use","id":"toolu_g1","name":"Grep","input":{"pattern":"a"}},{"type":"tool_use","id":"toolu_g2","name":"Glob","input":{"pattern":"*"}}]' | with_ts 03:00:16.000Z)"
+  R d8 d7  s8d dp1 user '[{"type":"tool_result","tool_use_id":"toolu_g1","content":"a"},{"type":"tool_result","tool_use_id":"toolu_g2","content":"b"}]' '{"timestamp":"2026-09-16T03:00:20.000Z","toolUseResult":{"durationMs":5}}'
+} > "$T/m8d.jsonl"
+M8 "$T/m8d.jsonl" --sid s8d --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 > "$T/m8d.events"
+check "K15②: 耗时与来源——WebFetch 1234 reported、WebSearch 2250 reported、Bash 5000 wall_clock、夹在一条里的两个 4000 wall_clock" \
+    '[.[] | select(.type=="tool.end") | [.payload.call_id, .payload.duration_ms, .extensions["vibetrail.duration_kind"]]]
+     == [["toolu_f",1234,"reported"],["toolu_s",2250,"reported"],["toolu_b",5000,"wall_clock"],["toolu_g1",4000,"wall_clock"],["toolu_g2",4000,"wall_clock"]]' "$T/m8d.events"
+
+# SubagentStart / SubagentStop → 父文件里的信号：同步 agent 的调用结果（agentId、status、耗时、token），后台 agent 的启动结果（isAsync）
+# 与之后的 <task-notification>（user 记录或 queued_command 附件）。子 agent 靠 subagents/*.meta.json 与这次读到的后台启动认
+PJ=$T/m8-proj; SA=$PJ/s8s/subagents; mkdir -p "$SA"
+printf '%s\n' '{"agentType":"Explore","description":"找入口","spawnDepth":1,"toolUseId":"toolu_sync"}' > "$SA/agent-asy1.meta.json"
+printf '%s\n' '{"agentType":"general-purpose","description":"会出错","spawnDepth":1,"toolUseId":"toolu_err"}' > "$SA/agent-aerr1.meta.json"
+{ R u1 ""  s8s sp1 user '"找入口"' '{"agentId":"asy1","isSidechain":true,"timestamp":"2026-09-16T04:00:01.000Z"}'
+  R u2 u1  s8s sp1 assistant '[]' "$(AM um1 '[{"type":"text","text":"入口在 main.go"}]' | jq -c '. + {agentId: "asy1", isSidechain: true, timestamp: "2026-09-16T04:00:05.000Z"}')"
+} > "$SA/agent-asy1.jsonl"
+NOTE_BG='<task-notification>
+<task-id>abg1</task-id>
+<tool-use-id>toolu_bg</tool-use-id>
+<status>killed</status>
+<summary>Agent "后台跑测试" was stopped</summary>
+<result>跑到一半被停了</result>
+<usage><subagent_tokens>900</subagent_tokens><tool_uses>7</tool_uses><duration_ms>60000</duration_ms></usage>
+</task-notification>'
+{ R m1 ""  s8s sp1 user '"派两个 agent"' "$(TS 04:00:00.000Z)"
+  R m2 m1  s8s sp1 assistant '[]' "$(AM mm1 '[{"type":"tool_use","id":"toolu_sync","name":"Agent","input":{"subagent_type":"Explore","description":"找入口","prompt":"找"}},{"type":"tool_use","id":"toolu_bg","name":"Agent","input":{"description":"后台跑测试","prompt":"跑","run_in_background":true}},{"type":"tool_use","id":"toolu_err","name":"Agent","input":{"description":"会出错","prompt":"x"}}]' | with_ts 04:00:00.500Z)"
+  R m3 m2  s8s sp1 user '[{"type":"tool_result","tool_use_id":"toolu_bg","content":"Async agent launched"}]' '{"timestamp":"2026-09-16T04:00:01.000Z","toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"abg1","description":"后台跑测试","outputFile":"/tmp/abg1.output"}}'
+  R m4 m3  s8s sp1 user '[{"type":"tool_result","tool_use_id":"toolu_sync","content":[{"type":"text","text":"入口在 main.go"}]}]' '{"timestamp":"2026-09-16T04:00:06.000Z","toolUseResult":{"status":"completed","agentId":"asy1","agentType":"Explore","content":[{"type":"text","text":"入口在 main.go"}],"totalDurationMs":4000,"totalTokens":1500,"totalToolUseCount":3}}'
+  R m5 m4  s8s sp1 user '[{"type":"tool_result","tool_use_id":"toolu_err","is_error":true,"content":"Agent failed"}]' '{"timestamp":"2026-09-16T04:00:07.000Z","toolUseResult":"Error: Agent failed"}'
+  AT m6 m5 s8s sp1 '{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification>\n<task-id>bsh1</task-id>\n<status>completed</status>\n<summary>Background command done</summary>\n</task-notification>"}' "$(TS 04:00:08.000Z)"
+  R m7 m6  s8s sp2 user "$(jq -n -c --arg t "$NOTE_BG" '$t')" '{"origin":{"kind":"task-notification"},"timestamp":"2026-09-16T04:01:00.000Z"}'
+} > "$PJ/s8s.jsonl"
+M8 "$PJ/s8s.jsonl" --sid s8s --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 1 --ledger "$T/m8s.ledger" > "$T/m8s.events"
+check "子 agent（同步）：调用结果出 subagent.end——实例 asy1、父 main、派它的调用、类型、最后的回答、耗时 / token / 工具次数" \
+    '[.[] | select(.type=="subagent.end" and .agent_instance_id=="asy1")] | length == 1
+     and (.[0] | .parent_agent_instance_id == "main" and .parent_call_id == "toolu_sync" and .payload.agent_type == "Explore"
+       and .payload.status == {code: "completed", category: "success"} and .payload.last_message == "入口在 main.go"
+       and .extensions["vibetrail.agent"] == {duration_ms: 4000, total_tokens: 1500, tool_use_count: 3})' "$T/m8s.events"
+check "子 agent（后台）：启动结果出 subagent.start（没给 subagent_type 就是 general-purpose），通知出 subagent.end（killed 算取消，带用量）" \
+    '([.[] | select(.type=="subagent.start" and .agent_instance_id=="abg1")] | length == 1 and (.[0] | .parent_call_id == "toolu_bg"
+       and .payload == {agent_type: "general-purpose", task: "后台跑测试"}))
+     and ([.[] | select(.type=="subagent.end" and .agent_instance_id=="abg1")] | length == 1 and (.[0] | .parent_call_id == "toolu_bg"
+       and .payload.status == {code: "killed", category: "cancellation"} and .payload.last_message == "跑到一半被停了"
+       and .extensions["vibetrail.agent"] == {duration_ms: 60000, total_tokens: 900, tool_use_count: 7}))' "$T/m8s.events"
+check "后台 shell 任务的通知不算子 agent；同步 agent 出错拿不到 agentId，不凭空发 subagent.end" \
+    'all(.[]; (.agent_instance_id | IN("bsh1","aerr1")) | not)' "$T/m8s.events"
+check "账本：后台启动记下（之后的通知靠它认），完成信号按 agentId 与调用 id 各记一份（出错的同步 agent 靠调用 id）" \
+    '.[0].agents.launched == {abg1: {call_id: "toolu_bg", agent_type: "general-purpose"}}
+     and .[0].agents.done == {asy1: "2026-09-16T04:00:06.000Z", abg1: "2026-09-16T04:01:00.000Z"}
+     and .[0].agents.calls_done == {toolu_sync: "2026-09-16T04:00:06.000Z", toolu_err: "2026-09-16T04:00:07.000Z", toolu_bg: "2026-09-16T04:01:00.000Z"}' "$T/m8s.ledger"
+schema_check < "$T/m8s.events" > "$T/schema.m8s" && ok || ko "subagent: $(cat "$T/schema.m8s")"
+M8 "$PJ/s8s.jsonl" --sid s8s --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 > "$T/m8s0.events"
+check "子 agent：关掉全采不带最后的回答" 'all(.[] | select(.type=="subagent.end"); .payload.last_message == null)' "$T/m8s0.events"
+# 子 agent 文件自己：第一条记录出 subagent.start（类型、任务、派它的调用取 meta）；最后一次调用只在完成信号不早于文件最后一条时写出
+M8 "$SA/agent-asy1.jsonl" --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 --close-last if_done --done-ts 2026-09-16T04:00:06.000Z \
+    --ledger "$T/m8u.ledger" > "$T/m8u.events"
+check "子 agent 文件：第一条记录出 subagent.start，父 main、派它的调用与类型取 meta；完成信号晚于最后一条 → 最后一次调用写出" \
+    '([.[] | select(.type=="subagent.start")] | length == 1 and (.[0] | .agent_instance_id == "asy1" and .parent_agent_instance_id == "main"
+       and .parent_call_id == "toolu_sync" and .payload == {agent_type: "Explore", task: "找入口"}))
+     and ([.[] | select(.type=="message.assistant")] | length == 1)' "$T/m8u.events"
+M8 "$SA/agent-asy1.jsonl" --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 --close-last if_done --done-ts 2026-09-16T04:00:03.000Z \
+    --ledger "$T/m8v.ledger" > "$T/m8v.events"
+check "子 agent 文件：完成信号早于最后一条（SendMessage 续上后又写了）→ 那次调用先不写出" \
+    '[.[] | select(.type=="message.assistant")] | length == 0' "$T/m8v.events"
+check "子 agent 文件：账本带最后一条记录的时间（hook 拿它判续上之后有没有新的完成信号）" '.[0].last_ts == "2026-09-16T04:00:05.000Z" and .[0].trace.call_open == true' "$T/m8v.ledger"
+if [ ! -s "$T/m8.err" ]; then ok; else ko "这一节的映射有报错: $(head -c 300 "$T/m8.err")"; fi
+
 echo
 [ "$skipped_schema" -gt 0 ] && echo "  ⚠ 本机 python3 没有 jsonschema，协议 schema 校验跳过 $skipped_schema 处（pip install jsonschema 后重跑）"
 if [ $fail -eq 0 ]; then echo "  ✅ $pass/$pass 通过"; else echo "  ❌ $fail 失败 / $pass 通过"; exit 1; fi

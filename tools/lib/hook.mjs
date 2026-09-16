@@ -241,6 +241,43 @@ export function vtSplitsSave(sid, fresh) {
   } catch { return false; }
 }
 
+// 09-16 起子 agent 的起止从 transcript 推（不再挂 SubagentStart / SubagentStop）。state/<sid>/agents.json：
+//   launched   {agentId: {call_id, agent_type}}：后台派出的 agent（很多没有自己的 transcript 文件，之后的 <task-notification> 靠它认）
+//   done       {agentId: 完成信号的时间}；calls_done {派它的调用 id: 调用结果的时间}（同步 agent 出错时拿不到 agentId）
+// 只增不改：launched 已有的不覆盖，时间取较晚的
+const objOr = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
+export const vtAgents = (sid) => {
+  const v = objOr(readJson(path.join(VT_HOME, 'state', sid, 'agents.json'), {}));
+  return { launched: objOr(v.launched), done: objOr(v.done), calls_done: objOr(v.calls_done) };
+};
+export function vtAgentsSave(sid, fresh) {
+  if (!fresh) return true;
+  const cur = vtAgents(sid);
+  let changed = false;
+  for (const [k, v] of Object.entries(objOr(fresh.launched))) if (!(k in cur.launched)) { cur.launched[k] = v; changed = true; }
+  for (const m of ['done', 'calls_done']) {
+    for (const [k, v] of Object.entries(objOr(fresh[m]))) if (typeof v === 'string' && !(typeof cur[m][k] === 'string' && cur[m][k] >= v)) { cur[m][k] = v; changed = true; }
+  }
+  if (!changed) return true;
+  try { vtWriteJson(path.join(VT_HOME, 'state', sid, 'agents.json'), cur); return true; } catch { return false; }
+}
+// 一个 subagents 目录里的子 agent：{agentId: {call_id, agent_type}}（meta.json 里的 toolUseId / agentType；没有 meta 的只有 id）
+export function vtKnownAgents(subDir) {
+  const out = {};
+  let names = [];
+  try { names = fs.readdirSync(subDir); } catch { return out; }
+  for (const f of names.sort()) {
+    const m = f.match(/^agent-(.+)\.(jsonl|meta\.json)$/);
+    if (!m) continue;
+    out[m[1]] ||= {};
+    if (m[2] !== 'meta.json') continue;
+    const mm = objOr(readJson(path.join(subDir, f), {}));
+    if (typeof mm.toolUseId === 'string' && mm.toolUseId) out[m[1]].call_id = mm.toolUseId;
+    if (typeof mm.agentType === 'string' && mm.agentType) out[m[1]].agent_type = mm.agentType;
+  }
+  return out;
+}
+
 export function vtPruneRemoved() {             // projects remove --drop 挪出去的数据留一天
   const dir = path.join(VT_HOME, 'removed');
   if (!isDir(dir)) return;
@@ -287,6 +324,9 @@ const vcsOf = (v) => {
 const CAPABILITIES = ['session.start', 'session.end', 'turn.start', 'turn.end', 'subagent.start', 'subagent.end',
   'permission.decision', 'tool.request', 'tool.end', 'message.user', 'message.assistant', 'ext.claude'];
 
+// 09-16 起只挂 5 个 hook（用户定）：SessionStart / UserPromptSubmit / Stop / SessionEnd / PermissionRequest。
+// 原来的 SubagentStart / SubagentStop / PostToolUseFailure / Notification / PermissionDenied / StopFailure / InstructionsLoaded / CwdChanged
+// 能给的都改从 transcript 推（map.mjs），这里不再为它们出事件
 export function hookEvents(event, p, ctx) {    // → [事件…]（0 或 1 条），形状与 hook-events.jq 逐字段一致
   const { project_id, workspace_id, vt_version, agent_version, surface, now, vcs, extra = {} } = ctx;
   const hname = p.hook_event_name || event;
@@ -326,61 +366,15 @@ export function hookEvents(event, p, ctx) {    // → [事件…]（0 或 1 条�
         ...opt('claude.effort', p.effort?.level ?? null), ...opt('vibetrail.dirty_files', vcs?.dirty_files ?? null) };
       e._key = `${e.turn_id}|turn.start`;
       return [e];
-    case 'SubagentStop':
-      if (extra.internal === true) {
-        e = hdr(event, { agent_id: p.agent_id ?? 'unknown', internal: true });
-        e._key = `ext|SubagentStop|${p.agent_id ?? ''}|${now}`;
-        return [e];
-      }
-      // fallthrough 到 subagent.start / end
-    case 'SubagentStart': {
-      const aid = p.agent_id ?? 'unknown';
-      e = { ...b, type: event === 'SubagentStart' ? 'subagent.start' : 'subagent.end',
-        agent_instance_id: aid, parent_agent_instance_id: extra.parent_instance ?? 'main',
-        payload: { agent_type: p.agent_type ?? 'unknown', ...(event === 'SubagentStop' ? { status: { code: 'completed', category: 'success' } } : {}) },
-        ...opt('parent_call_id', extra.parent_call_id ?? null) };
-      withTurn(e);
-      e._key = `${aid}|${e.type}`;
-      return [e];
-    }
     case 'SessionEnd':
       e = { ...b, type: 'session.end', payload: { reason: codeify(p.reason ?? 'other'), status: { code: 'completed', category: 'success' } } };
       e.agent_instance_id = 'main';
       e.extensions = { ...e.extensions, ...opt('vibetrail.vcs', vcsOf(vcs)) };
       e._key = `session.end|${now}`;
       return [e];
-    case 'PostToolUseFailure':
-      e = hdr(event, { tool_use_id: p.tool_use_id ?? null, tool_name: p.tool_name ?? null,
-        ...opt('is_interrupt', p.is_interrupt ?? null), ...opt('duration_ms', p.duration_ms ?? null),
-        error_bytes: Buffer.byteLength(String(p.error ?? ''), 'utf8') });
-      e._key = `ext|PostToolUseFailure|${p.tool_use_id ?? now}`;
-      return [e];
     case 'PermissionRequest':
       e = hdr(event, { tool_name: p.tool_name ?? 'unknown', ...opt('permission_mode', p.permission_mode ?? null) });
       e._key = `ext|PermissionRequest|${p.tool_name ?? ''}|${now}`;
-      return [e];
-    case 'PermissionDenied':
-      e = hdr(event, { tool_use_id: p.tool_use_id ?? null, tool_name: p.tool_name ?? null,
-        ...opt('reason', [...String(p.reason ?? '')].slice(0, 1024).join('')) });
-      e._key = `ext|PermissionDenied|${p.tool_use_id ?? now}`;
-      return [e];
-    case 'StopFailure':
-      e = hdr(event, { error: String(p.error ?? 'unknown'), ...opt('error_details', [...String(p.error_details ?? '')].slice(0, 512).join('')) });
-      e._key = `ext|StopFailure|${now}`;
-      return [e];
-    case 'Notification':
-      e = hdr(event, { notification_type: p.notification_type ?? 'unknown' });
-      e._key = `ext|Notification|${now}`;
-      return [e];
-    case 'InstructionsLoaded':
-      e = hdr(event, { file_path: p.file_path ?? null, ...opt('memory_type', p.memory_type ?? null), ...opt('load_reason', p.load_reason ?? null),
-        ...opt('parent_file_path', p.parent_file_path ?? null), ...opt('trigger_file_path', p.trigger_file_path ?? null),
-        ...opt('sha256', extra.sha256 ?? null), ...opt('bytes', extra.bytes ?? null) });
-      e._key = `ext|InstructionsLoaded|${p.file_path ?? ''}|${now}`;
-      return [e];
-    case 'CwdChanged':
-      e = hdr(event, { old_cwd: p.old_cwd ?? null, new_cwd: p.new_cwd ?? null });
-      e._key = `ext|CwdChanged|${now}`;
       return [e];
     default:
       return [];
@@ -429,7 +423,10 @@ export function mapFile(file, opts) {
     sid, project_id, workspace_id, parent_instance = 'main', meta = null,
     start_line = 1, start_byte = null, from_line = 0, seenFile = '', hook_turns = {}, hook_perms = [],
     perm_since = '', perm_periods = null, split_decisions = {}, close_last = '', stop_turn = '', turns = true, capture_content = '1', vt_version = VT_RUNTIME_VERSION,
+    done_ts = null,
   } = opts;
+  // 这个会话已知的子 agent：没给就看同目录（子 agent 文件）或 <sid>/subagents（主文件）
+  const known_agents = opts.known_agents ?? vtKnownAgents(subdir || path.join(path.dirname(file), sid, 'subagents'));
   const total = fs.statSync(file).size;
 
   // 只读到最后一个换行符
@@ -488,7 +485,7 @@ export function mapFile(file, opts) {
     seen_uuids: seenFile && isFile(seenFile)
       ? readText(seenFile).split('\n').filter(Boolean).map((l) => { const [u, n] = l.split('\t'); return [u, Number(n)]; })
       : [],
-    hook_turns, hook_perms, perm_since, perm_periods, split_decisions, close_last, stop_turn, turns, vt_version, rule_version: 'diverge-v1', capture_content,
+    hook_turns, hook_perms, perm_since, perm_periods, split_decisions, known_agents, done_ts, close_last, stop_turn, turns, vt_version, rule_version: 'diverge-v1', capture_content,
   });
 
   // 下次的起读字节：checkpoint 行的偏移
@@ -506,6 +503,9 @@ export function mapFile(file, opts) {
 }
 
 // ---------- hook 分发（原 vibetrail-hook） ----------
+// CatchUp 是 vibetrail sync 用的内部事件，不是 Claude Code 的 hook
+export const HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd', 'PermissionRequest'];
+const HANDLED_EVENTS = new Set([...HOOK_EVENTS, 'CatchUp']);
 const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { } };
 
 export function runHook(event, payload) {
@@ -516,9 +516,10 @@ export function runHook(event, payload) {
   const tpath = String(p.transcript_path ?? '');
   const cwd = String(p.cwd ?? '');
   const promptId = String(p.prompt_id ?? '');
-  const agentId = String(p.agent_id ?? '');
   const source = String(p.source ?? '');
   const ev = p.hook_event_name && !event ? String(p.hook_event_name) : event;
+  // 退役的事件（没重跑 init 的旧条目）连门控里的 git 都不跑，直接走
+  if (!HANDLED_EVENTS.has(ev)) return;
 
   // ---- 门控（scope，DESIGN §5；G8） ----
   vtPruneRemoved();
@@ -545,22 +546,6 @@ export function runHook(event, payload) {
     if (!vtSpoolWrite(ctx.pkey, sid, 'hook-' + name.toLowerCase(), filled)) vtLogError(ev, sid, 'spool:hook-' + name.toLowerCase(), 1);
   };
   const extraModel = () => { const s = readJson(path.join(SD, 'session.json'), null); return s && s.model ? { model: s.model } : {}; };
-  const extraSubagent = () => {                  // 父实例与派生调用（被子 agent 派出的，父实例是 toolUseId 所在的兄弟文件）
-    const dir = path.join(path.dirname(tpath), sid, 'subagents');
-    const metaFile = path.join(dir, `agent-${agentId}.meta.json`);
-    const tid = readJson(metaFile, {})?.toolUseId ?? '';
-    let parent = 'main';
-    if (tid) {
-      let names = [];
-      try { names = fs.readdirSync(dir).filter((f) => /^agent-.*\.jsonl$/.test(f) && f !== `agent-${agentId}.jsonl`); } catch {}
-      for (const f of names.sort()) {
-        const txt = readText(path.join(dir, f));
-        if (txt && txt.includes(`"id":"${tid}"`)) { parent = f.replace(/^agent-/, '').replace(/\.jsonl$/, ''); break; }
-      }
-    }
-    return { parent_instance: parent, ...(tid ? { parent_call_id: tid } : {}) };
-  };
-
   // ---- 轮次证据 ----
   const closeGap = (turnId, snap, by) => {
     const sf = vtTurnFile(sid, turnId, 'start'), gf = vtTurnFile(sid, turnId, 'gap');
@@ -597,35 +582,40 @@ export function runHook(event, payload) {
     vtWriteJson(f, { turn_id: promptId, at: nowIso(), at_epoch: epochSec(), stops: n + 1,
       stop_hook_active: p.stop_hook_active === true, vcs: snap ?? null, ...(c ? { commits: c.commits, commit_method: c.method } : {}) });
   };
-  const turnFail = () => {
-    if (!promptId) return;
-    vtWriteJson(vtTurnFile(sid, promptId, 'fail'),
-      { turn_id: p.prompt_id ?? null, at: nowIso(), at_epoch: epochSec(), error: String(p.error ?? 'unknown') });
-  };
-
   // ---- 一份 transcript：映射 → 去重 → 写一块 spool → 推进 state ----
   const processFile = (s2, sd, f, name, close = '', stopTurn = '') => {
     let size;
     try { size = fs.statSync(f).size; } catch { return; }
     const stFile = path.join(sd, `${name}.json`), seenFile = path.join(sd, `${name}.seen`);
-    // 子 agent 文件只在它结束后才带 close_last（把最后一次调用写出）
+    // 子 agent 文件只在它结束后才把最后一次调用写出。结束信号（09-16 起）在父文件里：同步 agent 的调用结果、后台 agent 的
+    // <task-notification>，映射父文件时记进 agents.json；映射器拿它与这份文件最后一条记录的时间比（close_last = if_done）。
+    // <name>.done 是老版本 SubagentStop hook 留下的（记的是当时的文件大小），升级过渡期照认
+    const aid = name.replace(/^agent-/, '');
+    const subDir = path.dirname(f);
+    const known = name === 'main' || subDir.endsWith('/subagents') ? { ...vtKnownAgents(name === 'main' ? path.join(path.dirname(f), s2, 'subagents') : subDir) } : {};
+    for (const [k, v] of Object.entries(vtAgents(s2).launched)) known[k] = { ...objOr(v), ...objOr(known[k]) };
+    let doneTs = null;
     if (name !== 'main') {
+      const ag = vtAgents(s2);
+      const tid = known[aid]?.call_id;
+      doneTs = [ag.done[aid], tid ? ag.calls_done[tid] : null].filter((x) => typeof x === 'string').sort().pop() ?? null;
       if (!['session_end', 'resume', 'idle'].includes(close)) {
-        close = (readText(path.join(sd, `${name}.done`)) || '').trim() === String(size) ? 'stop' : '';
+        close = (readText(path.join(sd, `${name}.done`)) || '').trim() === String(size) ? 'stop' : doneTs ? 'if_done' : '';
       }
     }
     let ino = null; try { ino = fs.statSync(f).ino; } catch {}
-    let lines = 0, consumed = 0, ckl = 1, ckb = 0, fpOld = '', rewrites = 0, open = '', closed = false, callOpen = false;
+    let lines = 0, consumed = 0, ckl = 1, ckb = 0, fpOld = '', rewrites = 0, open = '', closed = false, callOpen = false, lastTs = null;
     if (isFile(stFile)) {
       const st = readJson(stFile, {});
       lines = st.lines ?? 0; consumed = st.consumed_bytes ?? 0; ckl = st.checkpoint_line ?? 1; ckb = st.checkpoint_byte ?? 0;
       fpOld = st.fprint ?? ''; rewrites = st.rewrites ?? 0;
-      open = st.turn_open ?? ''; closed = st.turn_closed === true; callOpen = st.call_open === true;
+      open = st.turn_open ?? ''; closed = st.turn_closed === true; callOpen = st.call_open === true; lastTs = st.last_ts ?? null;
     }
     // 没有新字节时只比 inode；要关最后一轮或末尾还有调用没写出的照样往下走
     if (size === consumed && (fpOld === '' || String(fpOld).split(':')[0] === String(ino))) {
       if (!close) return;
       if ((!open || closed) && !callOpen) return;
+      if (close === 'if_done' && typeof lastTs === 'string' && !(doneTs >= lastTs)) return;   // 续上之后还没有新的完成信号
     }
     if (consumed > 0 && (size < consumed || (fpOld !== '' && vtFprint(f, consumed) !== fpOld))) {
       try { fs.unlinkSync(stFile); } catch {}
@@ -639,10 +629,11 @@ export function runHook(event, payload) {
         hook_turns: name === 'main' ? vtHookTurns(s2) : {},
         hook_perms: vtHookPerms(s2), perm_periods: vtPermPeriods(), split_decisions: vtSplits(s2),
         close_last: name === 'main' || close ? close : '', stop_turn: name === 'main' ? stopTurn : '',
-        capture_content: vtConf('capture_content', '1') });
+        known_agents: known, done_ts: doneTs, capture_content: vtConf('capture_content', '1') });
     } catch (e) { vtLogError(ev, s2, `map:${name}`, 2); return; }
     // 结论先落盘再写 spool：反过来的话，spool 写进去了、结论没存上，下次重读就可能判出另一种、发出矛盾的事件
     if (!vtSplitsSave(s2, out.ledger.split_decisions_new)) { vtLogError(ev, s2, `splits:${name}`, 1); return; }
+    if (!vtAgentsSave(s2, out.ledger.agents)) vtLogError(ev, s2, `agents:${name}`, 1);
     if (!vtSpoolWrite(ctx.pkey, s2, name, out.events)) { vtLogError(ev, s2, `spool:${name}`, 1); return; }
     const srcLines = (out.ledger.sources || []).map(([u, n]) => `${u}\t${n}`).join('\n');
     if (srcLines) { try { fs.appendFileSync(seenFile, srcLines + '\n'); } catch {} }
@@ -651,7 +642,7 @@ export function runHook(event, payload) {
       checkpoint_line: out.ledger.checkpoint_line, checkpoint_byte: out.ledger.checkpoint_byte,
       parent_instance: out.ledger.parent_instance, fprint: fp, rewrites,
       turn_open: out.ledger.turns.open ?? null, turn_closed: out.ledger.turns.closed ?? false,
-      call_open: out.ledger.trace?.call_open ?? false, updated_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z') };
+      call_open: out.ledger.trace?.call_open ?? false, last_ts: out.ledger.last_ts ?? null, updated_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z') };
     try { fs.writeFileSync(stFile + '.tmp', JSON.stringify(stNew) + '\n'); fs.renameSync(stFile + '.tmp', stFile); } catch {}
     if (name === 'main') {
       const model = out.ledger.turns?.model;
@@ -668,7 +659,11 @@ export function runHook(event, payload) {
       const subDir = path.join(path.dirname(mainT), s2, 'subagents');
       let names = [];
       try { names = fs.readdirSync(subDir).filter((f) => /^agent-.*\.jsonl$/.test(f)); } catch {}
+      const before = JSON.stringify(vtAgents(s2));
       for (const f of names.sort()) processFile(s2, sd, path.join(subDir, f), f.replace(/\.jsonl$/, ''), close);
+      if (names.length > 1 && JSON.stringify(vtAgents(s2)) !== before) {
+        for (const f of names.sort()) processFile(s2, sd, path.join(subDir, f), f.replace(/\.jsonl$/, ''), close);
+      }
     } finally { vtUnlock(sd); }
   };
 
@@ -681,20 +676,6 @@ export function runHook(event, payload) {
       prev = s; sleepSync(150);
     }
   };
-  const waitInterruptRecord = (f) => {             // 打断记录在 PostToolUseFailure 之后才写，最多等 5 s
-    if (process.env.VIBETRAIL_STABLE_WAIT === '0') return;
-    for (let i = 0; i < 25; i++) {
-      try {
-        const size = fs.statSync(f).size, off = Math.max(0, size - 65536);
-        const fd = fs.openSync(f, 'r'); const buf = Buffer.alloc(size - off);
-        fs.readSync(fd, buf, 0, size - off, off); fs.closeSync(fd);
-        const tail = buf.toString('utf8').split('\n').slice(-10).join('\n');
-        if (tail.includes('[Request interrupted by user')) return;
-      } catch {}
-      sleepSync(200);
-    }
-  };
-
   // ---- 补做：本仓与所有登记过的仓，每个 worktree 对应的 Claude 项目目录 ----
   const catchUpDirs = () => {
     const repos = [ctx.workspace];
@@ -793,20 +774,6 @@ export function runHook(event, payload) {
       turnStop();
       if (isFile(tpath)) { waitStable(tpath); processSession(sid, tpath, 'stop', promptId); }
       break;
-    case 'SubagentStart':
-      if (agentId) emitHook('SubagentStart', null, extraSubagent());
-      break;
-    case 'SubagentStop': {
-      const atype = String(p.agent_type ?? '');
-      if (agentId && atype === '') emitHook('SubagentStop', null, { internal: true });
-      else if (agentId) {
-        emitHook('SubagentStop', null, extraSubagent());
-        const af = String(p.agent_transcript_path ?? '') || path.join(path.dirname(tpath), sid, 'subagents', `agent-${agentId}.jsonl`);
-        if (isFile(af)) { waitStable(af); mkdirp(SD); try { fs.writeFileSync(path.join(SD, `agent-${agentId}.done`), String(fs.statSync(af).size) + '\n'); } catch {} }
-      }
-      if (isFile(tpath)) processSession(sid, tpath);
-      break;
-    }
     case 'SessionEnd': {
       const snap = vtGitSnapshot(cwd);
       emitHook('SessionEnd', snap, {});
@@ -815,24 +782,6 @@ export function runHook(event, payload) {
       if (isFile(tpath)) processSession(sid, tpath, 'session_end');
       break;
     }
-    case 'StopFailure': turnFail(); emitHook('StopFailure', null, {}); break;
-    case 'InstructionsLoaded': {
-      const fp2 = String(p.file_path ?? '');
-      const extra = {};
-      if (fp2 && isFile(fp2)) {
-        try { extra.sha256 = crypto.createHash('sha256').update(fs.readFileSync(fp2)).digest('hex'); extra.bytes = fs.statSync(fp2).size; } catch {}
-      }
-      emitHook('InstructionsLoaded', null, extra);
-      break;
-    }
-    case 'PostToolUseFailure':
-      emitHook('PostToolUseFailure', null, {});
-      if (p.is_interrupt === true && isFile(tpath) && !agentId) { waitInterruptRecord(tpath); processSession(sid, tpath); }
-      break;
-    case 'Notification':
-      if (String(p.notification_type ?? '') === 'idle_prompt') { if (isFile(tpath)) processSession(sid, tpath); }
-      else emitHook('Notification', null, {});
-      break;
     case 'PermissionRequest':
       mkdirp(path.join(SD, 'perms'));
       try {
@@ -842,11 +791,8 @@ export function runHook(event, payload) {
       } catch {}
       emitHook('PermissionRequest', null, {});
       break;
-    case 'PermissionDenied':
-    case 'CwdChanged':
-      emitHook(ev, null, {});
-      break;
     case 'CatchUp': catchUp(); break;              // vibetrail sync：补一遍，不发事件
+    // 退役的 8 个事件（见 hookEvents 上面的说明）在入口就挡掉了：它们能给的已经从 transcript 推出来，再发就是两条
     default: break;
   }
 }

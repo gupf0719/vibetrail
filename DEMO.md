@@ -22,7 +22,7 @@ bash tools/vibetrail init
 
 | 写到哪 | 是什么 |
 |---|---|
-| `~/.claude/settings.json` | 加 13 个事件的 hook 条目（命令里带 `vibetrail-hook`；只登记本机 Claude Code 都认识的事件），别的设置原样保留。写之前核对文件没被别人改过，写完自检，不对就自动还原 |
+| `~/.claude/settings.json` | 加 5 个事件的 hook 条目：SessionStart / UserPromptSubmit / Stop / SessionEnd / PermissionRequest（命令里带 `vibetrail-hook`；只登记本机 Claude Code 都认识的事件；以前装过 13 个的，重跑会把旧条目换掉），别的设置原样保留。写之前核对文件没被别人改过，写完自检，不对就自动还原 |
 | `~/.vibetrail/backup/` | settings 的备份：`settings.json.before-vibetrail` 是第一次装之前的原样（只存一次、永不覆盖；原来没有 settings 就没有它），另外每次改动前存一份带时间的（留最近 10 份）。重跑 `init` 没有变化时不写也不备份 |
 | `~/.vibetrail/bin/` | 运行时 |
 | `~/.vibetrail/config` | scope（默认 project，只采登记过的仓）、node 路径、device_id 等 |
@@ -90,13 +90,14 @@ bash tools/vibetrail init
 |---|---|
 | 会话开始 | `session.start`（来源、model、HEAD） |
 | 说一句话 | `turn.start`（HEAD、分支、有没有改动） |
-| 模型答完 | `turn.end`（状态、token 用量、本轮的 commit、这一轮里插了几句话）。同一块里还有这一轮的调用 trace：每次模型调用一条 `message.assistant`（model、token、stop_reason、调了哪些工具及其调用 id，全采时还带这次的输出正文与 thinking）、每次工具调用一条 `tool.request`（完整参数）与 `tool.end`（工具名、成功 / 出错 / 取消、耗时，全采时带结果原文）、API 请求失败重试一次一条 `ext.claude.api_error` |
+| 模型答完 | `turn.end`（状态、token 用量、本轮的 commit、这一轮里插了几句话）。同一块里还有这一轮的调用 trace：每次模型调用一条 `message.assistant`（model、token、stop_reason、调了哪些工具及其调用 id，全采时还带这次的输出正文与 thinking）、每次工具调用一条 `tool.request`（完整参数）与 `tool.end`（工具名、成功 / 出错 / 取消、耗时——注明是工具自报的还是按记录时间差算的，全采时带结果原文）、API 请求失败重试一次一条 `ext.claude.api_error`。下面几类也在这时从 transcript 推出来（不另挂 hook） |
 | 人拒绝一次工具调用 | `permission.decision`（decided_by user，注明是看权限框还是按权限模式分出来的）+ `tool.request`（被拒的命令），这一轮以「拒绝后停下」关；auto 模式的分类器拦下、权限链路故障也发 `permission.decision`，decided_by 分别是 policy、system |
 | 人按停止打断 | `turn.end`（interrupted）+ 被打断的回复 `message.assistant` + 在跑的调用 `tool.request`；打断的是正在跑的工具时 kind 是 `interrupt_tool`（「按停止打断工具」） |
 | 分歧之后人说的第一句话 | `message.user`，指回那次分歧 |
-| 子 agent 起止 | `subagent.start` / `subagent.end`；压缩、起标题这类 Claude Code 内部 agent 只记 `ext.claude.subagent_stop`（internal） |
+| 子 agent 起止 | `subagent.start`（类型、任务、派它的调用）/ `subagent.end`（完成 / 出错 / 被停、耗时、token，全采时带它最后的回答）；后台跑的子 agent 看它的完成通知 |
 | 弹权限框 | `ext.claude.permission_request`（工具名、权限模式，不带参数）；用来分「人拒绝」与「按停止打断工具」 |
-| 工具失败、分类器拦下、API 出错结束一轮、CLAUDE.md 加载、切换目录 | `ext.claude.*`，只有事件头 |
+| API 出错结束一轮 | 这一轮的 `turn.end` 状态就是那个错误（如 `rate_limit`），等下一次模型答完才写 |
+| CLAUDE.md 加载、切换目录 | `ext.claude.instructions_loaded`（每个文件的路径、大小、哈希，全采时带正文）、`ext.claude.cwd_changed`（从哪到哪） |
 | 会话结束 | `session.end` |
 
 ## 6. 生成一份 markdown 报告（只供测试、演示）
@@ -129,7 +130,8 @@ bash experiments/collect-demo/report.sh -o experiments/collect-demo/out/report.m
 
 ## 演示时要说清楚的
 
-- **按停止打断的那一轮**，`turn.end` 要等下一个 hook 才写：打断没有 hook，desktop 里实测按停止什么 hook 都不来。
+- **按停止打断的那一轮**，`turn.end` 要等下一个 hook 才写：打断没有 hook，desktop 里实测按停止什么 hook 都不来。API 出错结束的一轮同样晚到。
+- **只挂 5 个 hook**（09-16 起）：子 agent 起止、API 出错、CLAUDE.md 加载、切目录都在模型答完时从 transcript 推，不另挂；以前装过的重跑一次 `init` 会把多出来的旧条目去掉（不去也不会多发，只是白起进程，`doctor` 会点名）。
 - **按停止打断正在跑的工具**：Claude Code 写进 transcript 的与在权限框里点拒绝一模一样。现在单列成「按停止打断工具」：
   挂上 PermissionRequest 之后按这次调用弹没弹过权限框分，之前的按这一轮的权限模式粗分——auto 模式几乎不弹框，那里的「拒绝」按停止算（DESIGN D9）。
   desktop 里 PermissionRequest 09-16 已实测触发（含子 agent 里的、auto 模式下 AskUserQuestion 的），本机 8 条。

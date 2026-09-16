@@ -55,6 +55,7 @@ function parseArgs(rest) {
       case '--rule-version': a.rule_version = v; i++; break;
       case '--vt-version': a.vt_version = v; i++; break;
       case '--capture-content': a.capture_content = v; i++; break;
+      case '--done-ts': a.done_ts = v || null; i++; break;
       case '--no-turns': a.turns = false; break;
       default: die(`未知参数 ${k}`);
     }
@@ -103,6 +104,8 @@ if (cmd === 'map') {
       case '--stop-turn': o.stop_turn = v; i++; break;
       case '--vt-version': o.vt_version = v; i++; break;
       case '--capture-content': o.capture_content = v; i++; break;
+      // 子 agent 文件：父文件里完成信号的时间，配 --close-last if_done（09-16 起不挂 SubagentStop）
+      case '--done-ts': o.done_ts = v || null; i++; break;
       case '--ledger': ledger = v; i++; break;
       case '--sources-out': sourcesOut = v; i++; break;
       case '--no-turns': o.turns = false; break;
