@@ -227,8 +227,9 @@ def vcsMerge($branch; $hv):
   | if length > 0 then . else null end;
 def codeify: tostring | ascii_downcase | gsub("[^a-z0-9._-]+"; "_") | gsub("^[^a-z]+"; "") | gsub("[._-]+$"; "")
              | gsub("[._-]{2,}"; "_") | if . == "" then "unknown" else .[0:128] end;
-def commitsOf($end): if ($end.commits | type) == "array" and ($end.commits | length) > 0
-  then [$end.commits[] | select(type == "string") | {sha: ., relation: "observed", evidence: "before_after"}] else null end;
+# 这里不叫 $end：end 是 jq 的保留字，jq 1.6 里 $end 整份文件编译不过（本机 1.6 踩到，1.7+ 才放行）
+def commitsOf($tend): if ($tend.commits | type) == "array" and ($tend.commits | length) > 0
+  then [$tend.commits[] | select(type == "string") | {sha: ., relation: "observed", evidence: "before_after"}] else null end;
 def mainRec($r): ($r.isSidechain != true) and ($r.agentId == null);
 
 # ---------- 轮次元数据：开轮 / 关轮 / 累计（DESIGN §3.1、§4.1） ----------
@@ -246,7 +247,7 @@ def openTurn($s):
 def closeTurn($how; $s; $eof):
   if .pturn == null or .pturn.closed or .pturn.interrupted then .
   else
-    .pturn as $pt | hookTurn($pt.id) as $h | hookStop($h) as $stop | hookEnd($h) as $end
+    .pturn as $pt | hookTurn($pt.id) as $h | hookStop($h) as $stop | hookEnd($h) as $tend
     | ($eof or .ln > $from_line) as $new
     # 结束的依据按强弱排：stop_hook_summary（Claude Code 自己写的答完标记）> hook 记到的 Stop > 最后一条模型回复 stop_reason 是 end_turn
     # （模型自己说完了，但 Stop hook 的判定没落盘，比如会话紧接着被关掉，09-15 本机语料里见过）
@@ -257,7 +258,7 @@ def closeTurn($how; $s; $eof):
        elif $evidence == "stop_hook_summary" or $evidence == "hook_stop" or $evidence == "end_turn" then {code: "completed", category: "success"}
        elif $evidence == "stop_failure" then {code: (($h.fail.error // "error") | codeify), category: "error"}
        else {code: "unknown", category: "unknown"} end) as $status
-    | usageOf($pt.usage) as $usage | vcsMerge(.branch; $end.vcs) as $vcs | commitsOf($end) as $commits
+    | usageOf($pt.usage) as $usage | vcsMerge(.branch; $tend.vcs) as $vcs | commitsOf($tend) as $commits
     | (base($s; "turn.end"; null; ($pt.summary.ts // $stop.at // $pt.last_ts); {id: $pt.id, inferred: false})
        | .provenance = ({kind: "transcript", rule_version: "turn-v1"}
                         + (if $pt.summary != null or $stop != null then {source_event: "Stop"} else {} end)
@@ -265,11 +266,11 @@ def closeTurn($how; $s; $eof):
        | .payload = ({status: $status} + opt("model"; $pt.model) + opt("usage"; $usage) + opt("vcs"; $vcs))
        | (if $commits != null
           then .commits = $commits
-               | .extensions += {"vibetrail.commit_method": ($end.commit_method // "rev-list"),
+               | .extensions += {"vibetrail.commit_method": ($tend.commit_method // "rev-list"),
                                  "vibetrail.commit_attribution": (if $pt.git_commit then "agent_tool" else "inferred" end)}
           else . end)
        | .extensions += ({"vibetrail.closed_by": $how, "vibetrail.end_evidence": (if $pt.denied then "denial" else $evidence end),
-                          "vibetrail.stops": ($stop.stops // 0)} + opt("vibetrail.dirty_files"; $end.vcs.dirty_files)
+                          "vibetrail.stops": ($stop.stops // 0)} + opt("vibetrail.dirty_files"; $tend.vcs.dirty_files)
                          + opt("vibetrail.queued_prompts"; (if ($pt.queued // 0) > 0 then $pt.queued else null end)))
        # 被别的 Stop hook 拦停、同一轮第 N 次 Stop 时发的那条换一个 event_id（|stopN），读的一方同一 turn_id 取 vibetrail.stops 最大的
        | ._key = ($pt.id + "|turn.end" + (if (($stop.stops // 0) > 1) then "|stop" + ($stop.stops | tostring) else "" end))) as $e
