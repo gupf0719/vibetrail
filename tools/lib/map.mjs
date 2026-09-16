@@ -209,7 +209,7 @@ export function mapRecords(records, args) {
     ledger: {
       in: {}, in_total: {}, out: {}, events: {}, absorbed_for_tool_use: 0, unpaired_for_tool_use: 0,
       lookup: { index: 0, regex: 0, missing: 0 }, stop_press: 0, dedup: 0, records: 0, skipped_no_uuid: 0, skipped_non_object: 0,
-      sentinel: { marker: 0, marker_without_hit: 0 }, replayed: 0, turns: { started: 0, ended: {} }, sources: [],
+      sentinel: { marker: 0, marker_without_hit: 0 }, replayed: 0, inherited: 0, turns: { started: 0, ended: {} }, sources: [],
     },
     out: [],
   };
@@ -529,12 +529,16 @@ export function mapRecords(records, args) {
     }
     const rawData = { ...h }; delete rawData.as_kind; delete rawData.split_by; delete rawData.permission_mode; delete rawData.stop_calls;
     e.raw = { event_name: 'diverge.' + h.kind, data: rawData };
+    // K13：打断发的 turn.end 以前不带 closed_by / stops（本机 252 条全空），读的一方连「同 turn_id 取 stops 最大」都用不上
+    const hstops = sub ? null : alt(nz(hookStop(hookTurn(t.id))?.stops), 0);
     e.extensions = { ...e.extensions, 'vibetrail.kind': kind, 'vibetrail.human': true,
+      ...(sub ? {} : { 'vibetrail.closed_by': 'interrupt', 'vibetrail.stops': hstops }),
       ...opt('vibetrail.interrupted_uuid', reply ? reply.uuid : null),
       ...opt('vibetrail.split_by', nz(h.split_by) ?? null), ...opt('vibetrail.permission_mode', nz(h.permission_mode) ?? null) };
     e._key = s.uuid + '|' + e.type;
     emit(e);
-    if (!sub && st.pturn !== null && st.pturn.id === t.id) st.pturn.interrupted = true;
+    // K13：打断结束的轮也置 closed——否则 state 里 turn_closed 一直是 false，每次 SessionStart 补做都把它重新解析一遍（本机 5 个）
+    if (!sub && st.pturn !== null && st.pturn.id === t.id) { st.pturn.interrupted = true; st.pturn.closed = true; }
     addPending(s.uuid, kind);
   };
 
@@ -571,7 +575,11 @@ export function mapRecords(records, args) {
   const emitPrompt = (s) => emit(message(s, turnOf(s), s, 'message.user', 'user', s.slash ? { 'vibetrail.slash_command': true } : {}));
 
   const turnBoundary = (r, s) => {
-    if (turns && mainRec(r) && r.type === 'user' && isStr(r.promptId) && r.promptId !== alt(st.pturn ? st.pturn.id : null, null)) {
+    // K12（09-16 复核：turn.end 里 6.4% 是 unknown，106 轮一次模型调用都没有）：以前任何带新 promptId 的 user 记录都开一轮，
+    // /compact 后的续接摘要、<task-notification>、只有 tool_result 的记录都被灌成了轮，且与 hook 只在 UserPromptSubmit 发 turn.start 的口径不一致。
+    // 现在只在人话或斜杠命令处开轮，别的记录并入当前轮
+    if (turns && mainRec(r) && r.type === 'user' && (s.human || s.slash)
+        && isStr(r.promptId) && r.promptId !== alt(st.pturn ? st.pturn.id : null, null)) {
       closeTurn('next_turn', s, false);
       openTurn(s);
     }
@@ -749,6 +757,11 @@ export function mapRecords(records, args) {
     const s = slim(r, ln);
     const hits = diverge(r);
     if (st.run_uuids[r.uuid] || (st.prior[r.uuid] !== undefined && st.prior[r.uuid] !== ln)) { st.ledger.replayed += 1; return; }
+    // K8（🔴，09-16 复核：本机 7.6% 的事件落在复制来的轮上，trace 与 token 在云端算两遍）：desktop 续接会话会把旧会话的开头
+    // 原样复制进新文件，记录 uuid、promptId 都不变、只有文件换了——但每条记录的 sessionId 字段仍是原会话的。
+    // 所以「记录 sessionId 与文件 sid 不同」就是复制来的历史，整条跳过、账本记 inherited；它在原会话的文件里已经报过。
+    // 子 agent 文件里 sessionId 是父会话 id、与 sid 一致，不受影响；没有 sessionId 的记录（老版本）照常处理
+    if (sid && isStr(r.sessionId) && r.sessionId !== sid) { st.ledger.inherited += 1; return; }
     st.run_uuids[r.uuid] = true;
     st.ledger.records += 1;
     st.last_ts = alt(nz(r.timestamp), st.last_ts);

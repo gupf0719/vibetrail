@@ -257,7 +257,7 @@ check "system prompt: 关掉开关就不发（api_error 照发）" \
 for m in on off default; do
     mkdir -p "$T/cfg-$m"
     case $m in on) printf 'capture_content=1\n';; off) printf 'capture_content=0\n';; *) printf 'scope=project\n';; esac > "$T/cfg-$m/config"
-    VIBETRAIL_HOME=$T/cfg-$m bash "$SELF/vibetrail-map" "$T/scenario.jsonl" --sid s --project-id p --workspace-id w \
+    VIBETRAIL_HOME=$T/cfg-$m bash "$SELF/vibetrail-map" "$T/scenario.jsonl" --sid 11111111-2222-4333-8444-555555555555 --project-id p --workspace-id w \
         > "$T/cfg-$m.events" 2>/dev/null
 done
 check "开关走 config：capture_content=1 带正文" 'any(.[]; .type=="message.user" and (.payload.text // "") != "")' "$T/cfg-on.events"
@@ -268,6 +268,56 @@ check "开关走 config：capture_content=0 时 trace 不带正文，分歧那�
      and ([.[] | select(.type=="message.user")] | length == 1 and (.[0].extensions["vibetrail.after"] | length) == 2)
      and ([.[] | select(.type=="tool.request")] | length == 1 and (.[0].payload.input.command | startswith("sed -i")))' "$T/cfg-off.events"
 check "开关走 config：没写这一项＝默认全采" 'any(.[]; .type=="tool.end" and .payload.output != null)' "$T/cfg-default.events"
+
+echo "════ 7. 09-16 复核修补（K8 / K12 / K13，OPEN-ISSUES）════"
+R(){ # R <uuid> <parent> <sessionId> <promptId> <type> <content JSON> [额外字段 JSON]：造一条 transcript 记录
+    # 默认值别写成 ${7:-{\}}：没给第 7 个参数时它展开成 {\}，不是合法 JSON，jq 直接报错、这条记录就没造出来（先踩了一次）
+    local x=${7:-}; [ -n "$x" ] || x='{}'
+    jq -n -c --arg u "$1" --arg p "$2" --arg s "$3" --arg q "$4" --arg t "$5" --argjson c "$6" --argjson x "$x" \
+      '{type: $t, uuid: $u, parentUuid: (if $p == "" then null else $p end), sessionId: $s, promptId: (if $q == "" then null else $q end),
+        message: {role: $t, content: $c}, isSidechain: false, cwd: "/tmp/fx", version: "2.1.266", entrypoint: "cli", gitBranch: "main",
+        timestamp: "2026-09-16T02:00:00.000Z"} + $x'
+}
+AM(){ printf '{"message":{"id":"%s","model":"claude-opus-5","role":"assistant","content":%s,"usage":{"input_tokens":5,"output_tokens":5},"stop_reason":"end_turn"}}' "$1" "$2"; }
+
+# K8：desktop 续接会话把旧会话的开头复制进新文件——uuid、promptId 不变，sessionId 字段仍是旧会话的。复制来的整条跳过、账本记 inherited
+{ R o1 ""  old-sess op1 user '"旧会话里的一句"'
+  R o2 o1  old-sess op1 assistant '[]' "$(AM om1 '[{"type":"text","text":"旧回复"}]')"
+  R o3 o2  old-sess op1 user '[{"type":"text","text":"[Request interrupted by user]"}]'
+  R n1 o3  new-sess np1 user '"续接之后的新一句"'
+  R n2 n1  new-sess np1 assistant '[]' "$(AM nm1 '[{"type":"text","text":"新回复"},{"type":"tool_use","id":"toolu_n","name":"Bash","input":{"command":"ls"}}]')"
+  R n3 n2  new-sess np1 user '[{"type":"tool_result","tool_use_id":"toolu_n","content":"a.txt"}]'
+} > "$T/k8.jsonl"
+bash "$SELF/vibetrail-map" "$T/k8.jsonl" --sid new-sess --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 1 --close-last session_end \
+    --ledger "$T/k8.ledger" > "$T/k8.events" 2>/dev/null
+check "K8: 复制来的旧会话记录（sessionId 不是本文件的）一条事件都不出，打断也不算" \
+    'all(.[]; (.provenance.source_event_id // "") | IN("o1","o2","o3") | not) and all(.[]; .type != "turn.end" or .payload.status.code != "interrupted")' "$T/k8.events"
+check "K8: 本会话自己的记录照常出（人话、回复、工具调用）" \
+    'any(.[]; .type=="message.user" and .payload.text=="续接之后的新一句") and any(.[]; .type=="tool.request" and .payload.call_id=="toolu_n") and any(.[]; .type=="tool.end")' "$T/k8.events"
+check "K8: 账本 inherited 记 3 条" '.[0].inherited == 3' "$T/k8.ledger"
+
+# K12：只在人话或斜杠命令处开轮；带新 promptId 的 task-notification 不开轮、不出 turn.start
+{ R k1 ""  k12 kp1 user '"第一句人话"'
+  R k2 k1  k12 kp1 assistant '[]' "$(AM km1 '[{"type":"text","text":"好"}]')"
+  R k3 k2  k12 kp2 user '"<task-notification>后台任务跑完了</task-notification>"'
+  R k4 k3  k12 kp2 assistant '[]' "$(AM km2 '[{"type":"text","text":"收到通知"}]')"
+  R k5 k4  k12 kp3 user '"第二句人话"'
+} > "$T/k12.jsonl"
+bash "$SELF/vibetrail-map" "$T/k12.jsonl" --sid k12 --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 > "$T/k12.events" 2>/dev/null
+check "K12: turn.start 只在两句人话处（kp1、kp3），task-notification 的 kp2 不开轮" \
+    '[.[] | select(.type=="turn.start") | .turn_id] == ["kp1","kp3"] and ([.[] | select(.type=="turn.end") | .turn_id] == ["kp1"])' "$T/k12.events"
+
+# K13：打断发的 turn.end 带 closed_by = interrupt 与 stops，打断后这一轮算关了（state 的 turn_closed 才会是 true，补做不再重读）
+{ R i1 ""  k13 ip1 user '"看一下这个"'
+  R i2 i1  k13 ip1 assistant '[]' "$(AM im1 '[{"type":"text","text":"我先看看"}]')"
+  R i3 i2  k13 ip1 user '[{"type":"text","text":"[Request interrupted by user]"}]'
+} > "$T/k13.jsonl"
+bash "$SELF/vibetrail-map" "$T/k13.jsonl" --sid k13 --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 \
+    --ledger "$T/k13.ledger" > "$T/k13.events" 2>/dev/null
+check "K13: 打断的 turn.end 带 vibetrail.closed_by = interrupt 与 vibetrail.stops" \
+    '[.[] | select(.type=="turn.end")] | length == 1 and .[0].payload.status.code == "interrupted"
+     and .[0].extensions["vibetrail.closed_by"] == "interrupt" and .[0].extensions["vibetrail.stops"] == 0' "$T/k13.events"
+check "K13: 打断后这一轮算关了（账本 turns.closed = true）" '.[0].turns.open == "ip1" and .[0].turns.closed == true' "$T/k13.ledger"
 
 echo
 [ "$skipped_schema" -gt 0 ] && echo "  ⚠ 本机 python3 没有 jsonschema，协议 schema 校验跳过 $skipped_schema 处（pip install jsonschema 后重跑）"

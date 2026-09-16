@@ -1,9 +1,9 @@
 "整行是字符串"
 null
 42
-{"type":"user","uuid":"m1","message":"整个 message 是字符串","timestamp":"2026-09-15T07:00:00.000Z","sessionId":"fx-noise","cwd":"/tmp/fx","version":"2.1.260","gitBranch":"main"}
-{"type":"user","uuid":"m2","message":{"content":null},"timestamp":"2026-09-15T07:00:01.000Z","sessionId":"fx-noise","version":"2.1.260","gitBranch":"main"}
-{"type":"assistant","uuid":"m3","message":{"id":"mm3","content":[{"type":"tool_use","name":"Bash"},"裸字符串块",{"type":"text"}],"usage":"不是对象"},"timestamp":"2026-09-15T07:00:02.000Z","sessionId":"fx-noise","version":"2.1.260","gitBranch":"main"}
-{"type":"user","uuid":"m4","message":{"content":[{"type":"tool_result","is_error":true}]},"timestamp":"2026-09-15T07:00:03.000Z","sessionId":"fx-noise","version":"2.1.260","gitBranch":"main"}
-{"type":"user","uuid":"m5","promptId":"p1","toolUseResult":["array","形态"],"message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]},"timestamp":"2026-09-15T07:00:04.000Z","sessionId":"fx-noise","version":"2.1.260","gitBranch":"main"}
+{"type":"user","uuid":"m1","message":"整个 message 是字符串","timestamp":"2026-09-15T07:00:00.000Z","sessionId":"noise","cwd":"/tmp/fx","version":"2.1.260","gitBranch":"main"}
+{"type":"user","uuid":"m2","message":{"content":null},"timestamp":"2026-09-15T07:00:01.000Z","sessionId":"noise","version":"2.1.260","gitBranch":"main"}
+{"type":"assistant","uuid":"m3","message":{"id":"mm3","content":[{"type":"tool_use","name":"Bash"},"裸字符串块",{"type":"text"}],"usage":"不是对象"},"timestamp":"2026-09-15T07:00:02.000Z","sessionId":"noise","version":"2.1.260","gitBranch":"main"}
+{"type":"user","uuid":"m4","message":{"content":[{"type":"tool_result","is_error":true}]},"timestamp":"2026-09-15T07:00:03.000Z","sessionId":"noise","version":"2.1.260","gitBranch":"main"}
+{"type":"user","uuid":"m5","promptId":"p1","toolUseResult":["array","形态"],"message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]},"timestamp":"2026-09-15T07:00:04.000Z","sessionId":"noise","version":"2.1.260","gitBranch":"main"}
 {"type":"queue-operation","operation":"enqueue"}
