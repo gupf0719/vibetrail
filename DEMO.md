@@ -126,7 +126,7 @@ bash experiments/collect-demo/report.sh -o experiments/collect-demo/out/report.m
 - **按停止打断的那一轮**，`turn.end` 要等下一个 hook 才写：打断没有 hook，desktop 里实测按停止什么 hook 都不来。
 - **按停止打断正在跑的工具**：Claude Code 写进 transcript 的与在权限框里点拒绝一模一样。现在单列成「按停止打断工具」：
   挂上 PermissionRequest 之后按这次调用弹没弹过权限框分，之前的按这一轮的权限模式粗分——auto 模式几乎不弹框，那里的「拒绝」按停止算（DESIGN D9）。
-  desktop 里 PermissionRequest 会不会触发还没实测：要在 default 模式的会话里弹一次框、点一次拒绝。
+  desktop 里 PermissionRequest 09-16 已实测触发（含子 agent 里的、auto 模式下 AskUserQuestion 的），本机 8 条。
 - **desktop 续接会话**会把之前的历史复制进新会话文件，这部分会按新会话再报一遍（OPEN-ISSUES K8）；报告里已按记录合并显示，并注明「也在哪些会话」。
 - **在别人公司的机器上演示**：企业托管设置（`/Library/Application Support/ClaudeCode/managed-settings.json`）里 `allowManagedHooksOnly: true` 会让 HOME 里的条目
   一律被忽略，用户设置里 `disableAllHooks: true` 则是所有 hook 都不跑（安全模式同理）。两种情况下 hook 一次都不触发，而且**看不出异常**——

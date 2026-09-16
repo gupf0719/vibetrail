@@ -58,15 +58,15 @@ bash tools/vibetrail init
 - `vibetrail list` 列出 spool 里的每个块文件，文件在 `~/.vibetrail/spool/<项目>/<会话>/*.jsonl`，每行一条协议事件，直接 `cat` 就能看。
 - `vibetrail doctor` 自检；`vibetrail uninstall` 卸载（只去掉 settings 里自己的条目，spool 留着，`--purge` 才全删）。
 - 什么时候出现什么：说一句话就有 `turn.start`（带 HEAD）；模型答完（Stop）后，这一轮的 `turn.end`（状态、用量、本轮 commit）、每次模型调用的 `message.assistant` 与每次工具调用的 `tool.end`（trace，不带正文，DESIGN D8）、分歧事件一起落盘。
-  Stop hook 触发就是模型答完，当场写；别的 Stop hook 把这次 Stop 拦下时，模型补完再 Stop 会再写一条更新的（DESIGN D7）。
-  你按停止打断的轮要等下一个 hook 才写（打断没有 hook，desktop 实测）；打断正在跑的工具现在会被记成「拒绝」，见 OPEN-ISSUES K7。
+  Stop hook 触发就是模型答完，当场写（Claude Code 自己的答完标记 `stop_hook_summary` 已落盘就按它关，desktop 2.1.270 实测与 Stop 同一秒；没有才按 Stop 关）；别的 Stop hook 把这次 Stop 拦下时，模型补完再 Stop 会再写一条更新的（DESIGN D7）。
+  你按停止打断的轮要等下一个 hook 才写（打断没有 hook，desktop 实测）；打断正在跑的工具按有没有弹过权限框分成「按停止打断工具」与「拒绝」（DESIGN D9）。
 
 ## 状态
 
 2026-09-14 需求与设计定稿、09-15 定不传 transcript 原文件并选定云端协议（DESIGN D5）；同日做完：分歧映射成协议 1.0 事件（`tools/vibetrail-map`）、
 hook 分发入口（`tools/vibetrail-hook`：会话 / 轮次 / 子 agent 起止、`ext.claude.*` 事件头、git 状态、commit ↔ 轮次推导）、
 机器级安装与本地查看（`tools/vibetrail`：init / uninstall / projects / doctor / list / show / sync）、照 Pilot 粒度的调用 trace。人机分歧与轮次元数据是同一条事件流。
-push 与五个补充回归场景按用户 09-15 的要求往后放。G7 之前的代码与测试已归档到 `old/`。已有并沿用的是人机分歧判据（755 会话实测精确率 100%，裸 grep 只有 10.5%）。
+push 与五个补充回归场景按用户 09-15 的要求往后放。09-16 拿本机 124,666 条真实事件复核了已完成的部分，待修项立在 OPEN-ISSUES K8、K12–K16，push 方案的修正在 TODO。G7 之前的代码与测试已归档到 `old/`。已有并沿用的是人机分歧判据（755 会话实测精确率 100%，裸 grep 只有 10.5%）。
 上一版设计（留痕投影进被观测仓、git hook 写 trailer）已退役，理由与替代见 [DESIGN.md §7](DESIGN.md)。
 
 已实测确立的地基（`experiments/` 可复现）：Claude Code 的 hook 在 **desktop app 下正常触发且热加载**，stdin 直接给出 `transcript_path`；
