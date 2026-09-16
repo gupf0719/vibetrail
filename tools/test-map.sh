@@ -21,6 +21,8 @@ export VIBETRAIL_HOME=$T/vt; mkdir -p "$VIBETRAIL_HOME"
 update=0; accept=0
 for a in "$@"; do case "$a" in --update) update=1;; --accept-rule-digest) accept=1;; *) echo "✗ 不认识的参数：$a" >&2; exit 2;; esac; done
 fail=0; pass=0
+# 断言里要比对的分歧一路 rule_version 取自 map.mjs，升版本时不用逐条改断言（改没改规则由第 10 节的摘要钉子管）
+RV_DIVERGE=$(node --input-type=module -e "import { RULE_VERSIONS } from '$SELF/lib/map.mjs'; console.log(RULE_VERSIONS.diverge)")
 # 协议 schema 校验要 python3 + jsonschema（只在测试里用）；本机没装就跳过这几项并在末尾说明，不算失败
 if python3 -c 'import jsonschema' 2>/dev/null; then HAVE_SCHEMA=1; else HAVE_SCHEMA=0; fi
 skipped_schema=0
@@ -75,7 +77,7 @@ done
 e=$T/interrupt-text.events
 check "interrupt-text: 三条——被打断的回复、turn.end、人的下一句" 'map(.type) == ["message.assistant","turn.end","message.user"]' "$e"
 check "interrupt-text: 回复正文与 model，指回打断记录" '.[0].payload.text == "我看了一下，问题在 div：" and .[0].payload.model == "claude-opus-5" and .[0].payload.author_type == "agent" and .[0].extensions["vibetrail.trigger"] == "i1" and .[0].content_state == "included"' "$e"
-check "interrupt-text: turn.end 状态、用量按 message.id 去重（U12：入含缓存读，total = 入 + 出）、分支" '.[1].payload.status == {code:"interrupted",category:"cancellation",detail:"[Request interrupted by user]"} and .[1].payload.usage == {input_tokens:115,cached_input_tokens:100,output_tokens:20,reasoning_tokens:8,total_tokens:135} and .[1].payload.vcs.branch == "main" and .[1].turn_id == "p1" and .[1].provenance == {kind:"transcript",rule_version:"diverge-v2",source_event_id:"i1"}' "$e"
+check "interrupt-text: turn.end 状态、用量按 message.id 去重（U12：入含缓存读，total = 入 + 出）、分支" '.[1].payload.status == {code:"interrupted",category:"cancellation",detail:"[Request interrupted by user]"} and .[1].payload.usage == {input_tokens:115,cached_input_tokens:100,output_tokens:20,reasoning_tokens:8,total_tokens:135} and .[1].payload.vcs.branch == "main" and .[1].turn_id == "p1" and .[1].provenance == {kind:"transcript",rule_version:"'"$RV_DIVERGE"'",source_event_id:"i1"}' "$e"
 check "interrupt-text: 人的下一句去掉 system-reminder 块，只留人写的" '.[2].payload.text == "先别看 div" and .[2].extensions["vibetrail.after"] == ["i1"] and .[2].extensions["vibetrail.after_kind"] == "interrupt"' "$e"
 check "interrupt-text: raw 里保留提取器原始命中" '.[1].raw.event_name == "diverge.interrupt" and .[1].raw.data.kind == "interrupt" and .[1].raw.data.turn == "i1"' "$e"
 e=$T/interrupt-tool.events
@@ -95,7 +97,7 @@ check "subagent: 会话 id 取自路径、实例 id 是 agentId、父实例 main
 check "subagent: 打断映射成 subagent.end(cancelled)，带 agent_type，不带 usage / vcs" '[.[] | select(.type=="subagent.end")] | length == 1 and .[0].payload == {status:{code:"cancelled",category:"cancellation",detail:"[Request interrupted by user]"},agent_type:"general-purpose"}' "$e"
 check "subagent: 拒绝 + 被拒命令 + 被打断的回复都在；派活与注入消息不算人的下一句" 'map(.type) == ["tool.request","permission.decision","message.assistant","subagent.end"] and (.[2].payload.text == "测试跑不了，我读代码。")' "$e"
 e=$T/no-promptid.events
-check "no-promptid: 没有 promptId 的打断按位置推轮次，provenance 标 inferred" '[.[] | select(.type=="turn.end")] | length == 2 and .[0].turn_id == "i0" and .[0].provenance.kind == "inferred" and .[1].turn_id == "p1" and .[1].provenance.kind == "inferred" and .[1].provenance.rule_version == "diverge-v2"' "$e"
+check "no-promptid: 没有 promptId 的打断按位置推轮次，provenance 标 inferred" '[.[] | select(.type=="turn.end")] | length == 2 and .[0].turn_id == "i0" and .[0].provenance.kind == "inferred" and .[1].turn_id == "p1" and .[1].provenance.kind == "inferred" and .[1].provenance.rule_version == "'"$RV_DIVERGE"'"' "$e"
 check "no-promptid: 派生事件跟触发记录的轮次走" '[.[] | select(.type=="message.assistant")][0] | .turn_id == "p1" and .provenance.kind == "inferred"' "$e"
 check "no-promptid: 两句人话各指回各自的打断" '[.[] | select(.type=="message.user")] | map(.extensions["vibetrail.after"]) == [["i0"],["i1"]]' "$e"
 e=$T/unpaired.events
@@ -592,10 +594,11 @@ check "坏行、空行占行号：账本的 lines 是物理行数 11" '.[0].line
 M9B "$T/a11.jsonl" --sid s9a --project-id fx --workspace-id ws --workspace-roots /tmp/fx --capture-content 0 --from-line 4 --ledger "$T/a11b.ledger" > "$T/a11b.events"
 check "A11: 只数 from_line 之后的——第 5～11 行：seen 7 = 进映射 4 + 没 uuid 1 + 复制来的 1 + 回放副本 1" \
     '.[0].new | .seen == 7 and .records == 4 and .bad_json == 0 and .skipped_non_object == 0 and .skipped_no_uuid == 1 and .inherited == 1 and .replayed == 1' "$T/a11b.ledger"
-# 坏行夹在中间时的增量等价：以前坏行不占行号，checkpoint 换算成字节会错位一行；这里前段 + 从 checkpoint 起的后段 == 全量
+# 坏行夹在中间时的增量等价：以前坏行不占行号，checkpoint 换算成字节会错位（坏行在 checkpoint 之前隔着一行时，后段从早一行读起、
+# 早该写出的调用再发一遍）。坏行放第 2 行，前段读到第 5 行时 checkpoint 是第二轮开头（第 4 行）；前段 + 从 checkpoint 起的后段 == 全量
 { R b1 ""  s9c bp1 user '"第一轮"' "$(TS 09:10:00.000Z)"
-  R b2 b1  s9c bp1 assistant '[]' "$(AM bm1 '[{"type":"text","text":"一"}]' | with_ts 09:10:01.000Z)"
   printf '{"type":"user","uuid":"broken\n'
+  R b2 b1  s9c bp1 assistant '[]' "$(AM bm1 '[{"type":"text","text":"一"}]' | with_ts 09:10:01.000Z)"
   R b3 b2  s9c bp2 user '"第二轮"' "$(TS 09:10:02.000Z)"
   R b4 b3  s9c bp2 assistant '[]' "$(AM bm2 '[{"type":"text","text":"二"}]' | with_ts 09:10:03.000Z)"
   R b5 b4  s9c bp3 user '"第三轮"' "$(TS 09:10:04.000Z)"
@@ -603,12 +606,13 @@ check "A11: 只数 from_line 之后的——第 5～11 行：seen 7 = 进映射 
 } > "$T/badmid.jsonl"
 BM=(--sid s9c --project-id fx --workspace-id ws --workspace-roots /tmp/fx --capture-content 1)
 M9B "$T/badmid.jsonl" "${BM[@]}" --ledger /dev/null | jq -S -c . | sort > "$T/badmid.full"
-head -n 4 "$T/badmid.jsonl" > "$T/badmid-a.jsonl"
+head -n 5 "$T/badmid.jsonl" > "$T/badmid-a.jsonl"
 M9B "$T/badmid-a.jsonl" "${BM[@]}" --ledger "$T/badmid-a.ledger" --sources-out "$T/badmid-a.src" > "$T/badmid-a.events"
 M9B "$T/badmid.jsonl" "${BM[@]}" --start-line "$(jq -r .checkpoint_line "$T/badmid-a.ledger")" --start-byte "$(jq -r .checkpoint_byte "$T/badmid-a.ledger")" \
-    --from-line 4 --seen-uuids "$T/badmid-a.src" --ledger /dev/null > "$T/badmid-b.events"
-check "坏行夹在中间：前段 + 从 checkpoint 起读的后段 == 全量（checkpoint 行号与字节对得上）" \
-    '[ "$(cat "$T/badmid-a.events" "$T/badmid-b.events" | jq -S -c . | sort)" = "$(cat "$T/badmid.full")" ] && [ "$(wc -l < "$T/badmid.full" | tr -d " ")" -gt 0 ]'
+    --from-line "$(jq -r .lines "$T/badmid-a.ledger")" --seen-uuids "$T/badmid-a.src" --ledger /dev/null > "$T/badmid-b.events"
+if [ -s "$T/badmid.full" ] && [ "$(cat "$T/badmid-a.events" "$T/badmid-b.events" | jq -S -c . | sort)" = "$(cat "$T/badmid.full")" ]; then ok
+else ko "坏行夹在中间：前段 + 从 checkpoint 起读的后段 ≠ 全量（checkpoint 行号与字节对不上）"; fi
+check "坏行夹在中间：前段读了 5 个物理行，checkpoint 是第二轮开头第 4 行（坏行占第 2 行）" '.[0].lines == 5 and .[0].checkpoint_line == 4' "$T/badmid-a.ledger"
 
 # K22 子 agent 部分（按 09-16 真跑的子 agent 仿的形态：子 agent 文件里没有 toolUseResult，Write 新建只能看结果正文）
 SFP=$T/sf-proj; mkdir -p "$SFP/s9s/subagents"
