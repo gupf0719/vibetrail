@@ -595,7 +595,9 @@ cmd_doctor(){
     else
         local np; np=$(ls "$VT_HOME/projects" 2>/dev/null | wc -l | tr -d ' ')
         [ "$np" -gt 0 ] && ok "scope=project，登记了 $np 个项目" || note "scope=project 但一个项目都没登记——什么都不会采（vibetrail projects pick 选，或 projects add）"
-        if [ -n "$here" ]; then vt_registered "$here" && ok "本仓已登记：$here" || note "本仓没登记：${here}（vibetrail projects add）"; fi
+        # 没登记本仓是 scope=project 下的常态（在哪个目录跑 doctor 都行），不是毛病：用中性提示，别把整体结论拉成「有告警」、淹掉真的问题
+        if [ -n "$here" ]; then vt_registered "$here" && ok "本仓已登记：$here" \
+            || say "  · 本仓没登记，这个仓里的会话不采（要采：vibetrail projects add）：${here}"; fi
     fi
     # 采集证据
     local nst=0 nch=0 nev=0 oldest=""
