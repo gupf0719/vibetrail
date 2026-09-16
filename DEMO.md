@@ -81,7 +81,7 @@ bash tools/vibetrail init
 ~/.vibetrail/bin/vibetrail show
 ```
 
-按会话、按时间一行一条；模型调用那几行是元数据，比如「模型 claude-opus-5　入/缓存/出 11.9k/47.1k/317　tool_use → Bash　用时 6s」。其他看法：
+按会话、按时间一行一条；模型调用那几行是元数据，比如「模型 claude-opus-5　入 59k（缓存 47.1k）/ 出 317　tool_use → Bash　用时 6s」（「入」含缓存读，协议口径，U12）。其他看法：
 
 ```bash
 ~/.vibetrail/bin/vibetrail list

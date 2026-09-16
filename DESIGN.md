@@ -176,8 +176,9 @@ G6 的哨兵改由语料里「已知清单之外的 `type` / `attachment.type`�
   临时文件 + rename 写入，写入后不再改；push 按块发、ack 后整块删，不用改写一个不断增长的 `events.jsonl`（09-15 改，原写法是单个 events.jsonl + manifest.json）。
   块名里的 UTC 时间就是门槛计时的依据（§4）：最早待发事件的时间直接从文件名取，不另记状态。
   offset 等进度在 `state/`（上一条），不放 spool。项目键 = 主 checkout 目录名 + 路径 sha1 前 16 位。
-  `project_id` 取 `origin` 远端（去掉协议、用户名和 `.git`），没有远端就用主 checkout 路径；`workspace_id` 取主 checkout 路径（§4.1）。
-  **09-16 对照采集端协议文档：两个都不合协议**——`project_id` 要简单项目名，`workspace_id` 要客户端生成并持久化的不透明 UUID，push 前改（OPEN-ISSUES K17）。
+  `project_id` 是简单项目名：登记表里显式写的（`projects add --name`）> `origin` 远端的仓库名（`git@host:team/payment-service.git` → `payment-service`）> 主 checkout 目录名，
+  不含用户名与本机路径；`workspace_id` 是第一次见到主 checkout 时生成、持久化在 `~/.vibetrail/workspaces/<路径 sha1 前 16 位>` 的 UUID，worktree 共享，uninstall 留着、`--purge` 才删（§4.1；
+  09-16 对照采集端协议文档改的，K17——原先发的是 `github.com/acme/xxx` 与带用户名的本机路径，collector 按 user + workspace_id 关联会话，推出去再换历史会分成两份）。
   不再有副本目录；分歧提取器的原始输出是中间产物，A3 拿它对账。
   批次按协议打（≤ 100 条 / 16 MiB），一批可以混多个项目、多个会话（batch 顶层只有 `schema_version` / `batch_id` / `client` / `events`，项目与会话 id 在每条事件上，09-15 核），
   不另立 spool spec，事件形状以协议 schema 为准（[原件进仓](third-party/collection-batch-1.0.schema.json)作回归输入）。
@@ -256,21 +257,21 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
 `permission_id` / `tool_name` / `decision` / `decided_by`；`provenance.kind=transcript` 必带 `rule_version`；`files[].evidence=tool_argument` 只能是
 `target` / `read`，说「改了」要 `tool_result` 或 `before_after`；路径必须在工作区根内、不能 `..`（跨仓改动 K2 没有表达法）；`commits` 只能挂 `turn.end`、
 非空、完整 sha；`ext.*` 必带 `provenance.source_event`；thinking 不能当 assistant 文本。`client.name` 是 const `paas-coding-hook`，先照填（已提意见），vibetrail 自己的版本放 `extensions.vibetrail.version`；`policy_version` 填 `none-0` 表示暂不脱敏（两个默认值用户 09-15 认可）。
-`workspace_id` 取主 checkout（`git worktree list` 第一条），与 G8 的分区键一致，worktree 路径放 extensions。（09-16：协议要的是客户端生成的不透明 UUID，见下表与 OPEN-ISSUES K17）
+`workspace_id` 按主 checkout（`git worktree list` 第一条）生成并持久化的 UUID（09-16 改，K17；原先直接用路径），与 G8 的分区键一致，worktree 路径放 extensions。
 
 **协议文档里 schema 管不到的规矩**（2026-09-16 对照 `paas-coding-collector/docs/collection-event-protocol.md`；❌ 的记在 OPEN-ISSUES，标「push 前」的推数据之前要改完）：
 
 | 规矩 | 我们 |
 |---|---|
-| `project_id` 是简单项目名（配置 > remote 仓库名 > 根目录名），不得含用户名、token、本地完整路径；`workspace_id` 是客户端生成并持久化的不透明 UUID | ❌ K17，push 前 |
-| `status.category` 用推荐值（success / failure / cancellation / denial / skipped / unknown，不认识的按 other 统计）；各事件有推荐 code | ❌ K18，push 前 |
-| `usage` 来源没给的字段省略、不传 0；cached 通常是 input 的子集，不能各项直接相加 | ❌ U12，push 前定 |
-| Stop hook 阻止停止时轮次仍在继续，不得提前发 `turn.end` | ❌ K24（D7 的 `stops` = 1 那条路），push 前定 |
-| 映射规则改了就升 `rule_version`，不改写已收的历史事件 | ❌ K19 |
-| 工具调用中断导致轮次终止，`tool.end(cancelled)` 与 `turn.end` 各发一条 | ❌ K21（K7 判成按停止的那类缺 `tool.end`） |
-| 排队消息用 `delivery=queued`，不能当成人的实时输入 | ❌ K20（现在只计数，正文没发） |
-| `turn.end.files[]` 是查询「每轮改了哪些文件」的标准入口 | ❌ K22 |
-| `content_state=omitted` 时 text / input / output / task / last_message 与 `raw` 必须缺失，不能用空串冒充 | ✅（关掉全采时 `subagent.start` 的 `task` 例外，K23） |
+| `project_id` 是简单项目名（配置 > remote 仓库名 > 根目录名），不得含用户名、token、本地完整路径；`workspace_id` 是客户端生成并持久化的不透明 UUID | ✅ 09-16 改（K17）：登记表 `--name` > origin 仓库名 > 目录名；UUID 持久化在 `workspaces/`，按主 checkout 一个 |
+| `status.category` 用推荐值（success / failure / cancellation / denial / skipped / unknown，不认识的按 other 统计）；各事件有推荐 code | ✅ 09-16 改（K18）：`tool.end` 是 succeeded / failed / cancelled，分类 `error` 一律改 `failure`；来源自己的状态（interrupted、denied、hook_stopped、rate_limit、killed）留在 code |
+| `usage` 来源没给的字段省略、不传 0；cached 通常是 input 的子集，不能各项直接相加 | ✅ 09-16 定（U12）：input 含缓存创建与缓存读，cached 是 input 的子集，total = input + output，没给的不填（§4.2） |
+| Stop hook 阻止停止时轮次仍在继续，不得提前发 `turn.end` | ✅ 09-16 改（K24）：Stop 时先等答完标记 / 拦停反馈落盘（上限 `stop_wait`，默认 10 s）再关，拦停了不关；等不到才走 D7 的老路 |
+| 映射规则改了就升 `rule_version`，不改写已收的历史事件 | ✅ 09-16 升到 v2 基线（K19）；test-map 钉着：输出变了而版本号没升就红 |
+| 工具调用中断导致轮次终止，`tool.end(cancelled)` 与 `turn.end` 各发一条 | ✅ 09-16 改（K21）：K7 判成按停止的那类补 `tool.end(cancelled)`，判成人拒绝的仍只发 `permission.decision` |
+| 排队消息用 `delivery=queued`，不能当成人的实时输入 | ✅ 09-16 改（K20）：全采时每条排队的人话一条 `message.user`（delivery queued），不算分歧之后的下一句；关掉全采只计数 |
+| `turn.end.files[]` 是查询「每轮改了哪些文件」的标准入口 | ✅ 09-16 做了（K22）：Edit / MultiEdit / NotebookEdit / Write / Read 成功的结果记进当前轮，路径相对主 checkout 或 worktree 根，根外的只计数（K2） |
+| `content_state=omitted` 时 text / input / output / task / last_message 与 `raw` 必须缺失，不能用空串冒充 | ✅（09-16 起 `subagent.start` 的 `task` 也只在全采时带，K23） |
 | `is_divergence` 只标人发起的拒绝、打断、纠正，且必须带 `turn_id` | ✅ |
 | 执行前被拒只发 `permission.decision`，不发假的 `tool.end` | ✅ |
 | reasoning、系统提示、工具结果不得伪装成 assistant 文本 | ✅（thinking 进 extensions，system prompt 走扩展事件） |
@@ -323,14 +324,18 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
 - **`turn.end(interrupted)` 的 usage** = 本轮 assistant 记录按 `message.id` 去重后求和（缺 message.id 时退到 `requestId`，照 teamai；
   本机没有缺 id 的记录）。同一 id 留 output 最大的那份，照 ccusage（它说早期流式记录可能是占位值）；本机 24243 条消息里同一 id 各记录的用量
   全部一致，取第一份、最后一份、最大那份结果相同，所以这条也是纯防御。Pilot 取最后一份，teamai 取第一份：
-  input = `input_tokens` + `cache_creation_input_tokens`，cached = `cache_read_input_tokens`，reasoning = `thinking_tokens`，total = 三者之和。
-  **09-16**：采集端协议文档说 cached 通常是 input 的子集、不能各项直接相加，来源没给的字段应省略而不是传 0——与这里不一致，push 前定（OPEN-ISSUES U12）。
+  ~~input = `input_tokens` + `cache_creation_input_tokens`，cached = `cache_read_input_tokens`，reasoning = `thinking_tokens`，total = 三者之和。~~
+  **09-16 改（U12，按采集端协议文档「cached 通常是 input 的子集、不能各项直接相加，来源没给的字段省略而不是传 0」）**：
+  input = `input_tokens` + `cache_creation_input_tokens` + `cache_read_input_tokens`（Claude 的 `input_tokens` 不含缓存，加回去），cached = `cache_read_input_tokens`（input 的子集），
+  output 原样（thinking 已含在内），reasoning = `thinking_tokens`（output 的子集），total = input + output；一个来源字段都没给的项不填。每次调用（`vibetrail.call.usage`）同一算法。
+  与 Pilot 的「token 全量公式」相同；teamai 是四桶独立、总数四项相加，正是协议不许的算法。`vibetrail show` 与演示报告的「入」从此含缓存读，列成「入（其中缓存）/ 出」。
   vcs 只有 branch——transcript 里没有 HEAD，hook 侧补。Stop 路径的 `turn.end` 用同一定义。
 - **哨兵（G6）。** 被拒记录的 `toolUseResult` 是字符串 `User rejected tool use`（或 `Error: Permission to use …` 原文），与正文判据是两个独立字段；
   账本记 `sentinel.marker`（带这个标记的记录数）与 `sentinel.marker_without_hit`（有标记、判据却没认出人拒）。本机 45 个标记、0 次漏判。
 - **状态有上界**：tool_use 索引 500 条、记录链 400 条；分歧引用的永远是最近几条记录。多态字段一律先判 type（判据的铁律照用）。
   jq 的函数参数在调用处的输入上求值：`$r | slim(.ln)` 里的 `.ln` 是 `$r.ln`，第一版因此所有行号都是 null，断链兜底从未生效（09-15 修，fixture 钉着）。
-- **默认值**：`project_id` / `workspace_id` 没传就取 transcript 第一条记录的 `cwd`，hook 分发入口会传真值；`vibetrail.version` 先填 `0.2.0-dev`。
+- **默认值**：`project_id` / `workspace_id` / 工作区根没传就按 transcript 第一条记录的 `cwd` 推——`cwd` 在本机的 git 仓里就与 hook 同一套（主 checkout 的项目名、持久化的工作区 UUID、它的 worktree 当根），
+  不在就用目录名、按 `cwd` 字符串持久化的 UUID、`cwd` 当根（09-16 改，K17 / K22）；hook 分发入口会传真值；`vibetrail.version` 先填 `0.2.0-dev`。
 - **轮次切分**（09-15）。主会话文件里一条 `user` 记录的 promptId 与当前轮不同，就是新的一轮：上一轮关、这一轮开。hook 的 `prompt_id` 与记录的
   `promptId` 是同一个值（09-15 在 desktop 2.1.266 上挂 PostToolUse 探针实测），轮中插话（排队后被并入当前轮的人话）不换 promptId，
   所以 turn.start / turn.end / 分歧事件的 turn_id 都对得上。只有 user 记录带 promptId（assistant、attachment、system 都不带），它们归当前轮。
@@ -595,13 +600,13 @@ Notification 的 `permission_prompt` 挂在 6 s 定时器上、人先答了就�
 （工具名、call id，外加参数与结果全文）。teamai 没有调用这一级（`src/dashboard-collector.ts`）：每次 PostToolUse 记一条工具名（没有耗时、状态），
 token 是 Stop 时扫整份 transcript 加总的会话累计。
 
-定了什么：映射层（`tools/map-events.jq` 的 trace 部分，rule_version `call-v1`；`trace-v1` 已是审计记录格式的名字）从 transcript 出，不另挂 hook。**不带正文**（D5 不变），
+定了什么：映射层（`tools/map-events.jq` 的 trace 部分，rule_version `call-v1`，09-16 升 `call-v2`（K19）；`trace-v1` 已是审计记录格式的名字）从 transcript 出，不另挂 hook。**不带正文**（D5 不变），
 一次调用一条而不是 Pilot 的两条，每条百字节级（本机当时最重的会话 257 次模型调用、254 次工具调用，事件从 25 条变成 530 多条）。
 - **每次模型调用一条 `message.assistant`**（`content_state` = `omitted`），`extensions.vibetrail.call` 带 `response_id`、`request_id`、`stop_reason`、这次的 token、
   `started_at`、调了哪些工具、有没有 thinking。同一 `message.id` 的几条记录是一次调用；**出现另一个 `message.id`、或关轮时读到文件末尾才算结束**——
   2.1.260 边生成边执行工具，工具结果会夹在同一次调用的记录中间。
 - **请求开始**＝最近一条 user 记录与上一次调用结尾里晚的那个，不晚于这次调用的结束；只往后走。
-- **每个工具结果一条 `tool.end`**（工具名、`call_id`、success / error / cancelled——状态值要换成协议推荐的 succeeded / failed、分类 failure，K18；`duration_ms` = 结果时间 − 调用时间；09-16 起工具自报的耗时——WebFetch `durationMs`、
+- **每个工具结果一条 `tool.end`**（工具名、`call_id`、状态 code succeeded / failed / cancelled、分类 success / failure / cancellation——09-16 按协议推荐值改，原先是 success / error 且分类 error，K18；`duration_ms` = 结果时间 − 调用时间；09-16 起工具自报的耗时——WebFetch `durationMs`、
   WebSearch `durationSeconds`、Agent `totalDurationMs`——优先，`vibetrail.duration_kind` 标 `reported` / `wall_clock`，K15②）；这次没读到调用的结果不发；
   执行前被拒的没执行，不出 `tool.end`，拒绝本身已有 `permission.decision`。
 - **子 agent 文件**同样出，实例 = agentId；它的最后一次调用只在它结束后写：SubagentStop 记下的文件大小与现在相同，或会话结束 / 恢复 / 空闲。
@@ -669,7 +674,10 @@ Claude 在同一个 promptId 下接着干活、再来一次 Stop（`stop_hook_ac
 原因是我们的 Stop hook 是 `async`，Claude Code 不等它就写 summary。机制不用改（两条路同一个 event_id，先到的留下），但要读成「有 summary 按 summary 关、没有才按 Stop 关」：
 `|stopN` 那条路只在 summary 缺席时才走；09-15 的观察可能只对 2.1.266、或当时同步挂的 hook 成立。样本只有两次，再看几轮。README、§3.1、CAPABILITIES 的说法已同步改。
 同时核出同一轮可能出两条 turn.end（summary 关成 completed 之后同一 promptId 又来打断），读的一方的取舍规则记在 OPEN-ISSUES K13 / U13。
-**09-16 再记**：采集端协议文档写明「Stop Hook 阻止 Agent 停止时，轮次仍在继续，不得提前发送 `turn.end`」，上面「拦停反馈没落盘时先出一条 `stops` = 1」那条路与它冲突，push 前定怎么改（OPEN-ISSUES K24）。
+**09-16 再记**：采集端协议文档写明「Stop Hook 阻止 Agent 停止时，轮次仍在继续，不得提前发送 `turn.end`」，上面「拦停反馈没落盘时先出一条 `stops` = 1」那条路与它冲突（OPEN-ISSUES K24）。
+**09-16 改（K24）**：Stop hook 先等主会话文件末尾出现这一轮的答完标记（`stop_hook_summary`）或拦停反馈（`hook_blocking_error` 附件、「Stop hook feedback:」），再解析：有标记按标记关（拦停了就不关，等模型补完再 Stop 那次），
+等不到才走上面的老路（按 Stop 当场关、被拦下后补一条 `stops` 更大的）。上限 config `stop_wait`，默认 10 s；本机实测（11 个会话 52 轮）标记比最后一条回复晚 p50 1.9 s、最大 3.9 s——「与 Stop 同一秒」的说法是按 hook 触发时刻看的，按记录时间它晚 2～4 秒。
+我们的 Stop hook 是 async、不拖慢别的 hook，多等这几秒人感觉不到；标记本来就在（重跑 Stop）不等。测试与沙箱演示用 `VIBETRAIL_STOP_WAIT=0` 关掉（它们的标记是事后追加的），K24 一节按真实时序（后台 Stop、1 秒后追加标记）钉着。
 
 ### D6 — push 门槛：满 1 小时或 100 条才推，SessionEnd / SessionStart 兜底不看门槛（2026-09-15，现行）
 
@@ -777,4 +785,4 @@ D2 的「正文与指针分开」在 D5 后反转：分歧事件自带能判责�
 U6 审计线去向 · U7 自建还是改造 Pilot · U8 类型化信号成不成 kind · U9 Codex / Cursor · U12 token 口径 · U13 自定义取值待 collector 确认 ·
 U17 push 门槛默认值 ·
 另有 K6 脱敏（暂缓）、G5（升为前置）、
-G8 / G9 / G6 / G10 / G11。**push 之前要先改**（09-16 对照采集端协议文档核出）：K17 `project_id` / `workspace_id`、K18 状态值、K19 `rule_version`、K24 拦停时不提前发 turn.end，U12 用量口径；全采与协议补齐：K20–K23；本文还没记全采正文的决策：K25。U1 已定（scope 可配，默认 `project`）；U3 / U10 / K1 已由 D5 关闭。
+G8 / G9 / G6 / G10 / G11。**push 之前要先改的**（09-16 对照采集端协议文档核出）**同日改完**：K17 `project_id` / `workspace_id`、K18 状态值、K19 `rule_version`、K24 拦停时不提前发 turn.end、U12 用量口径（§4.1 表里逐条标 ✅）；全采与协议补齐 K20–K23 也已做；本文还没记全采正文的决策：K25。U1 已定（scope 可配，默认 `project`）；U3 / U10 / K1 已由 D5 关闭。

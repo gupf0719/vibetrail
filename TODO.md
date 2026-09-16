@@ -87,12 +87,13 @@
   K8 复制历史按记录 `sessionId` 跳过（🔴，7.6% 的事件在复制的轮上、trace 翻倍）→ K13 打断的 turn.end 补 `closed_by` / `stops`、打断后置 closed →
   K12 只在人话 / 斜杠命令处开轮或打 `turn_kind` → K15 ①③（capabilities 加 `tool.end`、state 目录清理）→ K14 uninstall 留 ids → K16 命令串 `2>/dev/null || true` 与 stdin 超时。
   每条各补一个回归用例（见下面「回归」）。U16 用户 09-16 定只挂 5 个 hook（D13）。
-- [ ] **push 之前先对齐采集端协议**（2026-09-16 对照 `paas-coding-collector/docs/collection-event-protocol.md` 核出；推出去之后再改，云端历史要么分成两份、要么口径前后不一，详见 OPEN-ISSUES）：
-  1. K17：`project_id` 改成简单项目名（remote 的仓库名 > 主 checkout 目录名），`workspace_id` 改成第一次见到时生成、持久化的 UUID（uninstall 留着）；先定按主 checkout 一个还是每个 worktree 一个；test-hook-flow 第 16 段跟着改。
-  2. K18：状态分类换成推荐值（`error` → `failure`），`tool.end` 的 code 换成 `succeeded` / `failed`；goldens 与断言跟着改。
-  3. U12：用量口径——cached 算 input 的子集、total = input + output、来源没给的字段不填（要用户定）。
-  4. K24：被别的 Stop hook 拦下时不提前发 `turn.end`——Stop 时等 `stop_hook_summary` 落盘，或跟 collector 确认可以后到的覆盖先到的（要定）。
-  5. K19：统一升一次 `rule_version` 定成基线，之后改映射规则就升；加钉子：golden 变了而 rule_version 没变就红。
+- [x] **push 之前先对齐采集端协议**（2026-09-16 核出、同日改完，`a34bbf5`；详见 OPEN-ISSUES 各条与 DESIGN §4.1 的表）：
+  1. K17：`project_id` = 登记表 `projects add --name` > origin 仓库名 > 主 checkout 目录名；`workspace_id` = 第一次见到时生成、持久化在 `~/.vibetrail/workspaces/` 的 UUID，按主 checkout 一个（worktree 共享），uninstall 留着；doctor 报两个标识。
+  2. K18：分类 `error` → `failure`，`tool.end` 的 code `succeeded` / `failed` / `cancelled`；来源自己的状态留在 code。goldens 与断言改了。
+  3. U12：input 含缓存创建与缓存读、cached 是 input 的子集、total = input + output、来源没给的字段不填；`show` 与报告列成「入（其中缓存）/ 出」。
+  4. K24：Stop 时先等答完标记或拦停反馈落盘（config `stop_wait` 默认 10 s，本机实测标记晚 2～4 秒），拦停了不发；等不到才走 D7 老路。测试与演示 `VIBETRAIL_STOP_WAIT=0`。
+  5. K19：四路 `rule_version` 升到 v2 基线（`RULE_VERSIONS`）；钉子 test-map 第 10 节：按 rule_version 算输出摘要记在 `expect/RULE-DIGESTS`，变了没升版本就红（`--update` 也红，`--accept-rule-digest` 才放）。
+  本机 11 个会话重映射 5,536 条事件全部过 schema；两家三方都没做 K17 那一层（teamai 报完整路径加服务端数字 id，Pilot 报 owner/repo 加完整路径），U12 与 Pilot 同式。
 - [ ] push（用户 09-15：先不急着做）：`vibetrail push [--list | --show]`，端点从 `~/.vibetrail/config`、token 从 `~/.vibetrail/token` 读（09-16 init 已引导填；联调阶段 token 可省），端点没配不发；配了按协议打批（≤ 100 条 / 16 MiB）、每条先过 schema、`event_id` 幂等、accepted + duplicate 推进水位并删本机块、失败重发。
   **门槛与兜底（D6，用户 09-15 定，DESIGN §4）**：Stop 落 spool 后查全机最早待发是否超 1 小时、全机待发是否满 100 条（`push_max_age` / `push_max_events` 可配），任一满足且不在退避期才推，
   扫全部 spool 混批、循环发到发完、一次最多 10 批；SessionEnd 起脱离进程的后台 push、SessionStart 补做后 push，都不看门槛只看退避；机器级 mkdir 锁 `state/push/.lock`、陈旧阈值 600 s；
@@ -113,7 +114,8 @@
   - `batch_id` 用首末 event_id 算 UUIDv5，重发同一批 id 不变，服务端排查方便；`client.device_id` 用 config 里的。
   - 先修 K14（uninstall 留 spool 删 ids）再上 push，否则重装后待发翻倍。
   - 要测再加：块超 100 条分批与游标续传、4xx 只丢一批、进程在 ack 与删块之间被杀不重不丢、token 不出现在进程列表。
-- [ ] **全采与协议补齐**（2026-09-16 核出，不挡 push，详见 OPEN-ISSUES）：K20 排队的人话发 `message.user`（`delivery: queued`，本机 278 条没上报）；K21 按停止打断工具补发 `tool.end(cancelled)`；K22 `turn.end.files[]`（这一轮改了哪些文件，先量体积）；K23 `capture_content=0` 时 `subagent.start` 不带 `task`；K11 workflow 子 agent 遇到样本时递归扫 `subagents/`；K25 DESIGN 补全采的决策条目、改 §0 / §2 / D5。
+- [x] **全采与协议补齐**（2026-09-16 核出、同日做完 K20–K23，`a34bbf5`）：K20 排队的人话全采时发 `message.user`（`delivery: queued`，本机这台 35 条）；K21 按停止打断工具补 `tool.end(cancelled)`；K22 `turn.end.files[]`（量过：有改动的轮平均 3.5 个文件、最多 10 个、路径约 100 字节，每条 turn.end 不到 1 KB；根外的只计数）；K23 `capture_content=0` 时 `subagent.start` 不带 `task`。
+  **还开着**：K11 workflow 子 agent 遇到样本时递归扫 `subagents/`（本机仍没有样本）；K25 DESIGN 补全采的决策条目、改 §0 / §2 / D5；子 agent 自己改的文件没进任何 `files[]`（它的 `subagent.end` 由父文件发，父不解析子 transcript）。
 - [ ] 完整性钉子：每类记录条数进出相等、映射后事件全部过 schema（这两条测试期已在 `test-map.sh` 钉住；运行时要进账本与 doctor）、超 1 MiB 被拒计数、未知记录类型 / 事件名告警（A11；G10、G6）。
   **09-16**：映射账本里 in / out / replayed / skipped_no_uuid / sentinel 已有，K8 修后再加 inherited；缺的是把它们按会话累计进 state、由 doctor 汇总（哪个会话 `marker_without_hit` > 0、`skipped_*` > 0、replayed 异常多），
   并在 test-hook-flow 里做成恒等式断言（记录数 = 出事件的 + 跳过的 + 不产事件的）——Pilot 的恒等式只写在文档里、测试 grep 不到，正是要避免的（G10）。

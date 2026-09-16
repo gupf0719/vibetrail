@@ -62,7 +62,7 @@ bash tools/vibetrail init
 - `vibetrail list` 列出 spool 里的每个块文件，文件在 `~/.vibetrail/spool/<项目>/<会话>/*.jsonl`，每行一条协议事件，直接 `cat` 就能看。
 - `vibetrail token` 填或换上报 token（不回显，存 `~/.vibetrail/token`，权限 600）；`vibetrail doctor` 自检；`vibetrail uninstall` 卸载（只去掉 settings 里自己的条目，spool 留着，`--purge` 才全删）。
 - 什么时候出现什么：说一句话就有 `turn.start`（带 HEAD）；模型答完（Stop）后，这一轮的 `turn.end`（状态、用量、本轮 commit）、每次模型调用的 `message.assistant` 与每次工具调用的 `tool.end`（trace，不带正文，DESIGN D8）、分歧事件一起落盘。
-  Stop hook 触发就是模型答完，当场写（Claude Code 自己的答完标记 `stop_hook_summary` 已落盘就按它关，desktop 2.1.270 实测与 Stop 同一秒；没有才按 Stop 关）；别的 Stop hook 把这次 Stop 拦下时，模型补完再 Stop 会再写一条更新的（DESIGN D7）。
+  Stop hook 触发就是模型答完；先等 Claude Code 自己的答完标记 `stop_hook_summary` 落盘（本机实测比最后一条回复晚 2～4 秒，最多等 10 秒，config `stop_wait`）再按它关轮；别的 Stop hook 把这次 Stop 拦下时不发，模型补完再 Stop 才写；等不到标记才按 Stop 当场关（DESIGN D7、K24）。
   你按停止打断的轮要等下一个 hook 才写（打断没有 hook，desktop 实测）；打断正在跑的工具按有没有弹过权限框分成「按停止打断工具」与「拒绝」（DESIGN D9）。
 
 ## 状态
@@ -71,6 +71,8 @@ bash tools/vibetrail init
 hook 分发入口（`tools/vibetrail-hook`：会话 / 轮次起止、git 状态、commit ↔ 轮次推导）、
 机器级安装与本地查看（`tools/vibetrail`：init / uninstall / projects / doctor / list / show / sync）、照 Pilot 粒度的调用 trace。人机分歧与轮次元数据是同一条事件流。
 push 与五个补充回归场景按用户 09-15 的要求往后放。09-16 拿本机 124,666 条真实事件复核了已完成的部分，待修项立在 OPEN-ISSUES K8、K12–K16，push 方案的修正在 TODO。同日定只挂 5 个 hook（SessionStart / UserPromptSubmit / Stop / SessionEnd / PermissionRequest，DESIGN D13）：子 agent 起止、API 出错、CLAUDE.md 加载、切目录改在 Stop 时从 transcript 推。同日定运行时换成 Node 单文件 `.mjs`、去掉 jq，bash 只留 sh 包装（DESIGN D12），并已移植完毕：运行时是 `tools/vibetrail.mjs` + `tools/lib/{map,hook,cli}.mjs`，唯一依赖 node ≥ 20；老的 bash + jq 版归档在 `old/jq/`。G7 之前的代码与测试已归档到 `old/`。已有并沿用的是人机分歧判据（755 会话实测精确率 100%，裸 grep 只有 10.5%）。
+同日 push 前对齐采集端协议：`project_id` 改成简单项目名、`workspace_id` 改成本机生成并持久化的 UUID（K17），状态 code / 分类换成协议推荐值（K18），四路 `rule_version` 升到 v2 基线并加钉子（K19），
+用量口径改成「入含缓存读、总数 = 入 + 出、没给的不填」（U12），Stop 时先等答完标记再关轮（K24）；全采补齐：排队的人话发 `message.user`（K20）、按停止打断工具补 `tool.end(cancelled)`（K21）、`turn.end.files[]`（K22）、关掉全采时 `subagent.start` 不带 task（K23）。
 上一版设计（留痕投影进被观测仓、git hook 写 trailer）已退役，理由与替代见 [DESIGN.md §7](DESIGN.md)。
 
 已实测确立的地基（`experiments/` 可复现）：Claude Code 的 hook 在 **desktop app 下正常触发且热加载**，stdin 直接给出 `transcript_path`；
