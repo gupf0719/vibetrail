@@ -60,18 +60,42 @@
 - [x] commit ↔ 轮次推导（09-15）：轮起 / 轮止快照（`state/<sid>/turns/`），本轮 commit = `rev-list 起..止` + 本轮 reflog 里新建的提交，归因看 transcript 里 agent 有没有跑
   `git commit`（DESIGN §3.5）；demo.sh 第 1 轮中途真的提交一次，turn.end 带上了。原写的「`vibetrail show` 按 commit 查改走它」不做了：按 commit 查是读取端的事（D5），
   现在的 `vibetrail show` 是本地预览。Bash stdout 里短 sha 的旁证还没做。
+- [ ] **09-16 复核核出的修补**（本机 124,666 条真实事件 + teamai / Pilot 源码对照，见 OPEN-ISSUES；都小，先做，顺序按影响排）：
+  K8 复制历史按记录 `sessionId` 跳过（🔴，7.6% 的事件在复制的轮上、trace 翻倍）→ K13 打断的 turn.end 补 `closed_by` / `stops`、打断后置 closed →
+  K12 只在人话 / 斜杠命令处开轮或打 `turn_kind` → K15 ①③（capabilities 加 `tool.end`、state 目录清理）→ K14 uninstall 留 ids → K16 命令串 `2>/dev/null || true` 与 stdin 超时。
+  每条各补一个回归用例（见下面「回归」）。U16（四个只记事件头的事件默认登不登记）等用户定。
 - [ ] push（用户 09-15：先不急着做）：`vibetrail push [--list | --show]`，端点与 token 从 `~/.vibetrail/config` 读、没配不发；配了按协议打批（≤ 100 条 / 16 MiB）、每条先过 schema、`event_id` 幂等、accepted + duplicate 推进水位并删本机块、失败重发。
   **门槛与兜底（D6，用户 09-15 定，DESIGN §4）**：Stop 落 spool 后查全机最早待发是否超 1 小时、全机待发是否满 100 条（`push_max_age` / `push_max_events` 可配），任一满足且不在退避期才推，
   扫全部 spool 混批、循环发到发完、一次最多 10 批；SessionEnd 起脱离进程的后台 push、SessionStart 补做后 push，都不看门槛只看退避；机器级 mkdir 锁 `state/push/.lock`、陈旧阈值 600 s；
   失败分暂时（退避 1 分钟起指数到 1 小时封顶，记在 `state/push/`）与永久（4xx 整块挪 `spool/.rejected/`、计数进 doctor）。
   要测：门槛不满不发、满任一就发且发全机、兜底不看门槛、退避期兜底也不发、4xx 隔离不重试、两个 hook 同时推不重不丢、SessionEnd 的后台进程在 `-p` 与 desktop 关会话时活不活（没实测，DESIGN §3.1）。
   测试对手先用一个只记录请求并按 schema 校验的桩端点（Pilot / teamai 实跑样例就是这么截的）。
+  **09-16 复核后的修正**（对照 teamai `team-push.ts` / `local-agent.ts`、Pilot `sls-flusher.ts` / `http-flusher.ts` 与本机真实 spool）：
+  - **批是 ack 单位，不是块**：本机 751 块里 310 块超过 100 条，最大一块 20,000 条（补采历史）。每块记一个已发行号的游标（`state/push/<块名>.cursor`），按批发、批 ack 推进游标，
+    游标到末尾才删块；进程在 ack 与推进游标之间被杀最多重发一批，event_id 幂等兜住。上面「ack 即删整块」按这个理解。
+  - **4xx 只隔离那一批**（≤ 100 条写进 `spool/.rejected/<块名>.<批号>.jsonl`），游标照推——一块 20,000 条不能因一条坏事件全丢。
+  - **门槛重估**：加了 trace 后一轮常常就超 100 条（本机 `message.assistant` + `tool.end` 占 95%），「满 100 条」等于每次 Stop 都推，D6 要的「每小时量级」不成立。
+    要么明说接受，要么 `push_max_events` 默认改到 1,000 左右；SessionStart / sync 的后台路径不限 10 批（本机现在积压 1,245 批，按 10 批要 125 次 hook 才发完），改成限时（如 60 s）不限批数。
+  - **「每条先过 schema」bash + jq 做不到**：改成 jq 结构预检（必填键、`code` 正则、`occurred_at` 以 Z 结尾、单条 ≤ 1 MiB、每批 ≤ 100 条 / 16 MiB），完整 schema 校验只留在测试里（python jsonschema）。
+  - **可重试集合明写**（借 Pilot `sls-transport.ts`）：HTTP 408 / 429 / 500 / 502 / 503 / 504 与 curl 退出码 6 / 7 / 28 / 35 / 52 / 56 算暂时；401 / 403 算暂时但 doctor 单独点名「配置问题」；其余 4xx 永久。退避带抖动。
+    别学 Pilot 的 checkpoint 先于 ack（它 SLS 失败只留元数据、数据丢）和 HTTP flusher 失败无限内存重放，也别学 teamai 上报失败仍截断本地事件（`pull.ts:1501-1512`）。
+  - **token 不放 curl 命令行参数**（`ps` 看得见）：`--header @文件` 或 `-K` 配置文件，0600、用完删；debug 日志里不记请求头。
+  - `batch_id` 用首末 event_id 算 UUIDv5，重发同一批 id 不变，服务端排查方便；`client.device_id` 用 config 里的。
+  - 先修 K14（uninstall 留 spool 删 ids）再上 push，否则重装后待发翻倍。
+  - 要测再加：块超 100 条分批与游标续传、4xx 只丢一批、进程在 ack 与删块之间被杀不重不丢、token 不出现在进程列表。
 - [ ] 完整性钉子：每类记录条数进出相等、映射后事件全部过 schema（这两条测试期已在 `test-map.sh` 钉住；运行时要进账本与 doctor）、超 1 MiB 被拒计数、未知记录类型 / 事件名告警（A11；G10、G6）。
+  **09-16**：映射账本里 in / out / replayed / skipped_no_uuid / sentinel 已有，K8 修后再加 inherited；缺的是把它们按会话累计进 state、由 doctor 汇总（哪个会话 `marker_without_hit` > 0、`skipped_*` > 0、replayed 异常多），
+  并在 test-hook-flow 里做成恒等式断言（记录数 = 出事件的 + 跳过的 + 不产事件的）——Pilot 的恒等式只写在文档里、测试 grep 不到，正是要避免的（G10）。
 - [ ] 回归（用户 09-15：先不急着做）：两路各有带断言的测试，输入用 [experiments/collect-demo/scenario.json](experiments/collect-demo/scenario.json) 回放，补上 SessionStart 补做、
   打断后无 Stop、后台子 agent 晚于父 Stop、一轮多 commit、端点未配置 / 配置后断网五个场景。分歧一路已有 `test-hook-flow.sh`，其中补做与打断后无 Stop 已覆盖；
   轮次元数据一路现在只有 demo.sh 端到端跑一遍、没有断言。本机 python 没装 jsonschema，两套回归里的 schema 项在这台机器上是跳过的。
+  **09-16 要补的用例**：带外来 `sessionId` 记录的复制历史不上报（K8）、非人话 promptId 不开轮（K12）、关轮之后再来打断只留一条或带 closed_by（K13）、
+  summary 与 Stop 同一秒落盘时两条路 event_id 相同且只留一条（D7 补记）、uninstall 后重装 spool 不翻倍（K14）、命令串带 `|| true` 时 `settings_ok` / doctor 仍认得（K16）；push 的见上。
+  turn.start / turn.end 成对、status、commits 的断言也还没有（demo.sh 只打印）。
 - [ ] 查询端只留 push 前本地预览（G9，读取不归本项目）：`vibetrail list / show` 已做（09-15），`push --list / --show` 随 push；然后 OPEN-ISSUES 关 G7。
   退役脚本 09-15 已按用户要求归档到 `old/`（`old/README.md`），审计线的几份随 U6 定去留。
+  **09-16 加**：`vibetrail show --bodies` 只列 `content_state = included` 的事件（被拒调用的 `tool.request.input`、被打断的回复、之后人的下一句），
+  就是 G9 原话「让开发放心没有侵犯隐私」要的那份「什么正文出了本机」，几十行。
 
 ## G11 多个会话改、一个会话提交：追回每一行出自哪个会话
 

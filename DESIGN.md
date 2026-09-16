@@ -110,7 +110,7 @@ Pilot 的拦截器路线（[对比 §6.3](third-party/teamai-cli-vs-vibetrail.md
 |---|---|---|
 | `SessionStart` | 门控（按 scope，§5）→ 发 `session.start`（`source`、capabilities；model、git 状态进 extensions）→ **补做**：本仓（按 `git worktree list` 归属）所有 offset 落后于文件大小的 transcript，各补一次解析（分歧 + 轮次元数据）；同一会话 `resume`、别的会话空闲超过 `turn_idle_close`（默认 3600 s）时把它的最后一轮也关掉（D7）；然后 **push 全机待发、不看门槛**（只看退避期，§4；push 未做）。startup / resume / clear / compact 都触发，频率不低，是最靠得住的兜底：agent 崩溃、被杀、`-p` 模式下 Stop / SessionEnd 都不来，全靠这一步 | 同步 hook，但读完 stdin 就把门控、记录、补做全丢进脱离的后台进程，自己约 0.02 s 退出（09-15 实现时定：不让人等） |
 | `UserPromptSubmit` | 发 `turn.start`（`prompt_id` 作 turn_id、会话已知的 model、HEAD / 分支 / 脏否，提示来源 `source` 进 extensions），记轮起快照（§3.3 `turns/`）；上一轮没等到 Stop 的（打断、拒绝、崩溃），用此刻的快照给它补一份「止」（gap）。**不读 transcript**（U11，09-15 定）：这里解析的结果本来也不 push、云端看到的时间不变，同步 hook 却要让人等；Pilot、teamai 也都不在这里读 | 同上：丢后台、立刻退出；stdout 会进模型上下文，**必须为空** |
-| `Stop` | 记轮止快照与本轮 commit（§3.5；被别的 Stop hook 拦停后同一轮会再来一次 Stop，每次覆盖、`stops` 计次）→ 等 transcript 写稳 → 从本轮开头解析（§3.3）：分歧事件 + **本轮的 turn.end**——Stop 就是模型答完，当场关（D7；Claude Code 的答完标记 `stop_hook_summary` 要等下一句人话才落盘，不等它）；被别的 Stop hook 拦下时再来一次 Stop，再发一条更新的 → 落 spool，再**看门槛决定推不推**（D6，09-15 定，规则在 §4；push 未做）：全机最早待发事件超过 1 小时、或全机待发满 100 条，任一满足且不在退避期就推，推的是全机所有待发、不只本会话；都不满足就只落盘，本轮不发；端点未配置时只记账不发。同一会话一把 mkdir 锁（照 Pilot），已在跑就跳过，下一次 hook 补上；push 另持一把机器级锁（§4） | `async: true`：不阻塞、不计 timeout |
+| `Stop` | 记轮止快照与本轮 commit（§3.5；被别的 Stop hook 拦停后同一轮会再来一次 Stop，每次覆盖、`stops` 计次）→ 等 transcript 写稳 → 从本轮开头解析（§3.3）：分歧事件 + **本轮的 turn.end**——Stop 就是模型答完，当场关（D7；Claude Code 的答完标记 `stop_hook_summary` 落盘了就按它关、没有才按 Stop 关——09-16 在 desktop 2.1.270 上实测它与 Stop 同一秒落盘，见 D7 的 09-16 补记）；被别的 Stop hook 拦下时再来一次 Stop，再发一条更新的 → 落 spool，再**看门槛决定推不推**（D6，09-15 定，规则在 §4；push 未做）：全机最早待发事件超过 1 小时、或全机待发满 100 条，任一满足且不在退避期就推，推的是全机所有待发、不只本会话；都不满足就只落盘，本轮不发；端点未配置时只记账不发。同一会话一把 mkdir 锁（照 Pilot），已在跑就跳过，下一次 hook 补上；push 另持一把机器级锁（§4） | `async: true`：不阻塞、不计 timeout |
 | `SubagentStart` / `SubagentStop` | 发 `subagent.start` / `subagent.end`（`agent_id` 作实例 id、`agent_type`、父实例：一级是 `main`，被子 agent 派出的是 meta.json 的 `toolUseId` 所在的兄弟文件；`parent_call_id` 取 meta.json 的 `toolUseId`，09-15 实跑 SubagentStart 时 meta.json 已经在）；Stop 时再扫一遍 `subagents/` 目录——后台子 agent 在父 Stop 之后才结束 | 异步 |
 | `PostToolUseFailure` / `PermissionDenied` / `StopFailure` / `Notification`（`permission_prompt`、`idle_prompt`） | 只记事件头，发 `ext.claude.<事件名的 snake_case>`：`tool_use_id`、`tool_name`、`is_interrupt`、`reason`（≤ 1 KB）/ `error`（StopFailure 的错误类型）/ `notification_type`、时间。PostToolUseFailure 的 `error` 原文是工具输出，只记字节数（D5）。StopFailure 另记进本轮，关轮时 status 取 error。`is_interrupt` 为 true 时等打断记录落盘后当场解析（二进制里工具抛出中止错误的路径会置 true；desktop 里按停止**不走这条路**，实测没有触发，见 D7）。`idle_prompt` 不发事件，只补一次解析（CLI 交互界面空闲时发，desktop 实测不发）。类型化信号，见 §3.2 | 异步（09-15 实现时改：只记事件头，不必让工具调用等） |
 | `InstructionsLoaded` | 记 `file_path`、`memory_type`、`load_reason`、正文 sha256 与字节数；正文不传（D5，有必要再补） | 异步 |
@@ -228,7 +228,7 @@ flowchart LR
 | push 什么时候发 | **不是每轮推**（D6，用户 09-15 定）。Stop 落完 spool 查两个门槛，任一满足就推：**全机最早待发事件超过 1 小时**，或**全机待发满 100 条**（正好一整批）。两个值在 `~/.vibetrail/config` 里可改（`push_max_age`，默认 3600 s；`push_max_events`，默认 100）。计时从最早待发事件算、不从上次推送算：保证的是「任何事件在本机最多待约 1 小时加到下一次 hook 的间隔」，时间就在块文件名上、不另记状态，空闲之后窗口从第一条事件起算、批更满。**按整台机器算、不按会话算**：一次 push 扫全部 `spool/<项目>/<sid>/`，合在一起打批（协议允许混批，§3.3）；并行开几个会话时各数各的谁都攒不满。待发超过 100 条就循环发，发完或失败为止，一次最多 10 批、剩下的下一次 hook 接着发（SessionStart 补做后常一次上千条）。**兜底不看门槛**：SessionEnd 起后台 push、SessionStart 补做后 push，都只看退避期。没有 daemon，「满 1 小时」的实际含义是「超过 1 小时后的第一个 hook 才推」，不是每小时推一次；人空闲时既没有新事件也没有 hook，攒下的最后几条要等下一次 hook 或下一次开会话——与 teamai 等到下一次 pull 才上报是同一类最坏情况，只在边角出现。push 持一把**机器级 mkdir 锁** `state/push/.lock`（与会话锁同款，已在跑就跳过），作用是省请求与账好对，不是保正确：块文件写入后不变、ack 后删块幂等，两个 hook 同时推同一块只会多发一次、服务端答 duplicate。锁的陈旧阈值单独定为 600 s：一次最多 10 批、每批 curl 超时 30 s，会话锁的 300 s 不够 |
 | push 失败怎么办 | 分两类，照 agentsview 的思路（[调研](third-party/open-source-survey.md)）。**暂时失败**（连不上、超时、5xx，以及 401 / 403 这类配置问题）：块留 spool，失败时间与次数记在 `state/push/`，退避期内**所有触发点都不发，含 SessionEnd / SessionStart 的兜底**（resume、clear、compact 都触发 SessionStart，端点挂掉时不看退避就是每次 compact 打一次注定失败的请求）；退避从 1 分钟起指数增长、封顶 1 小时，与时间门槛同量级；客户端超时但服务端已收下的，重发得到 duplicate，正是 `event_id` 幂等要挡的情况。**永久失败**（4xx 里的内容问题：schema 不过、单条超 1 MiB）：拒单条还是拒整批协议资料没写，按拒整批准备——整块挪到 `spool/.rejected/`、计数、doctor 报出来，**不重试**；否则它卡在队头，后面所有事件都推不出去。401 / 403 也进 doctor |
 | 保留 | 端点未配置前 spool 积着（上限与超限策略 U5，倾向只警告不丢）。配置后 **ack 即删**，不留 N 天。云端索引保留 30 天，**够用**（用户 09-15：「超过一个月复盘意义不大」）。仍要在会话自己的 Stop / SessionEnd 里落 spool，SessionStart 补做只是兜底——transcript 清理可能先于 hook 把源删掉 |
-| 体积 | 每会话 KB 级：分歧事件带被拒命令与被打断的回复，单条通常远小于 1 MiB；元数据每轮几条、百字节级。上一版 700 MB 字节流的分块与压缩问题随 D5 消失 |
+| 体积 | 分歧事件带被拒命令与被打断的回复，单条通常远小于 1 MiB。~~元数据每轮几条、百字节级，每会话 KB 级~~ **09-16 改**：D8 的调用 trace 让每轮变成几十到几百条——本机 45 个会话 120 MB、124,666 条，trace 占 95%，每会话 MB 级、最大的会话约 50,000 条（`5f069818`：23,147 次模型调用、26,307 次工具调用）。push 的门槛（D6）、spool 上限（U5）、云端 30 天的量都按这个算。上一版 700 MB 字节流的分块与压缩问题随 D5 消失 |
 | 隐私 | 出本机的正文只剩：被拒调用的工具输入与拒绝原文、被打断的模型回复、打断后人的下一句。可能含命令里的密钥与代码片段。**暂不脱敏**（用户 09-14，K6），先原样传。云端「记录默认对公司已登录用户可见」（协议与 collector 文档），是目前唯一的闸而且是开的，已提意见 |
 
 ### 4.1 映射到协议 1.0
@@ -466,7 +466,7 @@ Notification 的 `permission_prompt` 挂在 6 s 定时器上、人先答了就�
 
 本机效果：3 条 user-rejected（2 条是同一条被复制进两个会话）全在 auto 模式的轮里，都改判成按停止——其中一条就是 09-15 请用户按停止的实测；
 另一条是 09-11 一次 Agent 调用被拒，按粗分判成按停止，当时实际是不是按的停止没法核实。desktop 里 PermissionRequest 会不会触发、payload 与二进制是否一致，
-要在 default 模式的会话里弹一次框、点一次拒绝才能实测（auto 模式下几乎不弹框）；实测前，这部分只有二进制与回归（`test-hook-flow.sh` 第 14、15 段）的依据。
+要在 default 模式的会话里弹一次框、点一次拒绝才能实测（auto 模式下几乎不弹框）；实测前，这部分只有二进制与回归（`test-hook-flow.sh` 第 14、15 段）的依据。**09-16 补记**：装上后本机 8 条 `ext.claude.permission_request`（含子 agent 里的、auto 模式下 AskUserQuestion 的、acceptEdits 下 Edit / Bash 的），desktop 里确实触发，待实测项关闭（OPEN-ISSUES K7）。
 
 ### D8 — 采调用 trace：照 Pilot 的粒度，一次调用一条，不带正文（2026-09-15，现行）
 
@@ -544,6 +544,12 @@ Claude 在同一个 promptId 下接着干活、再来一次 Stop（`stop_hook_ac
 
 验证：本机 10 份真 transcript、30 个切点，「前段 ∪ 从 checkpoint 起的后段 == 一次读全」逐条一致；demo.sh 每轮在 Stop 之后才写 summary（照 desktop 的顺序），
 每轮的 turn.end 在 Stop 时就出；加的一轮「第一次 Stop 被拦、补完再 Stop」只出一条、带两次提交、`stops` = 2；拦停反馈没落盘时先出一条 `stops` = 1、第二次 Stop 再出一条 `stops` = 2（event_id 不同）。
+
+**09-16 补记（desktop 2.1.270 实测，样本两次 Stop）**：「desktop 要等下一句人话才把 summary 写进文件」在 2.1.270 上不成立——重装后会话 `ddfb3c0c` 的两次真实 Stop（轮 `d91dff2a`、`9b5ec3ff`），
+`stop_hook_summary` 的时间戳与 Stop hook 同一秒，Stop 时的解析（`wait_stable` 之后）已经读到它，两轮都是 `closed_by: summary`；本机全部 2,389 条 turn.end 里 `end_evidence: hook_stop` 一条都没有。
+原因是我们的 Stop hook 是 `async`，Claude Code 不等它就写 summary。机制不用改（两条路同一个 event_id，先到的留下），但要读成「有 summary 按 summary 关、没有才按 Stop 关」：
+`|stopN` 那条路只在 summary 缺席时才走；09-15 的观察可能只对 2.1.266、或当时同步挂的 hook 成立。样本只有两次，再看几轮。README、§3.1、CAPABILITIES 的说法已同步改。
+同时核出同一轮可能出两条 turn.end（summary 关成 completed 之后同一 promptId 又来打断），读的一方的取舍规则记在 OPEN-ISSUES K13 / U13。
 
 ### D6 — push 门槛：满 1 小时或 100 条才推，SessionEnd / SessionStart 兜底不看门槛（2026-09-15，现行）
 
