@@ -30,7 +30,9 @@ set -uo pipefail
 SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$SELF/vibetrail-lib.sh"
 
-RUNTIME_FILES="vibetrail vibetrail-hook vibetrail-lib.sh vibetrail-map map-events.jq diverge-rules.jq hook-events.jq"
+# D12 移植中：hook 这条路已经全走 node（vibetrail-hook 是 sh 包装 → vibetrail.mjs → lib/*.mjs）。
+# jq 那几个还留着：doctor 的探针与 vibetrail-map 暂时还用，④ 归档时一起去掉
+RUNTIME_FILES="vibetrail vibetrail-hook vibetrail-lib.sh vibetrail-map map-events.jq diverge-rules.jq hook-events.jq vibetrail.mjs lib/map.mjs lib/hook.mjs"
 CORE_EVENTS="SessionStart UserPromptSubmit Stop SubagentStop SessionEnd Notification"     # 老版本就有
 OPT_EVENTS="SubagentStart PostToolUseFailure PermissionRequest PermissionDenied StopFailure InstructionsLoaded CwdChanged"
 SETTINGS=$(vt_settings_path)
@@ -210,7 +212,7 @@ cmd_init(){
     mkdir -p "$VT_HOME"/spool "$VT_HOME"/state "$VT_HOME"/projects "$VT_HOME"/logs
     if [ "$(vt_realpath "$SELF")" != "$(vt_realpath "$VT_HOME/bin" 2>/dev/null)" ]; then
         rm -rf "$VT_HOME/bin.new"; mkdir -p "$VT_HOME/bin.new"
-        for a in $RUNTIME_FILES; do cp "$SELF/$a" "$VT_HOME/bin.new/$a" || die "拷不了 $SELF/$a"; done
+        for a in $RUNTIME_FILES; do mkdir -p "$VT_HOME/bin.new/$(dirname "$a")" && cp "$SELF/$a" "$VT_HOME/bin.new/$a" || die "拷不了 $SELF/$a"; done
         chmod +x "$VT_HOME/bin.new/vibetrail" "$VT_HOME/bin.new/vibetrail-hook" "$VT_HOME/bin.new/vibetrail-map"
         local src_rev; src_rev=$(git -C "$SELF" rev-parse --short HEAD 2>/dev/null || echo unknown)
         # jq 也记一笔：同一份 .jq 在不同 jq 版本上编译结果不一样，换过 jq 时 doctor 要看得出来
@@ -228,6 +230,7 @@ cmd_init(){
     [ -n "$scope" ] && conf_set scope "$scope"
     [ -n "$(vt_conf scope)" ] || conf_set scope project
     conf_set jq "$JQ"
+    local nodebin; nodebin=$(command -v node 2>/dev/null) && conf_set node "$nodebin"
     [ -n "$(vt_conf device_id)" ] || conf_set device_id "$(new_uuid)"
     [ -n "$(vt_conf turn_idle_close)" ] || conf_set turn_idle_close 3600
     [ -n "$(vt_conf push_max_age)" ] || conf_set push_max_age 3600

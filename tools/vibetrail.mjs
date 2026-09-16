@@ -8,7 +8,9 @@
 // stdout：每行一个协议事件（event_id 为 null、多一个 _key，由 vt_fill_ids 填），最后一行 {"_ledger": …}。
 // 与 jq 版逐字节对齐：字段、顺序、账本都不变（golden 比对前按键排序，所以键序无关）。
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { mapRecords } from './lib/map.mjs';
+import { runHook, detach, SYNC_EVENTS } from './lib/hook.mjs';
 
 const argv = process.argv.slice(2);
 const cmd = argv.shift();
@@ -70,6 +72,21 @@ if (cmd === 'map') {
   for (const e of events) buf += JSON.stringify(e) + '\n';
   buf += JSON.stringify({ _ledger: ledger }) + '\n';
   process.stdout.write(buf);
+} else if (cmd === 'hook' || cmd === 'hook-run') {
+  // hook：Claude Code 给的 payload 在 stdin。纪律（DESIGN §3.4）：stdout 永远为空、永远 exit 0。
+  // 同步 hook（SessionStart / UserPromptSubmit / SessionEnd / PermissionRequest）读完 stdin 就丢后台，自己立刻退出，不让人等；
+  // hook-run 是那个后台进程自己的入口，不再二次丢。
+  const event = argv.shift() ?? '';
+  let payload = '';
+  try { payload = readFileSync(0, 'utf8'); } catch { process.exit(0); }
+  try {
+    if (cmd === 'hook' && SYNC_EVENTS.has(event) && process.env.VIBETRAIL_FOREGROUND !== '1') {
+      detach(fileURLToPath(import.meta.url), event, payload);
+    } else {
+      runHook(event, payload);
+    }
+  } catch { /* 失败只进 errors.log，永远 exit 0 */ }
+  process.exit(0);
 } else {
-  die(`未知子命令 ${cmd ?? '(空)'}；移植期间只有 map`);
+  die(`未知子命令 ${cmd ?? '(空)'}；移植期间有 map / hook`);
 }
