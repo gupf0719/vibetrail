@@ -7,10 +7,10 @@
 // stdin 是 vibetrail-map 按 offset 切好的那一段（整行，末尾半行由调用方裁掉），每行一条记录。
 // stdout：每行一个协议事件（event_id 为 null、多一个 _key，由 vt_fill_ids 填），最后一行 {"_ledger": …}。
 // 与 jq 版逐字节对齐：字段、顺序、账本都不变（golden 比对前按键排序，所以键序无关）。
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { mapRecords } from './lib/map.mjs';
-import { runHook, detach, SYNC_EVENTS } from './lib/hook.mjs';
+import { runHook, detach, SYNC_EVENTS, mapFile, vtConf } from './lib/hook.mjs';
 import { cli } from './lib/cli.mjs';
 
 const argv = process.argv.slice(2);
@@ -73,6 +73,51 @@ if (cmd === 'map') {
   for (const e of events) buf += JSON.stringify(e) + '\n';
   buf += JSON.stringify({ _ledger: ledger }) + '\n';
   process.stdout.write(buf);
+} else if (cmd === 'map-file') {
+  // 与老的 bash vibetrail-map 参数一一对应（它现在是转到这里的 sh 包装）：
+  // 自己按 offset 切文件、算 event_id、写账本与 sources；stdout 每行一个事件
+  let f = '', ledger = '', sourcesOut = '', startByte = null;
+  const o = { turns: true, capture_content: '' };
+  for (let i = 0; i < argv.length; i++) {
+    const k = argv[i], v = argv[i + 1];
+    switch (k) {
+      case '--sid': o.sid = v; i++; break;
+      case '--project-id': o.project_id = v; i++; break;
+      case '--workspace-id': o.workspace_id = v; i++; break;
+      case '--parent-instance': o.parent_instance = v; i++; break;
+      case '--start-line': o.start_line = Number(v); i++; break;
+      case '--start-byte': startByte = v === '' ? null : Number(v); i++; break;
+      case '--from-line': o.from_line = Number(v); i++; break;
+      case '--meta': o.meta = v ? JSON.parse(readFileSync(v, 'utf8')) : null; i++; break;
+      case '--seen-uuids': o.seenFile = v; i++; break;
+      case '--hook-turns': o.hook_turns = v ? JSON.parse(readFileSync(v, 'utf8')) : {}; i++; break;
+      case '--hook-perms': o.hook_perms = v ? JSON.parse(readFileSync(v, 'utf8')) : []; i++; break;
+      case '--perm-since': o.perm_since = v; i++; break;
+      case '--close-last': o.close_last = v; i++; break;
+      case '--stop-turn': o.stop_turn = v; i++; break;
+      case '--vt-version': o.vt_version = v; i++; break;
+      case '--capture-content': o.capture_content = v; i++; break;
+      case '--ledger': ledger = v; i++; break;
+      case '--sources-out': sourcesOut = v; i++; break;
+      case '--no-turns': o.turns = false; break;
+      default:
+        if (k.startsWith('-')) die(`未知参数 ${k}`);
+        if (f) die('只接受一个 transcript');
+        f = k;
+    }
+  }
+  if (!f) die('缺 transcript 路径');
+  if (startByte !== null) o.start_byte = startByte;
+  if (!o.capture_content) o.capture_content = vtConf('capture_content', '1');
+  let out;
+  try { out = mapFile(f, o); } catch (e) { die(String(e.message)); }
+  let buf = '';
+  for (const e of out.events) buf += JSON.stringify(e) + '\n';
+  process.stdout.write(buf);
+  const lg = JSON.stringify(out.ledger) + '\n';
+  if (ledger) writeFileSync(ledger, lg); else process.stderr.write(lg);
+  if (sourcesOut) appendFileSync(sourcesOut, (out.ledger.sources || []).map(([u, n]) => `${u}\t${n}`).join('\n') + (out.ledger.sources?.length ? '\n' : ''));
+  process.exit(0);
 } else if (cmd === 'hook' || cmd === 'hook-run') {
   // hook：Claude Code 给的 payload 在 stdin。纪律（DESIGN §3.4）：stdout 永远为空、永远 exit 0。
   // 同步 hook（SessionStart / UserPromptSubmit / SessionEnd / PermissionRequest）读完 stdin 就丢后台，自己立刻退出，不让人等；

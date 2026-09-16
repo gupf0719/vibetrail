@@ -66,7 +66,7 @@ bash tools/vibetrail init
 2026-09-14 需求与设计定稿、09-15 定不传 transcript 原文件并选定云端协议（DESIGN D5）；同日做完：分歧映射成协议 1.0 事件（`tools/vibetrail-map`）、
 hook 分发入口（`tools/vibetrail-hook`：会话 / 轮次 / 子 agent 起止、`ext.claude.*` 事件头、git 状态、commit ↔ 轮次推导）、
 机器级安装与本地查看（`tools/vibetrail`：init / uninstall / projects / doctor / list / show / sync）、照 Pilot 粒度的调用 trace。人机分歧与轮次元数据是同一条事件流。
-push 与五个补充回归场景按用户 09-15 的要求往后放。09-16 拿本机 124,666 条真实事件复核了已完成的部分，待修项立在 OPEN-ISSUES K8、K12–K16，push 方案的修正在 TODO。同日定运行时换成 Node 单文件 `.mjs`、去掉 jq，bash 只留 sh 包装（DESIGN D12，待移植；移植前 jq 版只修 🔴）。G7 之前的代码与测试已归档到 `old/`。已有并沿用的是人机分歧判据（755 会话实测精确率 100%，裸 grep 只有 10.5%）。
+push 与五个补充回归场景按用户 09-15 的要求往后放。09-16 拿本机 124,666 条真实事件复核了已完成的部分，待修项立在 OPEN-ISSUES K8、K12–K16，push 方案的修正在 TODO。同日定运行时换成 Node 单文件 `.mjs`、去掉 jq，bash 只留 sh 包装（DESIGN D12），并已移植完毕：运行时是 `tools/vibetrail.mjs` + `tools/lib/{map,hook,cli}.mjs`，唯一依赖 node ≥ 20；老的 bash + jq 版归档在 `old/jq/`。G7 之前的代码与测试已归档到 `old/`。已有并沿用的是人机分歧判据（755 会话实测精确率 100%，裸 grep 只有 10.5%）。
 上一版设计（留痕投影进被观测仓、git hook 写 trailer）已退役，理由与替代见 [DESIGN.md §7](DESIGN.md)。
 
 已实测确立的地基（`experiments/` 可复现）：Claude Code 的 hook 在 **desktop app 下正常触发且热加载**，stdin 直接给出 `transcript_path`；

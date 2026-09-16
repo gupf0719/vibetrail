@@ -383,6 +383,19 @@ export function mapFile(file, opts) {
     }
     opts = { ...opts, parent_instance: parent };
   }
+  // project_id / workspace_id 没给就取第一条带 cwd 记录的 cwd（原 vibetrail-map 的默认值）
+  if (!opts.project_id || !opts.workspace_id) {
+    let cwd = '';
+    try {
+      const head = fs.readFileSync(file, 'utf8').slice(0, 1024 * 1024);
+      for (const line of head.split('\n')) {
+        if (!line) continue;
+        try { const r = JSON.parse(line); if (r && typeof r === 'object' && typeof r.cwd === 'string') { cwd = r.cwd; break; } } catch {}
+      }
+    } catch {}
+    if (!cwd) cwd = 'unknown';
+    opts = { ...opts, project_id: opts.project_id || cwd, workspace_id: opts.workspace_id || cwd };
+  }
   const {
     sid, project_id, workspace_id, parent_instance = 'main', meta = null,
     start_line = 1, start_byte = null, from_line = 0, seenFile = '', hook_turns = {}, hook_perms = [],

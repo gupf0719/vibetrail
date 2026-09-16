@@ -25,7 +25,7 @@ bash tools/vibetrail init
 | `~/.claude/settings.json` | 加 13 个事件的 hook 条目（命令里带 `vibetrail-hook`；只登记本机 Claude Code 都认识的事件），别的设置原样保留。写之前核对文件没被别人改过，写完自检，不对就自动还原 |
 | `~/.vibetrail/backup/` | settings 的备份：`settings.json.before-vibetrail` 是第一次装之前的原样（只存一次、永不覆盖；原来没有 settings 就没有它），另外每次改动前存一份带时间的（留最近 10 份）。重跑 `init` 没有变化时不写也不备份 |
 | `~/.vibetrail/bin/` | 运行时 |
-| `~/.vibetrail/config` | scope（默认 project，只采登记过的仓）、jq 路径等 |
+| `~/.vibetrail/config` | scope（默认 project，只采登记过的仓）、node 路径、device_id 等 |
 | `~/.vibetrail/projects/` | 登记的仓（`init` 不自动加） |
 
 `init` 最后会列出登记表和「用过 Claude Code、还没登记的仓」。被观测的仓里什么都不写。
@@ -121,7 +121,7 @@ bash experiments/collect-demo/report.sh -o experiments/collect-demo/out/report.m
 ~/.vibetrail/bin/vibetrail uninstall
 ```
 
-`doctor` 查运行时、jq 版本与**映射器在这个 jq 上跑不跑得通**（拿一条假记录真跑一遍：jq 的语法错是整份文件级的，编译不过的话 transcript 那一路一条都不出，而 hook 仍然全部 exit 0）、hook 条目（包括命令指向的脚本在不在）、hook 有没有被全局开关关掉（`disableAllHooks` / 企业策略的 `allowManagedHooksOnly`）、有没有重复挂载（同一事件挂在 HOME 与项目两处会触发两遍）、登记表、有没有落后没采的会话、错误日志（映射失败单独点出条数）。
+`doctor` 查运行时（MANIFEST 逐个校验）、node 版本与**映射器跑不跑得通**（真 import 一次 `lib/map.mjs` 再拿一条假记录跑一遍：映射器起不来的话 transcript 那一路一条都不出，而 hook 仍然全部 exit 0）、hook 条目（包括命令指向的脚本在不在）、hook 有没有被全局开关关掉（`disableAllHooks` / 企业策略的 `allowManagedHooksOnly`）、有没有重复挂载（同一事件挂在 HOME 与项目两处会触发两遍）、登记表、有没有落后没采的会话、错误日志（映射失败单独点出条数）。
 卸载只去掉 settings 里自己的条目和运行时，已采的数据、配置、登记表留着；加 `--purge` 连 `~/.vibetrail` 整个删掉。
 
 ## 演示时要说清楚的

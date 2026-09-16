@@ -17,15 +17,15 @@
 |---|---|---|
 | 人机分歧判据 | ✅ 已实现，755 会话实测精确率 100% | `tools/diverge-rules.jq`（jq 模块）+ 入口 `tools/extract-diverge.jq`（调用要带 `-L tools`），规范 [spec/diverge-v1.md](spec/diverge-v1.md) |
 | 判据回归 | ✅ | `tools/fixtures.jsonl` + `tools/test-extract.sh`（27 条正负例，比对整条输出并查 jq 报错） |
-| 协议映射（分歧一路） | ✅ 2026-09-15 | `tools/map-events.jq`（include 判据模块）+ `tools/vibetrail-map`（`event_id` UUIDv5、账本、只读到最后一个换行、按字节偏移从本轮开头读、回放副本不上报）；五类 kind → `permission.decision` / `turn.end(interrupted)` / `subagent.end(cancelled)`，带被拒调用的 `tool.request`、被打断的回复、之后人的下一句（含斜杠命令）；规则 [DESIGN §4.2](DESIGN.md) |
+| 协议映射（分歧一路） | ✅ 2026-09-15 | `tools/lib/map.mjs`（含判据，D12 移植自 map-events.jq + diverge-rules.jq）+ `tools/vibetrail-map`（`event_id` UUIDv5、账本、只读到最后一个换行、按字节偏移从本轮开头读、回放副本不上报）；五类 kind → `permission.decision` / `turn.end(interrupted)` / `subagent.end(cancelled)`，带被拒调用的 `tool.request`、被打断的回复、之后人的下一句（含斜杠命令）；规则 [DESIGN §4.2](DESIGN.md) |
 | 映射回归 | ✅ | `tools/test-map.sh`：11 份 fixtures（`tools/fixtures-map/`，golden 在 `expect/`）+ scenario 回放；断言 + golden + 每条过协议 schema（`tools/schema-check.py`，python3 + jsonschema，只在测试用）+ A2 对账（提取器命中按记录去重后 == 事件数）+ 每个切点的增量等价（从头读、从 checkpoint 读两路）+ 半行 + 幂等 + event_id 用 python 重算，158 项；调用带 `--no-turns`，只钉分歧那部分；python 缺 jsonschema 时 schema 项跳过并在末尾说明 |
 | 分歧一路挂 hook | ✅ 2026-09-15 | `tools/vibetrail-hook`（共用函数 `tools/vibetrail-lib.sh`）：Stop / SubagentStop / SessionEnd / SessionStart 补做时调 `vibetrail-map`，UserPromptSubmit 不读 transcript（U11）；scope 门控、会话锁、按 transcript 分文件的 state、spool 块文件、失败日志只留元数据；DESIGN §3.1、§3.3 |
-| hook 分发入口：会话 / 轮次 / 子 agent 起止与事件头 | ✅ 2026-09-15 | `tools/vibetrail-hook` + `tools/hook-events.jq`：13 个事件（09-15 加 PermissionRequest）——`session.start` / `session.end`、`turn.start`（HEAD / 分支 / 脏否）、`subagent.start` / `subagent.end`（父实例与 `parent_call_id` 取 meta.json）、`ext.claude.*`（PostToolUseFailure / PermissionDenied / StopFailure / Notification / InstructionsLoaded / CwdChanged，只记事件头）；同步 hook 读完 stdin 就丢后台、约 0.02 s 退出；desktop 2.1.266 真实 payload 实跑过（09-15）；DESIGN §3.1、§4.1 |
-| 轮次元数据：turn.end | ✅ 2026-09-15 | `tools/map-events.jq` 主会话按 promptId 切轮，**模型答完就发 `turn.end`**：Stop hook 当场关轮（Claude Code 的答完标记 `stop_hook_summary` 落盘了就按它关、没有才按 Stop 关；desktop 2.1.270 实测它与 Stop 同一秒落盘，D7 的 09-16 补记），被别的 Stop hook 拦下后再 Stop 时补发一条 `vibetrail.stops` 更大的；拒绝停下在拒绝处发；status completed / denied / hook_stopped / unknown / error（打断的由分歧一路发，打断没有 hook，要等下一个 hook；按停止打断正在跑的工具按弹没弹过权限框分成 `interrupt_tool` 与拒绝，D9）；用量按 message.id 去重、vcs 与 commits 取 hook 快照；与分歧同一条事件流，`vibetrail-map --no-turns` 只出分歧；DESIGN §4.1、§4.2 |
-| 调用 trace | ✅ 2026-09-15 | `tools/map-events.jq` 的 trace 部分（rule_version `call-v1`）：每次模型调用一条 `message.assistant`（content omitted，model、token、stop_reason、调了哪些工具、请求起止）、每次工具调用一条 `tool.end`（工具名、状态、耗时），子 agent 同样出；照 Pilot 的粒度、不带正文（D8） |
+| hook 分发入口：会话 / 轮次 / 子 agent 起止与事件头 | ✅ 2026-09-15 | `tools/vibetrail-hook`（sh 包装）+ `tools/lib/hook.mjs`：13 个事件（09-15 加 PermissionRequest）——`session.start` / `session.end`、`turn.start`（HEAD / 分支 / 脏否）、`subagent.start` / `subagent.end`（父实例与 `parent_call_id` 取 meta.json）、`ext.claude.*`（PostToolUseFailure / PermissionDenied / StopFailure / Notification / InstructionsLoaded / CwdChanged，只记事件头）；同步 hook 读完 stdin 就丢后台、约 0.02 s 退出；desktop 2.1.266 真实 payload 实跑过（09-15）；DESIGN §3.1、§4.1 |
+| 轮次元数据：turn.end | ✅ 2026-09-15 | `tools/lib/map.mjs` 主会话按 promptId 切轮，**模型答完就发 `turn.end`**：Stop hook 当场关轮（Claude Code 的答完标记 `stop_hook_summary` 落盘了就按它关、没有才按 Stop 关；desktop 2.1.270 实测它与 Stop 同一秒落盘，D7 的 09-16 补记），被别的 Stop hook 拦下后再 Stop 时补发一条 `vibetrail.stops` 更大的；拒绝停下在拒绝处发；status completed / denied / hook_stopped / unknown / error（打断的由分歧一路发，打断没有 hook，要等下一个 hook；按停止打断正在跑的工具按弹没弹过权限框分成 `interrupt_tool` 与拒绝，D9）；用量按 message.id 去重、vcs 与 commits 取 hook 快照；与分歧同一条事件流，`vibetrail-map --no-turns` 只出分歧；DESIGN §4.1、§4.2 |
+| 调用 trace | ✅ 2026-09-15 | `tools/lib/map.mjs` 的 trace 部分（rule_version `call-v1`）：每次模型调用一条 `message.assistant`（content omitted，model、token、stop_reason、调了哪些工具、请求起止）、每次工具调用一条 `tool.end`（工具名、状态、耗时），子 agent 同样出；照 Pilot 的粒度、不带正文（D8） |
 | commit ↔ 轮次推导 | ✅ 2026-09-15 | `vt_git_snapshot` / `vt_commits`（`tools/vibetrail-lib.sh`）：轮起 / 轮止快照在 `state/<sid>/turns/`，本轮 commit = rev-list 起..止 + 本轮 reflog 里新建的提交；`GIT_OPTIONAL_LOCKS=0` 保证不写被观测仓的 `.git/index`；DESIGN §3.5 |
-| 机器级安装 / 卸载 / 登记 | ✅ 2026-09-15 | `tools/vibetrail init / uninstall / projects`：运行时拷到 `~/.vibetrail/bin/`（MANIFEST 校验）、HOME settings 写 hook 条目（按命令认自家条目、改前备份）、config（scope、jq 绝对路径、device_id）；只登记本机每个 Claude Code 都认识的事件（有错的 settings 会被整个跳过）；写 settings 前核对、写后自检、不对就还原，运行时在临时目录时不写真实 settings；init 不登记任何仓，`projects pick / add / remove [--drop]` 自己加减（--drop 挪出的待发数据留一天）；被观测仓零写入；DESIGN §5、D11 |
-| 本地查看与自检 | ✅ 2026-09-15 | `vibetrail list`（spool 里的块）、`vibetrail show`（按会话、按时间一行一条，`--json` 原样）、`vibetrail doctor`（运行时、jq、条目、事件兼容、scope 与登记、积压、落后、错误日志）；G9 的本地预览先由它承担 |
+| 机器级安装 / 卸载 / 登记 | ✅ 2026-09-15 | `tools/vibetrail init / uninstall / projects`：运行时拷到 `~/.vibetrail/bin/`（MANIFEST 校验）、HOME settings 写 hook 条目（按命令认自家条目、改前备份）、config（scope、node 绝对路径、device_id）；只登记本机每个 Claude Code 都认识的事件（有错的 settings 会被整个跳过）；写 settings 前核对、写后自检、不对就还原，运行时在临时目录时不写真实 settings；init 不登记任何仓，`projects pick / add / remove [--drop]` 自己加减（--drop 挪出的待发数据留一天）；被观测仓零写入；DESIGN §5、D11 |
+| 本地查看与自检 | ✅ 2026-09-15 | `vibetrail list`（spool 里的块）、`vibetrail show`（按会话、按时间一行一条，`--json` 原样）、`vibetrail doctor`（运行时 MANIFEST、node 与映射器探针、条目、全局开关、重复挂载、事件兼容、scope 与登记、积压、落后、错误日志）；G9 的本地预览先由它承担 |
 | hook 回归 | ✅ | `tools/test-hook-flow.sh`：scenario 在临时仓里真实回放，70 项（09-16 数）——未登记零写入、spool 里的分歧事件等于全量分歧映射、重复触发、锁、半行、回放副本、子 agent、文件重写与 offset 信任检查、补做别的会话、scope=user、压缩时重写的旧结果、连续调用的请求开始、init / uninstall 与 doctor 的写保护 / 全局开关 / 重复挂载、K7 分拒绝与按停止、内部 agent / API 重试 / origin.kind / 插话、项目级多仓与 projects pick；python 缺 jsonschema 时 schema 项跳过并在末尾说明 |
 | 沙箱演示 | ✅ 2026-09-15 | `experiments/collect-demo/demo.sh`：临时目录里 init → 按 scenario 回放（hook 用 settings 里写下的命令触发、第 1 轮中途真的提交一次）→ list / show / doctor → 核对零写入；不碰真实的 `~/.claude` 与 `~/.vibetrail` |
 | hook 机制探针 | ✅ | `experiments/hook-probe.sh`（DESIGN §6.1 的实证来源） |
@@ -35,7 +35,7 @@
 
 | 功能 | 状态 | 形态 |
 |---|---|---|
-| 运行时移植到 Node 单文件 `.mjs`、去掉 jq | ❌ 用户 09-16 定（DESIGN D12） | 两个 ≤ 30 行的 sh 包装 + 每次 hook 一个 node 进程；`tools/lib/` 下 map / hook / cli / push / schema 五个 `.mjs`，只用内建模块、不构建；磁盘上的一切不变，golden 与 hook 回归原样验移植；移植期间 jq 版冻结只修 🔴；拆解见 TODO |
+| 运行时移植到 Node 单文件 `.mjs`、去掉 jq | ✅ 2026-09-16（DESIGN D12） | 两个 ≤ 30 行的 sh 包装 + 每次 hook 一个 node 进程；`tools/lib/` 下 map / hook / cli / push / schema 五个 `.mjs`，只用内建模块、不构建；磁盘上的一切不变，golden 与 hook 回归原样验移植；移植期间 jq 版冻结只修 🔴；拆解见 TODO |
 | `vibetrail push [--list \| --show]` | ❌ 用户 09-15 定往后放；09-16 定在 D12 移植之后用 JS 写 | 端点没配不发；配了按协议打批、每条过 schema、`event_id` 幂等、ack 即删、门槛与退避（D6）；DESIGN §4。本地看待发内容现在用 `vibetrail list / show` |
 | doctor 余项 | 🔁 | 已做的见上表；还缺最近会话的 `stop_hook_summary` 里有没有跑过我们的命令、本机语料里的未知 `type` / `attachment.type` / hook 事件名（G6） |
 | 完整性钉子 | 🔁 | 映射后事件全部过 schema、每类命中数 == 事件数已在 `test-map.sh` 钉住（测试期）；运行时的条数进出、超 1 MiB 被拒计数、未知类型 / 事件名告警待做（G10、G6） |
@@ -94,7 +94,7 @@ hook 层的回归要在它上面补：SessionStart 补做、打断后无 Stop、
 
 ### 2.4 协议映射
 
-`tools/map-events.jq` 把一份 transcript（主会话或子 agent 文件）一次读完，只对新的触发记录发协议 1.0 事件：`permission_denied` /
+`tools/lib/map.mjs` 把一份 transcript（主会话或子 agent 文件）一次读完，只对新的触发记录发协议 1.0 事件：`permission_denied` /
 `classifier_blocked` / `permission_infra_fail` → `permission.decision`（decided_by user / policy / system），并按 `tool_use_id` 反查被拒调用发
 `tool.request`；`interrupt` → `turn.end(interrupted)`（子 agent 文件里 → `subagent.end(cancelled)`），沿 `parentUuid` 回溯到被打断的回复发
 `message.assistant` / `tool.request`；分歧之后人的下一句发 `message.user`。`interrupt_for_tool_use` 吸收进同一轮的拒绝、不另发。

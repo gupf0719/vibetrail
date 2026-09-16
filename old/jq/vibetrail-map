@@ -1,0 +1,192 @@
+#!/bin/bash
+# vibetrail-map：把一份 transcript 映射成 paas-coding-hook 协议 1.0 事件，逐行输出到 stdout。
+# 人机分歧与轮次元数据是同一条事件流（同一个 spool、同一批 push）；transcript 里得出的两类都在这里出，hook 当场给的在 hook-events.jq。
+#
+# 用法：vibetrail-map <transcript.jsonl> [--sid ID] [--start-line S] [--from-line N] [--project-id X] [--workspace-id Y]
+#                     [--meta meta.json] [--parent-instance ID] [--ledger FILE] [--vt-version V]
+#   --sid          会话 id；默认从路径推：主会话 = 文件名去 .jsonl，子 agent 文件（…/<sid>/subagents/agent-*.jsonl）= 上两级目录名
+#   --start-line S 从第 S 行读起（上次账本的 checkpoint_line＝本轮开头，U11）；行号仍按整个文件算。默认 1
+#   --start-byte B 第 S 行的字节偏移（上次账本的 checkpoint_byte），有它就直接跳过去读；没有就现算（整个前缀扫一遍）
+#   --from-line N  只对行号 > N 的触发记录发事件（上次账本的 lines）。默认 0 = 全发
+#   --project-id / --workspace-id  协议的两个必填 id；默认都取 transcript 第一条带 cwd 记录的 cwd（hook 分发入口会传真值）
+#   --meta         子 agent 的 meta.json（agentType / toolUseId / spawnDepth）；默认取同名 .meta.json（有就用）
+#   --parent-instance  子 agent 的父实例；默认按 meta 的 toolUseId 在兄弟子 agent 文件里找派它的那个，找不到就是 main
+#   --seen-uuids FILE  前几次记下的记录，每行「uuid<TAB>行号」；同一 uuid 出现在别的行就是回放副本，整条跳过。
+#                      文件不存在当空
+#   --sources-out FILE 把本次新读到的记录按同样格式追加进去（下一次的 --seen-uuids 用它）
+#   --hook-turns FILE  hook 记的轮次证据（vt_hook_turns 的输出：{<turn_id>: {start, stop, gap, fail}}），关轮时拼 status / vcs / commits；
+#                      不给就当 {}（轮次事件照发，只是没有 HEAD、commit，status 多是 unknown）
+#   --hook-perms FILE  hook 记的权限框证据（vt_hook_perms 的输出：[{at, tool_name, agent_id, prompt_id, permission_mode}]），
+#                      分「人拒绝」与「按停止打断正在跑的工具」用（K7）；--perm-since 是 PermissionRequest 挂上的时刻（epoch 秒），
+#                      早于它的拒绝没有证据可查，退回按 permissionMode 粗分
+#   --no-turns         只出分歧事件，不切轮（默认切轮：主会话按 promptId 切，turn.start 补位、模型答完（stop_hook_summary 前没有拦停反馈）或拒绝停下时发 turn.end）；
+#                      分歧判据的回归 test-map.sh 用它，golden 只钉分歧那部分
+#   --close-last WHY   把文件里最后一轮也关掉（WHY = stop / session_end / resume / idle，记进 vibetrail.closed_by）；默认不关，等下一轮开始再关。
+#                      stop 要配 --stop-turn：只关这次 Stop 的那一轮，且它有过模型回复、没看到拦停反馈（Stop hook 用）
+#   --stop-turn ID     这次 Stop 的 prompt_id
+#   --ledger FILE  账本写到文件（默认写 stderr）：进出条数、反查方式、下次的 start / from 行、消费到的字节数
+#
+# 只读 transcript，不复制、不在它旁边写东西；产物只有 stdout 与账本。只解析到源文件最后一个换行符（源可能正在写半行）。
+# event_id = UUIDv5(vibetrail 命名空间, "<sid>|<记录 uuid>|<事件类型>|<限定符>")，同一输入重跑得到同一个 id（幂等重发靠它）。
+# 固定 C locale：macOS 自带的 bash 3.2 在 UTF-8 locale 下会把紧跟在变量名后的中文字符首字节算进变量名（变量名后紧跟「）」时，bash 找的是「V 加上「）」的首字节」这个变量），
+# 开了 set -u 就报 unbound variable（用户 09-15 的终端踩到），没开就悄悄展开成空；tr / sort 的结果也随 locale 变。放在最前面，后面的解析都按 C
+export LC_ALL=C
+set -uo pipefail
+SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+: "${JQ:=jq}"; export JQ
+. "$SELF/vibetrail-lib.sh"
+
+die(){ echo "✗ vibetrail-map: $*" >&2; exit 2; }
+isnum(){ case "$1" in ''|*[!0-9]*) return 1;; esac; }
+
+f=""; sid=""; start_line=1; start_byte=""; from_line=0; project_id=""; workspace_id=""; meta=""; parent=""; ledger=""; vt_version="$VT_RUNTIME_VERSION"
+seen_file=""; sources_out=""; hook_turns=""; hook_perms=""; perm_since=""; close_last=""; turns=true; stop_turn=""
+capture_content=""      # 空＝照 config（capture_content，默认 1 全采）；测试显式传 --capture-content，免得跟着本机配置漂
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --sid) sid=$2; shift 2;;
+        --start-line) start_line=$2; shift 2;;
+        --start-byte) start_byte=$2; shift 2;;
+        --from-line) from_line=$2; shift 2;;
+        --project-id) project_id=$2; shift 2;;
+        --workspace-id) workspace_id=$2; shift 2;;
+        --meta) meta=$2; shift 2;;
+        --parent-instance) parent=$2; shift 2;;
+        --ledger) ledger=$2; shift 2;;
+        --seen-uuids) seen_file=$2; shift 2;;
+        --sources-out) sources_out=$2; shift 2;;
+        --hook-turns) hook_turns=$2; shift 2;;
+        --hook-perms) hook_perms=$2; shift 2;;
+        --perm-since) perm_since=$2; shift 2;;
+        --close-last) close_last=$2; shift 2;;
+        --stop-turn) stop_turn=$2; shift 2;;
+        --no-turns) turns=false; shift;;
+        --capture-content) capture_content=$2; shift 2;;
+        --vt-version) vt_version=$2; shift 2;;
+        -h|--help) sed -n '2,29p' "$0"; exit 0;;
+        -*) die "未知参数 $1";;
+        *) [ -n "$f" ] && die "只接受一个 transcript"; f=$1; shift;;
+    esac
+done
+[ -n "$f" ] || die "缺 transcript 路径"
+[ -f "$f" ] || die "文件不存在: $f"
+isnum "$from_line" || die "--from-line 要是非负整数"
+isnum "$start_line" && [ "$start_line" -ge 1 ] || die "--start-line 要是正整数"
+case "$close_last" in ''|stop|session_end|resume|idle) ;; *) die "--close-last 只认 stop / session_end / resume / idle";; esac
+[ -z "$start_byte" ] || isnum "$start_byte" || die "--start-byte 要是非负整数"
+
+# ---- sid / meta：从路径推 ----
+subdir=""
+case "$f" in */subagents/*) subdir=$(dirname "$f");; esac
+if [ -z "$sid" ]; then
+    if [ -n "$subdir" ]; then sid=$(basename "$(dirname "$subdir")"); else sid=$(basename "$f" .jsonl); fi
+fi
+[ -z "$meta" ] && [ -f "${f%.jsonl}.meta.json" ] && meta="${f%.jsonl}.meta.json"
+meta_json=null
+if [ -n "$meta" ]; then
+    meta_json=$($JQ -c 'if type == "object" then . else null end' "$meta" 2>/dev/null) || die "meta 不是 JSON: $meta"
+fi
+
+# ---- 父实例：被子 agent 派出的子 agent（spawnDepth ≥ 2），派生调用在上一层子 agent 的文件里（09-15 语料 76 个） ----
+if [ -z "$parent" ]; then
+    parent=main
+    tid=$(printf '%s' "$meta_json" | $JQ -r '.toolUseId // empty' 2>/dev/null)
+    if [ -n "$subdir" ] && [ -n "$tid" ]; then
+        hit=$(grep -lF "\"id\":\"$tid\"" "$subdir"/agent-*.jsonl 2>/dev/null | grep -vF "$f" | head -1)
+        [ -n "$hit" ] && parent=$(basename "$hit" .jsonl) && parent=${parent#agent-}
+    fi
+fi
+
+# ---- project_id / workspace_id 默认值 ----
+if [ -z "$project_id" ] || [ -z "$workspace_id" ]; then
+    cwd=$($JQ -r 'select(type == "object" and (.cwd | type) == "string") | .cwd' "$f" 2>/dev/null | head -1)
+    [ -z "$cwd" ] && cwd="unknown"
+    [ -z "$project_id" ] && project_id=$cwd
+    [ -z "$workspace_id" ] && workspace_id=$cwd
+fi
+
+# ---- 只读到最后一个换行符 ----
+total=$(wc -c < "$f" | tr -d ' ')
+consumed=$total
+if [ "$total" -gt 0 ] && [ "$(tail -c1 "$f" | od -An -tx1 | tr -d ' \n')" != "0a" ]; then
+    partial=$(tail -n1 "$f" | wc -c | tr -d ' ')
+    consumed=$((total - partial))
+fi
+
+# ---- 起读的字节偏移：给了就用（跳读 5 ms），没给就数前 S-1 行（106 MB 约 0.3 s） ----
+if [ -z "$start_byte" ]; then
+    if [ "$start_line" -eq 1 ]; then start_byte=0; else start_byte=$(head -n $((start_line - 1)) "$f" | wc -c | tr -d ' '); fi
+fi
+[ "$start_byte" -le "$consumed" ] || die "起读偏移 $start_byte 超过文件可读长度 ${consumed}（文件被重写过？从 0 重读）"
+
+tmp=$(mktemp "${TMPDIR:-/tmp}/vibetrail-map.XXXXXX") || die "mktemp 失败"
+trap 'rm -rf "$tmp" "$tmp.err" "$tmp.seen" "$tmp.turns" "$tmp.perms"' EXIT
+if [ -n "$seen_file" ] && [ -f "$seen_file" ]; then
+    $JQ -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | [.[0], (.[1] | tonumber)])' "$seen_file" > "$tmp.seen" \
+        || die "读不了 ${seen_file}（每行应是 uuid<TAB>行号）"
+else
+    echo '[]' > "$tmp.seen"
+fi
+if [ -n "$hook_turns" ] && [ -s "$hook_turns" ]; then
+    $JQ -c 'if type == "object" then . else {} end' "$hook_turns" > "$tmp.turns" 2>/dev/null || die "读不了 ${hook_turns}（要是 JSON 对象）"
+else
+    echo '{}' > "$tmp.turns"
+fi
+if [ -n "$hook_perms" ] && [ -s "$hook_perms" ]; then
+    $JQ -c 'if type == "array" then . else [] end' "$hook_perms" > "$tmp.perms" 2>/dev/null || die "读不了 ${hook_perms}（要是 JSON 数组）"
+else
+    echo '[]' > "$tmp.perms"
+fi
+case "$perm_since" in ''|*[!0-9]*) perm_since="";; esac
+
+# ---- 映射：从 start_byte 读到最后一个换行（按偏移跳读、走管道，不落临时副本） ----
+# D12 移植期间两套引擎并存：VIBETRAIL_ENGINE=node 走 .mjs，默认仍是 jq。两边吃同样的 stdin、给同样的 stdout，
+# 对拍就是同一批 transcript 两个引擎各跑一遍比事件（移植 ① 的验收）
+if [ "${VIBETRAIL_ENGINE:-jq}" = "node" ]; then
+    NODE=$(vt_conf node node)
+    set -- --sid "$sid" --project-id "$project_id" --workspace-id "$workspace_id" --parent-instance "$parent" \
+           --start-line "$start_line" --from-line "$from_line" --meta "$meta_json" \
+           --seen-uuids "$tmp.seen" --hook-turns "$tmp.turns" --hook-perms "$tmp.perms" --perm-since "$perm_since" \
+           --close-last "$close_last" --stop-turn "$stop_turn" --vt-version "$vt_version" --rule-version "diverge-v1" \
+           --capture-content "${capture_content:-$(vt_conf capture_content 1)}"
+    [ "$turns" = false ] && set -- "$@" --no-turns
+    tail -c +$((start_byte + 1)) "$f" | head -c $((consumed - start_byte)) \
+        | "$NODE" "$SELF/vibetrail.mjs" map "$@" > "$tmp" 2>"$tmp.err"
+    rc=$?
+    if [ $rc -ne 0 ] || [ -s "$tmp.err" ]; then die "node 失败（rc=${rc}）: $(head -c 300 "$tmp.err")"; fi
+else
+tail -c +$((start_byte + 1)) "$f" | head -c $((consumed - start_byte)) | $JQ -n -c -L "$SELF" \
+    --arg sid "$sid" --arg project_id "$project_id" --arg workspace_id "$workspace_id" --arg parent_instance "$parent" \
+    --argjson start_line "$start_line" --argjson from_line "$from_line" --argjson meta "$meta_json" --slurpfile seen_uuids "$tmp.seen" \
+    --slurpfile hook_turns "$tmp.turns" --slurpfile hook_perms "$tmp.perms" --arg perm_since "$perm_since" \
+    --arg close_last "$close_last" --arg stop_turn "$stop_turn" --argjson turns "$turns" \
+    --arg vt_version "$vt_version" --arg rule_version "diverge-v1" \
+    --arg capture_content "${capture_content:-$(vt_conf capture_content 1)}" \
+    -f "$SELF/map-events.jq" > "$tmp" 2>"$tmp.err"
+rc=$?
+if [ $rc -ne 0 ] || [ -s "$tmp.err" ]; then
+    die "jq 失败（rc=${rc}）: $(head -c 300 "$tmp.err")"
+fi
+fi
+
+# ---- event_id：UUIDv5(uuid5(NS_URL, "vibetrail"), "<sid>|<_key>")，实现在 vibetrail-lib.sh 的 vt_fill_ids（hook 直接发的事件共用） ----
+# 每个名字写成一个小文件，一次 shasum / sha1sum 算完——macOS 的 shasum 是 perl，逐条起进程 151 条要 2.7 s。
+vt_fill_ids "$sid" < "$tmp" || die "算 event_id 失败（事件 _key 重复：同一记录派生了两条同型事件？）"
+
+# ---- 账本 ----
+# 下次的起读字节：checkpoint 行的偏移，只在本次读过的那段里数（不扫整个文件）
+ck=$($JQ -r 'select(._ledger != null) | ._ledger.checkpoint_line' "$tmp")
+if [ "$ck" -gt "$start_line" ] && [ "$start_byte" -eq 0 ]; then
+    ck_byte=$(head -n $((ck - 1)) "$f" | wc -c | tr -d ' ')          # 直接读文件：106 MB 0.3 s（走管道要 3.9 s）
+elif [ "$ck" -gt "$start_line" ]; then
+    ck_byte=$(( start_byte + $(tail -c +$((start_byte + 1)) "$f" | head -n $((ck - start_line)) | wc -c | tr -d ' ') ))
+else
+    ck_byte=$start_byte
+fi
+lg=$($JQ -c --arg f "$f" --arg sid "$sid" --arg parent "$parent" --argjson consumed "$consumed" --argjson total "$total" \
+        --argjson start_byte "$start_byte" --argjson ck_byte "$ck_byte" \
+        'select(._ledger != null) | ._ledger + {file: $f, sid: $sid, parent_instance: $parent, start_byte: $start_byte,
+          checkpoint_byte: $ck_byte, consumed_bytes: $consumed, file_bytes: $total}' "$tmp")
+if [ -n "$ledger" ]; then printf '%s\n' "$lg" > "$ledger"; else printf '%s\n' "$lg" >&2; fi
+if [ -n "$sources_out" ]; then printf '%s\n' "$lg" | $JQ -r '.sources[] | "\(.[0])\t\(.[1])"' >> "$sources_out"; fi
+exit 0

@@ -361,7 +361,9 @@ Stop / SubagentStop 120 s 且 `async`（Stop 要等 `stop_hook_summary`）、其
 
 ### 5.3 实现栈：bash + jq + curl，不做 Go
 
-> **2026-09-16 起改为 Node 单文件 `.mjs`、去掉 jq，bash 只留 sh 包装（D12，待移植；拆解在 TODO）。本节保留当时的理由，「不做 Go、不做常驻进程」仍成立。**
+> **2026-09-16 起改为 Node 单文件 `.mjs`、去掉 jq，bash 只留 sh 包装（D12，**同日移植完毕** ①②③④）。本节保留当时选 bash + jq 的理由，「不做 Go、不做常驻进程」仍成立。**
+> 现在的运行时是 `tools/vibetrail.mjs` + `tools/lib/{map,hook,cli}.mjs`，加三个 sh 包装（`vibetrail`、`vibetrail-hook`、`vibetrail-map`）；
+> **唯一的运行时依赖是 node ≥ 20**。jq 只剩判据提取器 `diverge-rules.jq` / `extract-diverge.jq` 与测试里的断言在用，不装进 `~/.vibetrail/bin`。
 
 没有常驻进程，每次 hook 是一个短命进程，bash 够用；已有的判据、fixtures、回放都是 bash + jq。唯一的运行时依赖是 jq（macOS 不自带），
 init 时把它的绝对路径写进 `~/.vibetrail/config`，hook 不靠 PATH；doctor 校验。curl 系统自带。Go 单二进制的好处（零依赖、HTTP 顺手）
@@ -409,7 +411,7 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
 
 ## 7. 决策记录
 
-### D12 — 运行时全部换成 Node 单文件 `.mjs`、去掉 jq；bash 只留一个 sh 包装（2026-09-16，现行，待移植）
+### D12 — 运行时全部换成 Node 单文件 `.mjs`、去掉 jq；bash 只留一个 sh 包装（2026-09-16，现行，**同日移植完毕**）
 
 用户原话：「node硬依赖问题不大，把jq全换成mjs吧」「你不用写代码，把文档更新，移植方案写一下就行」。此前 09-14 的「如果不是常驻进程，用不到go吧」仍成立：不做 Go、不做常驻进程。
 
