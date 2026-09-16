@@ -78,13 +78,16 @@ bash tools/vibetrail init
 
 **数据文件在** `~/.vibetrail/spool/<项目目录名>-<hash>/<会话 id>/`，每个文件是一次 hook 产出的一块，文件名 `<UTC 时间>-<pid>-<来源>.jsonl`，
 来源是 `hook-<事件名小写>`（hook 当场给的，如 `hook-userpromptsubmit`）、`main`（解析主会话 transcript 得出的）或 `agent-<id>`（子 agent 的 transcript）。每行一条 paas-coding-hook 协议 1.0 事件，直接 `cat` 就能看。
-这就是将来要 push 的全部内容：分歧事件带被拒的命令、被打断的回复、之后人的下一句，其余只有元数据。
+这就是将来要 push 的全部内容。**2026-09-16 起默认全采正文**（用户定，推翻原先的「只带元数据」）：人的 prompt、模型输出、
+工具参数与结果原样进事件（`payload.text` / `payload.input` / `payload.output`），thinking 进 `extensions["vibetrail.reasoning"]`，
+**不脱敏**。单条超协议上限 1 MiB 的，整条去掉正文、标 `content_state=omitted`，事件本身照发。
+只要元数据：在 `~/.vibetrail/config` 里写 `capture_content=0`——那时只有分歧那几条带正文（被拒的命令、被打断的回复、之后人的下一句）。
 
 | 什么时候 | 出现什么 |
 |---|---|
 | 会话开始 | `session.start`（来源、model、HEAD） |
 | 说一句话 | `turn.start`（HEAD、分支、有没有改动） |
-| 模型答完 | `turn.end`（状态、token 用量、本轮的 commit、这一轮里插了几句话）。同一块里还有这一轮的调用 trace：每次模型调用一条 `message.assistant`（不带正文：model、token、stop_reason、调了哪些工具及其调用 id）、每次工具调用一条 `tool.end`（工具名、成功 / 出错 / 取消、耗时）、API 请求失败重试一次一条 `ext.claude.api_error` |
+| 模型答完 | `turn.end`（状态、token 用量、本轮的 commit、这一轮里插了几句话）。同一块里还有这一轮的调用 trace：每次模型调用一条 `message.assistant`（model、token、stop_reason、调了哪些工具及其调用 id，全采时还带这次的输出正文与 thinking）、每次工具调用一条 `tool.request`（完整参数）与 `tool.end`（工具名、成功 / 出错 / 取消、耗时，全采时带结果原文）、API 请求失败重试一次一条 `ext.claude.api_error` |
 | 人拒绝一次工具调用 | `permission.decision`（decided_by user，注明是看权限框还是按权限模式分出来的）+ `tool.request`（被拒的命令），这一轮以「拒绝后停下」关；auto 模式的分类器拦下、权限链路故障也发 `permission.decision`，decided_by 分别是 policy、system |
 | 人按停止打断 | `turn.end`（interrupted）+ 被打断的回复 `message.assistant` + 在跑的调用 `tool.request`；打断的是正在跑的工具时 kind 是 `interrupt_tool`（「按停止打断工具」） |
 | 分歧之后人说的第一句话 | `message.user`，指回那次分歧 |
