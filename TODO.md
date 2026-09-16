@@ -60,7 +60,24 @@
 - [x] commit ↔ 轮次推导（09-15）：轮起 / 轮止快照（`state/<sid>/turns/`），本轮 commit = `rev-list 起..止` + 本轮 reflog 里新建的提交，归因看 transcript 里 agent 有没有跑
   `git commit`（DESIGN §3.5）；demo.sh 第 1 轮中途真的提交一次，turn.end 带上了。原写的「`vibetrail show` 按 commit 查改走它」不做了：按 commit 查是读取端的事（D5），
   现在的 `vibetrail show` 是本地预览。Bash stdout 里短 sha 的旁证还没做。
-- [ ] **09-16 复核核出的修补**（本机 124,666 条真实事件 + teamai / Pilot 源码对照，见 OPEN-ISSUES；都小，先做，顺序按影响排）：
+- [ ] **运行时换成 Node 单文件 `.mjs`、去掉 jq**（用户 09-16 定：「node硬依赖问题不大，把jq全换成mjs吧」；DESIGN D12；换语言不换设计，磁盘上的一切不变）。
+  **jq 版从此冻结**：只修 🔴，别的会话别再往 `.jq` 里加东西。估两到三天。
+  1. 布局：`tools/vibetrail-hook`、`tools/vibetrail` 各留一个 ≤ 30 行的 POSIX sh 包装（读 config 的 `node=`，`exec node vibetrail.mjs …`；找不到 node 也 exit 0、只记 errors.log）；
+     `tools/vibetrail.mjs` 入口按 argv 分发 hook / cli / push；`tools/lib/` 下 `map.mjs`（原 map-events.jq + diverge-rules.jq + hook-events.jq）、`hook.mjs`（原 vibetrail-hook + vibetrail-lib.sh + vibetrail-map）、
+     `cli.mjs`（原 vibetrail）、`push.mjs`（新）、`schema.mjs`（手写结构校验，约 150 行）。ESM 相对 import，不构建、不引 npm 包，只用 fs / path / crypto / child_process / fetch，node ≥ 20。
+     settings 里的命令改成 `sh '<路径>/vibetrail-hook' <事件> 2>/dev/null || true`（K16 一并做），`settings_ok` / doctor 的命令解析同步改。
+  2. 顺序与验收（每步单独提交，移植与修补分开）：
+     ① map 模块 1:1 移植：test-map 158 项全绿，golden 按键排序逐字节相同；再拿本机真实语料对拍——同一批 transcript 新旧两版跑出的 event_id 集合与每条事件（去掉 `occurred_at` 取 now 的 hook 事件）相同。
+        每条记录一个 try/catch，坏记录只丢自己、账本计数；jq 的 `test(…; "m")` 对应 JS 正则的 `s` 标志，多态字段照样先判类型。
+     ② hook 入口 + 共用函数：同步 hook 读完 stdin `spawn` detached 子进程（`stdio: 'ignore'`、`unref()`）再退出；git 用 `execFileSync` 带 `timeout: 3000` 与 `GIT_OPTIONAL_LOCKS=0`；
+        会话锁、state、spool 块、UUIDv5（`crypto`）逐一对应。test-hook-flow 70 项全绿、demo.sh 跑通、被观测仓零写入照旧。
+     ③ CLI：init 改记 `node=`（config 里的优先、其次 PATH、再 nvm / volta / brew 的常见路径，记绝对路径，像现在找 jq）；doctor 探针从「jq 跑映射器」换成「node ≥ 20 且能 import map.mjs」，
+        并查 config 里的 node 路径还在不在（nvm 升级后会失效，提示重跑 init）；VERSION 记 node 版本；MANIFEST 列全部 .mjs。第 13、16 段全绿。
+     ④ 老文件归档到 `old/jq/`；README、DESIGN §5.3、CAPABILITIES、DEMO 的 jq 说法同步改；本机 `~/.vibetrail` 重跑 init 后 doctor 全绿、再跑一轮真实会话看 spool 照常长。
+     ⑤ 之后才在 JS 里做下面「09-16 复核核出的修补」，再写 push。
+  3. 测试：第一步 bash 回归脚本不动，只把被测程序换掉（断言处的 jq 只在开发机用，运行时不再依赖 jq）；第二步换 `node:test`。fixtures / golden / scenario.json 原样沿用。
+  4. 风险要盯：行为漂移（靠 golden 与 hook 回归兜）；同步 hook 从 20 ms 变 70～135 ms；desktop 启动的 hook 没有 PATH（包装只用 config 里的绝对路径）；两套并存期间别的会话往 jq 里加东西（冻结）。
+- [ ] **09-16 复核核出的修补**（本机 124,666 条真实事件 + teamai / Pilot 源码对照，见 OPEN-ISSUES；都小，**移植完在 JS 里做**，顺序按影响排）：
   K8 复制历史按记录 `sessionId` 跳过（🔴，7.6% 的事件在复制的轮上、trace 翻倍）→ K13 打断的 turn.end 补 `closed_by` / `stops`、打断后置 closed →
   K12 只在人话 / 斜杠命令处开轮或打 `turn_kind` → K15 ①③（capabilities 加 `tool.end`、state 目录清理）→ K14 uninstall 留 ids → K16 命令串 `2>/dev/null || true` 与 stdin 超时。
   每条各补一个回归用例（见下面「回归」）。U16（四个只记事件头的事件默认登不登记）等用户定。
@@ -76,7 +93,8 @@
   - **4xx 只隔离那一批**（≤ 100 条写进 `spool/.rejected/<块名>.<批号>.jsonl`），游标照推——一块 20,000 条不能因一条坏事件全丢。
   - **门槛重估**：加了 trace 后一轮常常就超 100 条（本机 `message.assistant` + `tool.end` 占 95%），「满 100 条」等于每次 Stop 都推，D6 要的「每小时量级」不成立。
     要么明说接受，要么 `push_max_events` 默认改到 1,000 左右；SessionStart / sync 的后台路径不限 10 批（本机现在积压 1,245 批，按 10 批要 125 次 hook 才发完），改成限时（如 60 s）不限批数。
-  - **「每条先过 schema」bash + jq 做不到**：改成 jq 结构预检（必填键、`code` 正则、`occurred_at` 以 Z 结尾、单条 ≤ 1 MiB、每批 ≤ 100 条 / 16 MiB），完整 schema 校验只留在测试里（python jsonschema）。
+  - **「每条先过 schema」bash + jq 做不到**：改成手写结构校验 `lib/schema.mjs`（D12；必填键、`code` 正则、条件必填、`occurred_at` 以 Z 结尾、单条 ≤ 1 MiB、每批 ≤ 100 条 / 16 MiB），完整 schema 校验只留在测试里（python jsonschema）。
+  - **push 在 D12 移植之后用 JS 写**（`lib/push.mjs`）：分批与游标是数组切片加一个 JSON 状态文件，退避加抖动一行算式，重试分类对 `response.status` / `err.code` 做 switch，`fetch` 传 header 对象、token 不经过命令行。先用 bash 写再移植等于做两遍，不做。
   - **可重试集合明写**（借 Pilot `sls-transport.ts`）：HTTP 408 / 429 / 500 / 502 / 503 / 504 与 curl 退出码 6 / 7 / 28 / 35 / 52 / 56 算暂时；401 / 403 算暂时但 doctor 单独点名「配置问题」；其余 4xx 永久。退避带抖动。
     别学 Pilot 的 checkpoint 先于 ack（它 SLS 失败只留元数据、数据丢）和 HTTP flusher 失败无限内存重放，也别学 teamai 上报失败仍截断本地事件（`pull.ts:1501-1512`）。
   - **token 不放 curl 命令行参数**（`ps` 看得见）：`--header @文件` 或 `-K` 配置文件，0600、用完删；debug 日志里不记请求头。
