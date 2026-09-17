@@ -37,7 +37,7 @@ bash tools/vibetrail init
 | `~/.claude/settings.json` | 加 5 个事件的 hook 条目：SessionStart / UserPromptSubmit / Stop / SessionEnd / PermissionRequest（命令里带 `vibetrail-hook`；只登记本机 Claude Code 都认识的事件；以前装过 13 个的，重跑会把旧条目换掉），别的设置原样保留。写之前核对文件没被别人改过，写完自检，不对就自动还原 |
 | `~/.vibetrail/backup/` | settings 的备份：`settings.json.before-vibetrail` 是第一次装之前的原样（只存一次、永不覆盖；原来没有 settings 就没有它），另外每次改动前存一份带时间的（留最近 10 份）。重跑 `init` 没有变化时不写也不备份 |
 | `~/.vibetrail/bin/` | 运行时 |
-| `~/.vibetrail/config` | scope（默认 project，只采登记过的仓）、node 路径、device_id 等 |
+| `~/.vibetrail/config` | scope（默认 project，只采登记过的仓）、node 路径、device_id、补采天数 `backfill_days`（默认 2）等 |
 | `~/.vibetrail/token` | 上报 token（权限 600，不写进 config）。在终端里跑 `init` 时没填过会问一次，回车跳过；不在终端里跑只提示怎么填 |
 | `~/.vibetrail/projects/` | 登记的仓（`init` 不自动加） |
 
@@ -93,6 +93,7 @@ bash tools/vibetrail init
 
 `list` 列出每个文件的位置、条数、大小；`show --json` 输出原始协议事件，也可以 `--session <会话 id 前缀>`、`--type turn` 过滤。
 想马上看到登记过的仓以前的会话（装之前开的那些），跑 `~/.vibetrail/bin/vibetrail sync` 补采一遍；平时下次开会话时会自动补。
+补采只补最近两天动过的会话、从两天内的记录读起（`backfill_days`，默认 2，`all` 不限）；已经在采的会话不受影响。
 空闲超过一小时的会话，补采时连最后一轮一起关掉；最近一小时内还在用的，最后一轮要等它下次答完（或空闲满一小时）才出 `turn.end`，不是漏采。
 
 **数据文件在** `~/.vibetrail/spool/<项目目录名>-<hash>/<会话 id>/`，每个文件是一次 hook 产出的一块，文件名 `<UTC 时间>-<pid>-<来源>.jsonl`（同一次 hook 同一秒写同一来源的第二块，pid 后加 `_2`），
@@ -155,7 +156,7 @@ bash experiments/collect-demo/report.sh -o experiments/collect-demo/out/report.m
   挂上 PermissionRequest 之后按这次调用弹没弹过权限框分，之前的按这一轮的权限模式粗分——auto 模式几乎不弹框，那里的「拒绝」按停止算（DESIGN D9）。
   desktop 里 PermissionRequest 09-16 已实测触发（含子 agent 里的、auto 模式下 AskUserQuestion 的），本机 8 条。
 - **desktop 续接会话**会把之前的历史原样复制进新会话文件：09-16 起按每条记录里原会话的 id 认出这部分、整条跳过，只在原会话里报一次（OPEN-ISSUES K8）；更早采的数据里这部分重复过，报告按记录合并显示，并注明「也在哪些会话」。
-- **第一次补采超大的会话**：单次最多读 50 MB，超出的最早那段不采，`doctor` 会点名截掉了多少（这个上限要不要留还没定，OPEN-ISSUES U18）。平时每次只读新增的，碰不到。
+- **补采只补最近两天**：装好或刚登记一个仓时，只补最近两天动过的会话、从两天内的记录读起，更早的不补（云端只存 7 天；config 的 `backfill_days` 可改，`all` 是不限）。正在采的会话每次都照常读。大文件分段读完，每段最多 50 MB，一段都不丢。
 - **在别人公司的机器上演示**：企业托管设置（`/Library/Application Support/ClaudeCode/managed-settings.json`）里 `allowManagedHooksOnly: true` 会让 HOME 里的条目
   一律被忽略，用户设置里 `disableAllHooks: true` 则是所有 hook 都不跑（安全模式同理）。两种情况下 hook 一次都不触发，而且**看不出异常**——
   spool 不涨、也没有错误日志。先跑一次 `vibetrail doctor`，它会直接点名是哪份文件里的哪个键。

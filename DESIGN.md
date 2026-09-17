@@ -109,7 +109,7 @@ Pilot 的拦截器路线（[对比 §6.3](third-party/teamai-cli-vs-vibetrail.md
 
 | 事件 | 动作 | 同步 / 异步 |
 |---|---|---|
-| `SessionStart` | 门控（按 scope，§5）→ 发 `session.start`（`source`、capabilities；model、git 状态进 extensions）→ **补做**：本仓（按 `git worktree list` 归属）所有 offset 落后于文件大小的 transcript，各补一次解析（分歧 + 轮次元数据）；同一会话 `resume`、别的会话空闲超过 `turn_idle_close`（默认 3600 s）时把它的最后一轮也关掉（D7）；然后 **push 全机待发、不看门槛**（只看退避期，§4；push 未做）。startup / resume / clear / compact 都触发，频率不低，是最靠得住的兜底：agent 崩溃、被杀、`-p` 模式下 Stop / SessionEnd 都不来，全靠这一步 | 同步 hook，但读完 stdin 就把门控、记录、补做全丢进脱离的后台进程，自己约 0.02 s 退出（09-15 实现时定：不让人等） |
+| `SessionStart` | 门控（按 scope，§5）→ 发 `session.start`（`source`、capabilities；model、git 状态进 extensions）→ **补做**：本仓（按 `git worktree list` 归属）所有 offset 落后于文件大小的 transcript，各补一次解析（分歧 + 轮次元数据；从没读过的会话只补最后修改在两天内的、从两天内的第一条记录读起，用户 09-17 定，§3.3）；同一会话 `resume`、别的会话空闲超过 `turn_idle_close`（默认 3600 s）时把它的最后一轮也关掉（D7）；然后 **push 全机待发、不看门槛**（只看退避期，§4；push 未做）。startup / resume / clear / compact 都触发，频率不低，是最靠得住的兜底：agent 崩溃、被杀、`-p` 模式下 Stop / SessionEnd 都不来，全靠这一步 | 同步 hook，但读完 stdin 就把门控、记录、补做全丢进脱离的后台进程，自己约 0.02 s 退出（09-15 实现时定：不让人等） |
 | `UserPromptSubmit` | 发 `turn.start`（`prompt_id` 作 turn_id、会话已知的 model、HEAD / 分支 / 脏否，提示来源 `source` 进 extensions），记轮起快照（§3.3 `turns/`）；上一轮没等到 Stop 的（打断、拒绝、崩溃），用此刻的快照给它补一份「止」（gap）。**不读 transcript**（U11，09-15 定）：这里解析的结果本来也不 push、云端看到的时间不变，同步 hook 却要让人等；Pilot、teamai 也都不在这里读 | 同上：丢后台、立刻退出；stdout 会进模型上下文，**必须为空** |
 | `Stop` | 记轮止快照与本轮 commit（§3.5；被别的 Stop hook 拦停后同一轮会再来一次 Stop，每次覆盖、`stops` 计次）→ 等 transcript 写稳 → 从本轮开头解析（§3.3）：分歧事件 + **本轮的 turn.end**——Stop 就是模型答完，当场关（D7；Claude Code 的答完标记 `stop_hook_summary` 落盘了就按它关、没有才按 Stop 关——09-16 在 desktop 2.1.270 上实测它与 Stop 同一秒落盘，见 D7 的 09-16 补记）；被别的 Stop hook 拦下时再来一次 Stop，再发一条更新的 → 落 spool，再**看门槛决定推不推**（D6，09-15 定，规则在 §4；push 未做）：全机最早待发事件超过 1 小时、或全机待发满 100 条，任一满足且不在退避期就推，推的是全机所有待发、不只本会话；都不满足就只落盘，本轮不发；端点未配置时只记账不发。同一会话一把 mkdir 锁（照 Pilot），已在跑就跳过，下一次 hook 补上；push 另持一把机器级锁（§4）。子 agent 起止、API 出错结束的轮、CLAUDE.md 加载、切目录也在这一次从 transcript 推出来（09-16 起，D13），`subagents/` 目录一起扫——后台子 agent 在父 Stop 之后才结束，它的完成通知落进父会话，下一次 Stop 读到 | `async: true`：不阻塞、不计 timeout |
 | `PermissionRequest` | 弹权限框时记一份证据进 `state/<sid>/perms/`（时间、工具名、agent_id、prompt_id、permission_mode，不带参数），发 `ext.claude.permission_request`。transcript 里没有「弹没弹过框」，K7 分「人拒绝」与「按停止打断工具」全靠它（D9）；Claude Code 可能同步等这类 hook，读完就丢后台 | 同步 hook，丢后台、立刻退出 |
@@ -171,7 +171,13 @@ G6 的哨兵改由语料里「已知清单之外的 `type` / `attachment.type`�
   保住「从本轮开头读」的代价；没有新字节时只比 inode、不算哈希（一个会话几十个子 agent 文件）。代价写明：只改了中间、大小又不变的原地改写查不出来。
   transcript 目前是 append-only，但 `file-history-snapshot` 带 `isSnapshotUpdate` 字段，不能假设永远是。
 - 首次全读、无单次上限。Pilot 首次只读最后一轮、单次超过 50 MB 只读尾部，那份 111 MB 的会话前段整个丢掉，4 条拒绝没了；
-  teamai 超过 50 MB 整份不扫。两种上限都会丢分歧，不学。**现状与这条相反**：09-16 全采那一批照 Pilot 加了单次 50 MB 上限（`hook.mjs` 的 `MAX_READ_BYTES`，超了从尾部读、对齐行首，截掉的字节进 A11 计数、doctor 点名），要不要保留待定（OPEN-ISSUES U18）。
+  teamai 超过 50 MB 整份不扫。两种上限都会丢分歧，不学。**09-17 用户定（U18）**：09-16 全采那一批照 Pilot 加的「超过 50 MB 只读尾部」改成**分段读完**——一段最多 50 MB（`hook.mjs` 的 `MAX_READ_BYTES`），
+  写完这一段的 spool、推进进度就从 checkpoint 接着读下一段，一次 hook 读太久（默认 60 s，config `read_budget_ms`）剩下的下次接着读，不丢任何一段；
+  checkpoint 落在读到的位置往前超过半段（一轮就超过 25 MB）时从读到的地方接着读，保证往前走。每段开始前从 agents.json 重新取已知的子 agent。
+  本机 106 MB 的真实 transcript，每段 5 / 20 / 50 MB 读出来的 29,890 条与一次读完逐条一致。
+- **补采老会话最多补两天**（用户 09-17 定，U18）：只管从没读过的 transcript——SessionStart / sync 补做时，从没读过、最后修改在两天前的会话整个跳过；
+  第一次读一份文件时，从两天内的第一条记录读起（按块扫 `"timestamp":"`，不整份读进内存），跳过的字节进 A11 计数、doctor 说明，行号照算。
+  已经在跟的会话每次 hook 都读，照读、不按天截。config `backfill_days`（init 写 2，`all` 不限）。理由：云端只存 7 天，更早的补进去也用不上。
 - 子 agent 文件按 `<sid>/subagents/` 目录扫，不只信 hook 递来的那一个路径——teamai 栽在这里，58% 的人拒在子 agent 文件里
   （[对比 §3.2](third-party/teamai-cli-vs-vibetrail.md)）。
 - 产物写临时文件 + 原子 rename；每个会话一个目录，多 worktree 并发不共享文件。同一会话的几次 hook 可能重叠（大会话首次整读约 12 s，
@@ -487,7 +493,7 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
   标 `content_state` = omitted 与 `vibetrail.content_dropped` = size，事件本身照发；条数进 A11 计数、doctor 汇总。
 - **体积**：本机 8 份真实 transcript 共 48 MB，全采 11 MB、只带元数据 3 MB（§4 体积行，K15⑤）。
 - **单次读上限**：同一批改动照 Pilot 加了「单次最多读 50 MB，超了从尾部读、对齐行首」（`hook.mjs` 的 `MAX_READ_BYTES`），与 §3.3 原先「首次全读、无单次上限，Pilot 的上限不学」相反；
-  截掉的字节进 A11 计数、doctor 点名。要不要保留待定（OPEN-ISSUES U18）。
+  09-17 用户定改成分段读完（每段 50 MB、读完一段写 spool 接着读，不丢），补采老会话最多补两天（§3.3，U18）。
 
 代价：出本机的是全部正文（K6：云端默认全公司可见，已提意见）；spool 体积约是只带元数据的 3～4 倍（U5）。
 实现：`763e566`（四样进协议字段、thinking 进扩展、默认开）、`c18e52d`（system prompt）、D13（CLAUDE.md）、`a34bbf5`（K20 排队的人话、K23 关掉全采时不带 task）。
@@ -751,7 +757,7 @@ Claude 在同一个 promptId 下接着干活、再来一次 Stop（`stop_hook_ac
   不传，「如果后面有必要再补充」——协议的 message.* / tool.* 事件留着这个口子。
 - **云端就是 paas-coding-hook 的 collector**，采集端映射成协议事件（§4.1）。`turn.end` 的 status.code 是自定义值，`interrupted` 直接用，不等服务端。
   U3 关闭，U4 只剩端点与 token。
-- **索引保留 30 天够用**：「超过一个月复盘意义不大」。U10 关闭。
+- **索引保留 30 天够用**：「超过一个月复盘意义不大」。U10 关闭。（09-17 用户说云端现在只存 7 天；补采老会话因此只补两天，§3.3、U18。）
 - **读取与分析不归本项目**：「读取不是我们读，我们只负责采」。查询端只留 push 前的本地预览（G9 再缩）。
 
 代价写明：G11 §6 第 3 步「回原始 transcript 还原现场」只在本机 30 天内有来源；分歧之外的对话正文不在云端。
@@ -830,6 +836,6 @@ D2 的「正文与指针分开」在 D5 后反转：分歧事件自带能判责�
 
 只记在 [OPEN-ISSUES.md](OPEN-ISSUES.md)：U2 登记方式 · U4 端点 / token / 谁能看 · U5 spool 上限 ·
 U6 审计线去向 · U7 自建还是改造 Pilot · U8 类型化信号成不成 kind · U19 先 push 还是先做 Codex / Cursor（G12）· U12 token 口径 · U13 自定义取值待 collector 确认 ·
-U17 push 门槛默认值 · U18 单次读 50 MB 上限要不要留 ·
+U17 push 门槛默认值 ·
 另有 K6 脱敏（暂缓）、G5（升为前置）、
 G8 / G9 / G6 / G11（G10 09-17 已钉）。**push 之前要先改的**（09-16 对照采集端协议文档核出）**同日改完**：K17 `project_id` / `workspace_id`、K18 状态值、K19 `rule_version`、K24 拦停时不提前发 turn.end、U12 用量口径（§4.1 表里逐条标 ✅）；全采与协议补齐 K20–K23 也已做；全采正文的决策 09-17 补成 D14（K25）。U1 已定（scope 可配，默认 `project`）；U3 / U10 / K1 已由 D5 关闭。
