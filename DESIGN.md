@@ -835,7 +835,7 @@ D2 的「正文与指针分开」在 D5 后反转：分歧事件自带能判责�
 ## 10. 未定项
 
 只记在 [OPEN-ISSUES.md](OPEN-ISSUES.md)：U2 登记方式 · U4 端点 / token / 谁能看 · U5 spool 上限 ·
-U6 审计线去向 · U7 自建还是改造 Pilot · U8 类型化信号成不成 kind · U19 先 push 还是先做 Codex / Cursor（G12）· U12 token 口径 · U13 自定义取值待 collector 确认 ·
+U6 审计线去向 · U7 自建还是改造 Pilot · U8 类型化信号成不成 kind · U12 token 口径 · U13 自定义取值待 collector 确认 ·
 U17 push 门槛默认值 ·
 另有 K6 脱敏（暂缓）、G5（升为前置）、
-G8 / G9 / G6 / G11（G10 09-17 已钉）。**push 之前要先改的**（09-16 对照采集端协议文档核出）**同日改完**：K17 `project_id` / `workspace_id`、K18 状态值、K19 `rule_version`、K24 拦停时不提前发 turn.end、U12 用量口径（§4.1 表里逐条标 ✅）；全采与协议补齐 K20–K23 也已做；全采正文的决策 09-17 补成 D14（K25）。U1 已定（scope 可配，默认 `project`）；U3 / U10 / K1 已由 D5 关闭。
+G8 / G9 / G6 / G11（G10 09-17 已钉）/ G12（Codex / Cursor，09-17 第一版已实现、待实测）。**push 之前要先改的**（09-16 对照采集端协议文档核出）**同日改完**：K17 `project_id` / `workspace_id`、K18 状态值、K19 `rule_version`、K24 拦停时不提前发 turn.end、U12 用量口径（§4.1 表里逐条标 ✅）；全采与协议补齐 K20–K23 也已做；全采正文的决策 09-17 补成 D14（K25）。U1 已定（scope 可配，默认 `project`）；U3 / U10 / K1 已由 D5 关闭。

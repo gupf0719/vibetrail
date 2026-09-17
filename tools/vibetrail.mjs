@@ -137,7 +137,10 @@ if (cmd === 'map') {
   // hook：Claude Code 给的 payload 在 stdin。纪律（DESIGN §3.4）：stdout 永远为空、永远 exit 0。
   // 同步 hook（SessionStart / UserPromptSubmit / SessionEnd / PermissionRequest）读完 stdin 就丢后台，自己立刻退出，不让人等；
   // hook-run 是那个后台进程自己的入口，不再二次丢。
-  const event = argv.shift() ?? '';
+  let event = argv.shift() ?? '';
+  // Codex / Cursor 的条目多一个家名参数（`vibetrail-hook codex Stop`，TODO G12），分给各自的模块；Claude 的条目不带，走原来的路
+  const agentName = event === 'codex' || event === 'cursor' ? event : '';
+  if (agentName) event = argv.shift() ?? '';
   // K16②（借 teamai hook-dispatch-cli.ts:36-65）：宿主写完 payload 却不关 stdin 时，裸读会一直等到 Claude Code 的 timeout
   // （同步 hook 是 10 s，人就干等 10 s）。改成流式读、1 秒没有新数据就当读完
   const readStdin = (idleMs = 1000) => new Promise((resolve) => {
@@ -156,7 +159,10 @@ if (cmd === 'map') {
   let payload = '';
   try { payload = await readStdin(); } catch { process.exit(0); }
   try {
-    if (cmd === 'hook' && SYNC_EVENTS.has(event) && process.env.VIBETRAIL_FOREGROUND !== '1') {
+    if (agentName) {
+      const m = await import(agentName === 'codex' ? './lib/codex.mjs' : './lib/cursor.mjs');
+      await m.hookEntry(cmd, event, payload, fileURLToPath(import.meta.url));
+    } else if (cmd === 'hook' && SYNC_EVENTS.has(event) && process.env.VIBETRAIL_FOREGROUND !== '1') {
       detach(fileURLToPath(import.meta.url), event, payload);
     } else {
       runHook(event, payload);

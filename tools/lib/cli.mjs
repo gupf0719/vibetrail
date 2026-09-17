@@ -10,6 +10,9 @@ import {
   vtRegistered, vtRegister, vtUnregister, vtPruneRemoved, settingsPath, claudeProjects, runHook,
   vtPermPeriods, formatPermPeriods, tokenPath, vtToken, vtProjectName, vtWorkspaceId, workspaceIdPath,
 } from './hook.mjs';
+import { KNOWN_AGENTS, selectedAgents } from './agents.mjs';
+import { codexHome, codexPresent, codexInstall, codexUninstall, codexDoctor } from './codex.mjs';
+import { cursorHome, cursorInstall, cursorUninstall, cursorDoctor } from './cursor.mjs';
 
 const say = (s = '') => process.stdout.write(s + '\n');
 const die = (s) => { process.stderr.write('✗ ' + s + '\n'); process.exit(1); };
@@ -31,7 +34,39 @@ const SETTINGS = () => settingsPath();
 const CORE_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd'];
 const OPT_EVENTS = ['PermissionRequest'];
 const RETIRED_EVENTS = ['SubagentStart', 'SubagentStop', 'PostToolUseFailure', 'Notification', 'PermissionDenied', 'StopFailure', 'InstructionsLoaded', 'CwdChanged'];
-export const RUNTIME_FILES = ['vibetrail', 'vibetrail.mjs', 'lib/map.mjs', 'lib/hook.mjs', 'lib/cli.mjs', 'vibetrail-hook'];
+export const RUNTIME_FILES = ['vibetrail', 'vibetrail.mjs', 'lib/map.mjs', 'lib/hook.mjs', 'lib/cli.mjs', 'vibetrail-hook',
+  'lib/agents.mjs', 'lib/codex.mjs', 'lib/cursor.mjs'];
+
+// ---- 采哪几家（TODO G12）：照 teamai 的 promptForSelfModeAgents（init.ts:592）——命令行指定 > 不在终端里就挂本机装了的 > 终端里列出来让人选 ----
+const AGENT_LABEL = { claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor' };
+async function chooseAgents(flag) {
+  // 运行时在临时目录（测试、演示）时不认本机真实的 ~/.codex、~/.cursor，免得把条目写进真实配置（同 settings 的保护）
+  const sandboxed = (home) => underTmp(VT_HOME) && !underTmp(home);
+  const present = { claude: () => isDir(path.join(process.env.HOME || '', '.claude')) || claudeBinaries().length > 0,
+    codex: () => !sandboxed(codexHome()) && codexPresent(), cursor: () => !sandboxed(cursorHome()) && isDir(cursorHome()) };
+  const detected = KNOWN_AGENTS.filter((a) => present[a]());
+  const fallback = detected.length ? detected : ['claude'];
+  if (flag === 'auto') return fallback;
+  if (flag) {
+    const list = [...new Set(flag.split(',').map((x) => x.trim()).filter(Boolean))];
+    const bad = list.filter((x) => !KNOWN_AGENTS.includes(x));
+    if (bad.length || list.length === 0) die(`--agents 只认 ${KNOWN_AGENTS.join(' / ')}（逗号分隔）或 auto，不认识：${bad.join(' ') || '(空)'}`);
+    return list;
+  }
+  if (vtConf('agents', '')) return selectedAgents();       // 重跑 init（升级）沿用上次的选择，不再问；要改用 --agents
+  if (!(process.stdin.isTTY && process.stdout.isTTY)) return fallback;
+  say('');
+  say('要采哪几家 AI 编码工具的会话？（✓ = 本机检测到）');
+  KNOWN_AGENTS.forEach((a, i) => say(`  ${i + 1}. ${detected.includes(a) ? '✓' : ' '} ${AGENT_LABEL[a]}`));
+  const ans = ((await ask(`输编号（空格或逗号分隔，如 1 3），直接回车 = 检测到的全部（${fallback.map((a) => AGENT_LABEL[a]).join('、')}）：`)) ?? '').trim();
+  if (!ans) return fallback;
+  const out = [];
+  for (const k of ans.split(/[\s,]+/).filter(Boolean)) {
+    const a = /^\d+$/.test(k) ? KNOWN_AGENTS[Number(k) - 1] : null;
+    if (a) { if (!out.includes(a)) out.push(a); } else say(`  ⚠ 不认识的编号：${k}`);
+  }
+  return out.length ? out : fallback;
+}
 
 function confSet(key, value) {                            // 改或加一行，别的行原样留着
   mkdirp(VT_HOME);
@@ -359,11 +394,12 @@ function showRegistered() {
 
 // ---- init ----
 export async function cmdInit(argv) {
-  let scope = '', mode = 'auto';
+  let scope = '', mode = 'auto', agentsFlag = '';
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--scope') { scope = argv[++i] ?? ''; }
     else if (a === '--events') { mode = argv[++i] ?? ''; }
+    else if (a === '--agents') { agentsFlag = argv[++i] ?? ''; }
     else if (a === '--no-register' || a === '--no-pick') { /* 老参数，留着不报错 */ }
     else die(`init 不认识的参数：${a}`);
   }
@@ -415,8 +451,13 @@ export async function cmdInit(argv) {
   if (vtConf('capture_content', '1') === '0') say('  采集内容：只带元数据（capture_content=0）');
   else say('  采集内容：全采正文——prompt、模型输出、thinking、工具参数与结果原样上报，不脱敏（capture_content=0 可只留元数据）');
 
-  // 3. settings 条目
-  const events = eventsFor(mode);
+  // 2b. 采哪几家（TODO G12）
+  const agents = await chooseAgents(agentsFlag);
+  confSet('agents', agents.join(','));
+  say(`✓ 采集的工具：${agents.map((a) => AGENT_LABEL[a]).join('、')}（改：vibetrail init --agents claude,codex,cursor）`);
+
+  // 3. settings 条目（没选 Claude Code 时事件为空：只把自家旧条目去掉）
+  const events = agents.includes('claude') ? eventsFor(mode) : [];
   const bins = claudeBinaries();
   let next = stripOurs(structuredClone(cur));
   for (const x of entriesJson(events)) {
@@ -465,6 +506,20 @@ export async function cmdInit(argv) {
   confSet('permission_request_periods', formatPermPeriods(periods));
   confDel('permission_request_since');
 
+  // 3c. Codex / Cursor 的 hook 条目（TODO G12）：选了就挂，没选就把自家条目去掉（装卸对称）
+  for (const [name, install, uninstall, home] of [['codex', codexInstall, codexUninstall, codexHome()], ['cursor', cursorInstall, cursorUninstall, cursorHome()]]) {
+    const on = agents.includes(name);
+    if (underTmp(VT_HOME) && !underTmp(home)) {
+      if (on) say(`⚠ ${AGENT_LABEL[name]}：VIBETRAIL_HOME 在临时目录，却要改 ${home}（多半是测试漏设了 VIBETRAIL_${name.toUpperCase()}_HOME），没写`);
+      continue;
+    }
+    const r = on ? install() : uninstall();
+    if (!r.ok) { say(`⚠ ${AGENT_LABEL[name]}：${r.msg}`); continue; }
+    if (on) say(r.changed ? `✓ ${AGENT_LABEL[name]} 的 hook 条目 → ${r.file}` : `✓ ${AGENT_LABEL[name]} 的 hook 条目已是最新（${r.file} 没动）`);
+    else if (r.changed) say(`✓ 没选 ${AGENT_LABEL[name]}：已从 ${r.file} 去掉 vibetrail 的条目`);
+  }
+  if (agents.includes('codex')) say('  Codex 要先信任这 5 条 hook 才会跑：CLI 里用 /hooks 信任（桌面版入口待核）；条目改过就要重新信任');
+
   // 3b. 上报 token（用户 09-16：init 要引导填）。终端里没填过就问一次，回车跳过；不在终端里（脚本、测试）不问，只提示怎么填
   say('');
   const tok = vtToken();
@@ -494,6 +549,11 @@ export function cmdUninstall(argv) {
       if (!settingsWrite(cur, stripOurs(structuredClone(cur)))) die(`写不了 ${SETTINGS()}`);
       say(`✓ 已从 ${SETTINGS()} 去掉 vibetrail 的 hook 条目（原文件备份在 ${VT_HOME}/backup/）`);
     } else say(`  ${SETTINGS()} 里没有 vibetrail 的条目`);
+  }
+  for (const [name, uninstall, home] of [['Codex', codexUninstall, codexHome()], ['Cursor', cursorUninstall, cursorHome()]]) {   // TODO G12
+    if (underTmp(VT_HOME) && !underTmp(home)) continue;   // 测试里不碰真实配置
+    const r = uninstall();
+    if (!r.ok) say(`⚠ ${name}：${r.msg}`); else if (r.changed) say(`✓ 已从 ${r.file} 去掉 vibetrail 的 hook 条目`);
   }
   if (purge) { fs.rmSync(VT_HOME, { recursive: true, force: true }); say(`✓ 已删除 ${VT_HOME}（含 spool 里还没发出去的数据）`); }
   else {
@@ -769,7 +829,8 @@ export async function cmdDoctor() {
   const s = isFile(SETTINGS()) ? readJson(SETTINGS(), null) : null;
   if (s && typeof s === 'object' && !Array.isArray(s)) {
     const have = Object.entries(s.hooks ?? {}).filter(([, gs]) => (Array.isArray(gs) ? gs : []).some((g) => (g?.hooks ?? []).some(isOurs))).map(([k]) => k).sort();
-    if (have.length === 0) bad(`${SETTINGS()} 里没有 vibetrail 的 hook 条目——跑 vibetrail init`);
+    if (have.length === 0 && !selectedAgents().includes('claude')) say('  · 没选 Claude Code（init --agents），settings 里没有条目是对的');
+    else if (have.length === 0) bad(`${SETTINGS()} 里没有 vibetrail 的 hook 条目——跑 vibetrail init`);
     else {
       const missEv = CORE_EVENTS.filter((e) => !have.includes(e));
       const cur = have.filter((e) => !RETIRED_EVENTS.includes(e));
@@ -942,6 +1003,12 @@ export async function cmdDoctor() {
     note(`errors.log 有 ${lines.length} 条（只记元数据）${nm > 0 ? `，其中 ${nm} 条是映射失败（map:*）` : ''}，最近一条：${lines[lines.length - 1]}`);
   } else ok('没有错误日志');
 
+  // Codex / Cursor（TODO G12）
+  const agents = selectedAgents();
+  say(`  · 采集的工具：${agents.map((a) => AGENT_LABEL[a]).join('、')}`);
+  if (agents.includes('codex')) codexDoctor({ ok, bad, note });
+  if (agents.includes('cursor')) cursorDoctor({ ok, bad, note });
+
   const ep = vtConf('endpoint', '');
   if (ep) ok(`端点：${ep}`);
   else say('  · 端点没配置：只落本机 spool、不发（push 还没做，DESIGN §4）');
@@ -960,7 +1027,7 @@ export async function cmdDoctor() {
 
 export const USAGE = `vibetrail：机器级安装、登记与本地查看（DESIGN §5）
 
-  vibetrail init [--scope project|user] [--events auto|core|all]
+  vibetrail init [--scope project|user] [--events auto|core|all] [--agents claude,codex,cursor|auto]
   vibetrail token [--status | --clear]
   vibetrail uninstall [--purge]
   vibetrail projects [list | add [目录] [--name 项目名] | remove [目录] [--drop] | pick]
