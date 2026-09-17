@@ -154,7 +154,8 @@ bash experiments/collect-demo/report.sh -o experiments/collect-demo/out/report.m
 - **按停止打断正在跑的工具**：Claude Code 写进 transcript 的与在权限框里点拒绝一模一样。现在单列成「按停止打断工具」：
   挂上 PermissionRequest 之后按这次调用弹没弹过权限框分，之前的按这一轮的权限模式粗分——auto 模式几乎不弹框，那里的「拒绝」按停止算（DESIGN D9）。
   desktop 里 PermissionRequest 09-16 已实测触发（含子 agent 里的、auto 模式下 AskUserQuestion 的），本机 8 条。
-- **desktop 续接会话**会把之前的历史复制进新会话文件，这部分会按新会话再报一遍（OPEN-ISSUES K8）；报告里已按记录合并显示，并注明「也在哪些会话」。
+- **desktop 续接会话**会把之前的历史原样复制进新会话文件：09-16 起按每条记录里原会话的 id 认出这部分、整条跳过，只在原会话里报一次（OPEN-ISSUES K8）；更早采的数据里这部分重复过，报告按记录合并显示，并注明「也在哪些会话」。
+- **第一次补采超大的会话**：单次最多读 50 MB，超出的最早那段不采，`doctor` 会点名截掉了多少（这个上限要不要留还没定，OPEN-ISSUES U18）。平时每次只读新增的，碰不到。
 - **在别人公司的机器上演示**：企业托管设置（`/Library/Application Support/ClaudeCode/managed-settings.json`）里 `allowManagedHooksOnly: true` 会让 HOME 里的条目
   一律被忽略，用户设置里 `disableAllHooks: true` 则是所有 hook 都不跑（安全模式同理）。两种情况下 hook 一次都不触发，而且**看不出异常**——
   spool 不涨、也没有错误日志。先跑一次 `vibetrail doctor`，它会直接点名是哪份文件里的哪个键。
