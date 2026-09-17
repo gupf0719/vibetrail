@@ -26,7 +26,8 @@ VT=$VIBETRAIL_HOME
 vt(){ node "$SELF/vibetrail.mjs" "$@"; }
 hook(){ printf '%s' "$3" | node "$SELF/vibetrail.mjs" hook "$1" "$2"; }
 spool(){ cat "$VT"/spool/*/*/*.jsonl 2>/dev/null; }
-q(){ spool | jq -s -c "$1"; }                           # 对全部 spool 事件跑一个 jq 表达式
+q(){ spool | jq -s -c "$1"; }
+TS(){ node -e 'console.log(new Date(Date.now() + Number(process.argv[1])).toISOString())' -- "$1"; }   # 现在 + $1 毫秒                           # 对全部 spool 事件跑一个 jq 表达式
 
 REPO=$T/proj; mkdir -p "$REPO"; REPO=$(cd "$REPO" && pwd -P)
 ( cd "$REPO" && git init -q -b main && git config user.email t@t && git config user.name t && echo init > README && git add -A && git commit -q -m init )
@@ -62,7 +63,21 @@ check "--agents 不认识的值报错" '[ $? -ne 0 ] || grep -q "只认" <<<"$ou
 vt init --agents claude,codex,cursor >/dev/null 2>&1
 ( cd "$REPO" && vt projects add >/dev/null 2>&1 )
 out=$(vt doctor 2>&1)
-check "doctor：报采集的工具、Codex 的 hook 还没信任" 'grep -q "采集的工具：Claude Code、Codex、Cursor" <<<"$out" && grep -q "还没信任过" <<<"$out"'
+check "doctor：报采集的工具、Codex 的 hook 还没信任" 'grep -q "采集的工具：Claude Code、Codex、Cursor" <<<"$out" && grep -q "还没在 Codex 里信任" <<<"$out"'
+# 照 Codex 的算法写信任记录（codex-v3 的 doctor 核对哈希，Codex 09-17 意见 3）；$1 是故意写错哈希的那个事件
+mk_trust(){ node --input-type=module -e '
+import fs from "node:fs"; import { codexHookHash, codexTrustKey } from "./lib/codex.mjs";
+const doc = JSON.parse(fs.readFileSync(process.env.VIBETRAIL_CODEX_HOME + "/hooks.json", "utf8"));
+let out = "[hooks.state]\n";
+for (const [ev, groups] of Object.entries(doc.hooks)) groups.forEach((g, gi) => (g.hooks || []).forEach((h, hi) => {
+  if (!String(h.command).includes("vibetrail-hook")) return;
+  out += "\n[hooks.state.\"" + codexTrustKey(ev, gi, hi) + "\"]\ntrusted_hash = \"" + (ev === process.argv[1] ? "sha256:00" : codexHookHash(ev, g, h)) + "\"\n";
+}));
+fs.writeFileSync(process.env.VIBETRAIL_CODEX_HOME + "/config.toml", out);' "$1"; }
+mk_trust Stop; out=$(vt doctor 2>&1)
+check "doctor 按哈希核信任：Stop 的记录与当前条目对不上 → 报改过；其余 4 条哈希对上，不报没信任" 'grep -q "Stop 信任之后条目改过" <<<"$out" && ! grep -q "还没在 Codex 里信任" <<<"$out"'
+mk_trust ""; out=$(vt doctor 2>&1)
+check "doctor：5 条哈希都对上 → 报都已信任" 'grep -q "5 条 hook 都已信任，哈希与当前条目一致" <<<"$out"'
 
 echo "════ 2. Codex：未登记的仓零写入 ════"
 SID0=019a0000-0000-7000-8000-00000000aaaa
@@ -125,12 +140,13 @@ check "同一个 Stop 再来一次：不多写一条" '[ "$(spool | wc -l | tr -
 
 # 第 2 轮：人拒绝（弹过审批框 + 输出 rejected by user）→ 插话 → 按停止打断
 hook codex UserPromptSubmit "$(P '{hook_event_name: "UserPromptSubmit", turn_id: "t2", prompt: "删掉 README"}')"
+add '{"timestamp":"2026-09-17T02:00:59.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"两轮之间的孤儿回复"}]}}'
 add '{"timestamp":"2026-09-17T02:01:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t2"}}'
 add '{"timestamp":"2026-09-17T02:01:00.100Z","type":"turn_context","payload":{"turn_id":"t2","model":"gpt-5-codex","approval_policy":"on-request"}}'
 add '{"timestamp":"2026-09-17T02:01:00.200Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"t2","item":{"type":"UserMessage","id":"u2","content":[{"type":"text","text":"删掉 README"}]}}}'
-add '{"timestamp":"2026-09-17T02:01:01.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"rm\",\"README\"]}","call_id":"call_3"}}'
+add "$(jq -n -c --arg ts "$(TS -1000)" '{timestamp: $ts, type: "response_item", payload: {type: "function_call", name: "shell", arguments: "{\"command\":[\"rm\",\"README\"]}", call_id: "call_3"}}')"
 hook codex PermissionRequest "$(P '{hook_event_name: "PermissionRequest", turn_id: "t2", tool_name: "Bash", tool_input: {command: "rm README"}}')"
-add '{"timestamp":"2026-09-17T02:01:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_3","output":"exec command rejected by user"}}'
+add "$(jq -n -c --arg ts "$(TS 1000)" '{timestamp: $ts, type: "response_item", payload: {type: "function_call_output", call_id: "call_3", output: "exec command rejected by user"}}')"
 add '{"timestamp":"2026-09-17T02:01:04.000Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"t2","item":{"type":"UserMessage","id":"u3","content":[{"type":"text","text":"别删，改名成 README.bak"}]}}}'
 add '{"timestamp":"2026-09-17T02:01:05.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"sleep\",\"100\"]}","call_id":"call_4"}}'
 add '{"timestamp":"2026-09-17T02:01:06.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"t2","reason":"interrupted"}}'
@@ -146,7 +162,7 @@ add '{"timestamp":"2026-09-17T02:02:02.600Z","type":"response_item","payload":{"
 add '{"timestamp":"2026-09-17T02:02:03.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t3"}}'
 hook codex Stop "$(P '{hook_event_name: "Stop", turn_id: "t3", stop_hook_active: false}')"
 check "t2：人拒绝发 permission.decision（decided_by user、is_divergence、证据两条），被拒的调用不发 tool.end" \
-  '[ "$(q "[(map(select(.type == \"permission.decision\" and .payload.call_id == \"call_3\")) | map([.payload.decided_by, .is_divergence, .extensions[\"vibetrail.denial_evidence\"]])), (map(select(.type == \"tool.end\" and .payload.call_id == \"call_3\")) | length)]")" = "[[[\"user\",true,[\"output_text\",\"permission_request_hook\"]]],0]" ]'
+  '[ "$(q "[(map(select(.type == \"permission.decision\" and .payload.call_id == \"call_3\")) | map([.payload.decided_by, .is_divergence, .extensions[\"vibetrail.denial_evidence\"]])), (map(select(.type == \"tool.end\" and .payload.call_id == \"call_3\")) | length)]")" = "[[[\"user\",true,[\"output_text\",\"permission_request_in_window\"]]],0]" ]'
 check "t2：轮中插的第二句人话是 queued" '[ "$(q "map(select(.type == \"message.user\" and .turn_id == \"t2\")) | map(.payload.delivery)")" = "[\"direct\",\"queued\"]" ]'
 check "t2：打断 → turn.end interrupted + is_divergence，vcs 取下一轮开始时补的快照；跑着的调用补 tool.end(cancelled)" \
   '[ "$(q "[(map(select(.type == \"turn.end\" and .turn_id == \"t2\")) | map([.payload.status.code, .payload.status.category, .is_divergence, (.payload.vcs.head_sha | length)])), (map(select(.type == \"tool.end\" and .payload.call_id == \"call_4\")) | map(.payload.status.code))]")" = "[[[\"interrupted\",\"cancellation\",true,40]],[\"cancelled\"]]" ]'
@@ -154,12 +170,28 @@ check "t3：没有弹框证据的拒绝 decided_by unknown、不标分歧；拒�
   '[ "$(q "[(map(select(.type == \"permission.decision\" and .payload.call_id == \"call_5\")) | map([.payload.decided_by, (.is_divergence // false)])), (map(select(.type == \"turn.end\" and .turn_id == \"t3\")) | map(.files // null))]")" = "[[[\"unknown\",false]],[null]]" ]'
 check "输出里夹着拒绝字样的成功调用（读源码）不算拒绝：照发 tool.end succeeded，不发 permission.decision" '[ "$(q "[(map(select(.type == \"tool.end\" and .payload.call_id == \"call_6\")) | map(.payload.status.code)), (map(select(.type == \"permission.decision\" and .payload.call_id == \"call_6\")) | length)]")" = "[[\"succeeded\"],0]" ]'
 check "PermissionRequest 发 ext.codex.permission_request（不带参数）" '[ "$(q "map(select(.type == \"ext.codex.permission_request\")) | map([.turn_id, .payload.tool_name, (.payload.tool_input // null)])")" = "[[\"t2\",\"Bash\",null]]" ]'
+# 第 4 轮（codex-v3）：弹框证据要落在「调用发出 → 结果回来」之间，一次弹框只配一次拒绝
+hook codex UserPromptSubmit "$(P '{hook_event_name: "UserPromptSubmit", turn_id: "t4", prompt: "再删一次"}')"
+add '{"timestamp":"2026-09-17T02:03:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t4"}}'
+add '{"timestamp":"2026-09-17T02:03:00.100Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"t4","item":{"type":"UserMessage","id":"u5","content":[{"type":"text","text":"再删一次"}]}}}'
+C7=$(TS -1000); C8=$(TS -500)
+hook codex PermissionRequest "$(P '{hook_event_name: "PermissionRequest", turn_id: "t4", tool_name: "Bash", tool_input: {command: "rm README"}}')"
+O7=$(TS 1000); O8=$(TS 1500); C9=$(TS 60000); O9=$(TS 61000)
+for x in "call_7 $C7 $O7" "call_8 $C8 $O8" "call_9 $C9 $O9"; do set -- $x
+  add "$(jq -n -c --arg id "$1" --arg ts "$2" '{timestamp: $ts, type: "response_item", payload: {type: "function_call", name: "shell", arguments: "{\"command\":[\"rm\",\"README\"]}", call_id: $id}}')"
+  add "$(jq -n -c --arg id "$1" --arg ts "$3" '{timestamp: $ts, type: "response_item", payload: {type: "function_call_output", call_id: $id, output: "exec command rejected by user"}}')"
+done
+add '{"timestamp":"2026-09-17T02:03:09.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t4"}}'
+hook codex Stop "$(P '{hook_event_name: "Stop", turn_id: "t4", stop_hook_active: false}')"
+check "t4：一次弹框只配窗口内最早那次拒绝（call_7 人拒）；同一弹框不再配给 call_8；窗口外的 call_9 不算人拒" \
+  '[ "$(q "map(select(.type == \"permission.decision\" and .turn_id == \"t4\")) | sort_by(.payload.call_id) | map([.payload.call_id, .payload.decided_by, (.is_divergence // false)])")" = "[[\"call_7\",\"user\",true],[\"call_8\",\"unknown\",false],[\"call_9\",\"unknown\",false]]" ]'
 hook codex SessionEnd "$(jq -n -c --arg sid "$SID" --arg tp "$R" --arg cwd "$REPO" '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "SessionEnd", reason: "other"}')"
 check "会话：session.start / session.end 各一条，agent 是 codex 0.154.0、surface cli" \
   '[ "$(q "map(select(.type | test(\"^session\\\\.\"))) | map([.type, .agent.name, .agent.version, .agent.surface])")" = "[[\"session.start\",\"codex\",\"0.154.0\",\"cli\"],[\"session.end\",\"codex\",\"0.154.0\",\"cli\"]]" ]'
-check "轮次成对：三轮 turn.start / turn.end 各三条" '[ "$(q "[(map(select(.type == \"turn.start\")) | length), (map(select(.type == \"turn.end\")) | length)]")" = "[3,3]" ]'
+check "轮次成对：四轮 turn.start / turn.end 各四条" '[ "$(q "[(map(select(.type == \"turn.start\")) | length), (map(select(.type == \"turn.end\")) | length)]")" = "[4,4]" ]'
 check "event_id 不重复" '[ "$(q "map(.event_id) | (length == (unique | length))")" = true ]'
 check "Codex 的全部事件过协议 1.0 schema" 'spool | schema_ok'
+check "两轮之间才到的回复不挂到已经结束的轮上：不发，计数 1（codex-v3）" '[ "$(q "map(select(.type == \"message.assistant\" and ((.payload.text // \"\") | test(\"孤儿\")))) | length")" = 0 ] && [ "$(jq .orphan_items "$VT/state/$SID/codex-main.json")" = 1 ]'
 check "state 里记了 rollout 的消费进度，没有还开着的轮" '[ "$(jq -c "[.consumed_bytes == $(wc -c < "$R" | tr -d " "), .open_turn]" "$VT/state/$SID/codex-main.json")" = "[true,null]" ]'
 
 echo "════ 3b. U18 同款：从没读过的 rollout 第一次只读补采窗口内的记录；分段读完（每段 200 字节也不丢不重） ════"

@@ -15,7 +15,7 @@ import {
   detach, hookCommand, isOurs, readHostJson, writeHostJson, sameJson,
 } from './agents.mjs';
 
-export const RULE = 'codex-v2';                          // v2（09-17）：拒绝只认整条输出，不在输出里搜字符串
+export const RULE = 'codex-v3';                          // v2（09-17）：拒绝只认整条输出；v3（同日）：弹框证据按时间窗、一对一配拒绝，轮结束后到来的记录不挂上去
 export const CODEX_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd', 'PermissionRequest'];
 // 超时与 async 定死不改：Codex 按整组配置算信任哈希，改一个字就要人重新信任（G12 §3 问题 1）
 // SessionEnd 最多 3 秒（hooks/src/events/session_end.rs:23，超了 Codex 在设置里报「clamping SessionEnd hook timeout to 3s」，用户 09-17 截图）
@@ -155,6 +155,7 @@ export function patchFiles(name, input) {
 // v1 在整段输出里搜，判成了策略拒绝、这次成功调用的 tool.end 也丢了——正是 diverge-v1「只读字段、不 grep 原文」的老坑
 const REJECTED = /^(exec command rejected by user|patch rejected by user|rejected by user)$/i;
 const POLICY = /^[^\n]{1,200}; rejected by user approval settings$/i;   // core/src/safety.rs 的两句
+const PERM_SLACK_MS = 2000;                            // 弹框证据的时间窗前后各放 2 秒（hook 进程的时刻与 Codex 写记录的时刻有抖动）
 const TURN_STATUS = {
   completed: { code: 'completed', category: 'success' },
   interrupted: { code: 'interrupted', category: 'cancellation' },
@@ -167,12 +168,12 @@ const TURN_STATUS = {
 // o: { sid（事件与 state 的会话 id；子 agent 用根会话的）, ctx, meta, fileKey（main / agent-<thread id>），child（null 或 {instance, parentInstance, agentType}），
 //      perms（这个会话的 PermissionRequest 证据）, parentTurn, close（'' / session_end / idle / resume）, cap, usageRecords（这份文件出现过 token_usage_record）}
 export function mapRollout(lines, o) {
-  const out = [], keys = new Set();
+  const out = [], keys = new Set(), usedPerms = new Set();
   let meta = o.meta ?? null;
   let usageRecords = o.usageRecords === true || lines.some((l) => l.raw.includes('"token_usage_record"'));
   const turns = new Map();
   let cur = null, lastAt = null;
-  const ledger = { records: 0, bad_json: 0, types: {}, unknown: {} };
+  const ledger = { records: 0, bad_json: 0, types: {}, unknown: {}, orphan_items: 0 };
   const paginated = () => String(meta?.history_mode ?? '').toLowerCase() === 'paginated';
   const agent = () => ({ name: 'codex', version: meta?.cli_version ?? null, surface: surfaceOf(meta?.originator) });
   const turnIdOf = (t) => (o.child ? (t.root ?? o.parentTurn ?? t.id) : t.id);
@@ -250,13 +251,19 @@ export function mapRollout(lines, o) {
     const whole = text.trim();
     if (POLICY.test(whole) || REJECTED.test(whole) || itemStatus === 'declined') {
       const policy = POLICY.test(whole);
-      const human = !policy && o.perms.some((x) => x.turn_id === t.id || (t.root && x.turn_id === t.root));
+      // 人拒绝要有弹框证据落在「调用发出 → 结果回来」之间，而且一次弹框只配一次拒绝（codex-v3）。v2 只要同一轮弹过框就算，
+      // 一轮里一次允许的弹框加一次非人为的拒绝就会误标成人拒（Codex 09-17 自己提的意见 1）
+      const lo = Date.parse(c.at ?? at) - PERM_SLACK_MS, hi = Date.parse(at) + PERM_SLACK_MS;
+      const perm = policy ? null : (o.perms ?? []).find((x) => !usedPerms.has(x._id) && (x.turn_id === t.id || (t.root && x.turn_id === t.root))
+        && Date.parse(x.at) >= lo && Date.parse(x.at) <= hi);
+      if (perm) usedPerms.add(perm._id);
+      const human = Boolean(perm);
       const e = mk('permission.decision', at, t);
       e.payload = { permission_id: cid, tool_name: c.name, call_id: cid, decision: 'deny',
         decided_by: policy ? 'policy' : human ? 'user' : 'unknown', ...opt('reason', text.slice(0, 4096)) };
       if (human) e.is_divergence = true;
       e.extensions['vibetrail.denial_evidence'] = [...(itemStatus === 'declined' ? ['item_declined'] : []),
-        ...(REJECTED.test(whole) || POLICY.test(whole) ? ['output_text'] : []), ...(human ? ['permission_request_hook'] : [])];
+        ...(REJECTED.test(whole) || POLICY.test(whole) ? ['output_text'] : []), ...(human ? ['permission_request_in_window'] : [])];
       push(e, `${cid}|permission.decision`);
       return;
     }
@@ -390,7 +397,9 @@ export function mapRollout(lines, o) {
       }
       case 'response_item': {
         const t = cur;
-        if (!t) break;
+        // response_item 自己不带 turn_id，只能按顺序归到当前轮。轮已经结束（task_complete / turn_aborted 之后、下一轮开始之前）就不挂上去、只计数（codex-v3）：
+        // 否则回复进了已关的轮的缓冲、再也发不出去（Codex 09-17 意见 5 顺带照出来的）。只数这次新读到的字节，重读不重复计
+        if (!t || t.closed) { if (off >= (o.newFrom ?? 0)) ledger.orphan_items++; break; }
         switch (p.type) {
           case 'message':                               // user / developer 角色是注入与人话的原样（AGENTS.md、环境信息），人话只认 UserMessage / user_message
             if (p.role === 'assistant') bufOf(t, at).texts.push(textOf(p.content));
@@ -438,10 +447,11 @@ export function mapRollout(lines, o) {
 }
 
 // ---------- 一份 rollout：增量读 → 映射 → 写 spool → 推进 state ----------
-const permsOf = (sid) => {
+const permsOf = (sid) => {                             // 按弹框时刻排好序；_id 是证据文件名（一次弹框只配一次拒绝）
   const d = path.join(VT_HOME, 'state', sid, 'perms');
   let names = []; try { names = fs.readdirSync(d); } catch { return []; }
-  return names.filter((n) => n.endsWith('.json')).map((n) => readJson(path.join(d, n), null)).filter(isObj);
+  return names.filter((n) => n.endsWith('.json')).map((n) => ({ ...readJson(path.join(d, n), {}), _id: n }))
+    .filter((x) => typeof x.at === 'string').sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
 };
 
 export function processFile(sid, ctx, file, fileKey, { child = null, close = '', ev = '', parentTurn = null } = {}) {
@@ -466,12 +476,13 @@ export function processFile(sid, ctx, file, fileKey, { child = null, close = '',
     if (k > 0) { skippedOld = (k < slice.lines.length ? slice.lines[k].off : slice.end) - slice.lines[0].off; slice.lines = slice.lines.slice(k); }
   }
   const meta = st.meta ?? metaOf(file);
-  const res = mapRollout(slice.lines, { sid, ctx, meta, fileKey, child, perms: permsOf(sid), parentTurn, close, cap: capture(), usageRecords: st.usage_records === true });
+  const res = mapRollout(slice.lines, { sid, ctx, meta, fileKey, child, perms: permsOf(sid), parentTurn, close, cap: capture(), usageRecords: st.usage_records === true, newFrom: consumed });
   if (!emit(ctx.pkey, sid, `codex-${fileKey}`, res.events, ev)) return null;
   const nst = {
     consumed_bytes: slice.end, checkpoint_byte: res.ledger.open_off ?? slice.end, fprint: vtFprint(file, slice.end) ?? '',
     meta: compactMeta(res.meta ?? meta), usage_records: res.ledger.usage_records, open_turn: res.ledger.open_turn,
     records: res.ledger.records, bad_json: res.ledger.bad_json, unknown: res.ledger.unknown, rewrites: st.rewrites ?? 0,
+    orphan_items: (st.orphan_items ?? 0) + res.ledger.orphan_items,
     ...((st.skipped_old_bytes ?? 0) + skippedOld > 0 ? { skipped_old_bytes: (st.skipped_old_bytes ?? 0) + skippedOld } : {}), updated_at: nowIso(),
   };
   vtWriteJson(stFile, nst);
@@ -697,6 +708,23 @@ export function codexUninstall() {
   if (!writeHostJson(f, cur, next, 'codex-hooks.json')) return { ok: false, file: f, msg: `${f} 在这期间被改过，没写；再跑一次` };
   return { ok: true, changed: true, file: f };
 }
+// 信任记录的 key 与哈希，照 Codex：hooks/src/lib.rs 的 hook_key；hooks/src/engine/discovery.rs 的 hook_hash + config/src/fingerprint.rs 的 version_for_toml——
+// {event_name, matcher?, hooks: [这一条 handler，async 缺省补 false]} 按键名递归排序、紧凑 JSON、sha256。09-17 拿本机用户刚信任的 5 条真实记录核过，全部对上
+export const codexTrustKey = (ev, gi, hi) => `${hooksFile()}:${LABEL[ev] ?? ev}:${gi}:${hi}`;
+const canonJson = (v) => (Array.isArray(v) ? v.map(canonJson) : isObj(v) ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canonJson(v[k])])) : v);
+export function codexHookHash(ev, group, handler) {
+  const identity = { event_name: LABEL[ev] ?? ev, ...(typeof group?.matcher === 'string' ? { matcher: group.matcher } : {}), hooks: [{ async: false, ...handler }] };
+  return 'sha256:' + sha256(JSON.stringify(canonJson(identity)));
+}
+function trustStateOf(toml, key) {                    // [hooks.state."<key>"] 这张表里的 trusted_hash 与 enabled
+  const i = toml.indexOf(`[hooks.state."${key}"]`);
+  if (i < 0) return {};
+  const body = [];
+  for (const l of toml.slice(i).split('\n').slice(1)) { if (/^\s*\[/.test(l)) break; body.push(l); }
+  const txt = body.join('\n');
+  const th = txt.match(/^\s*trusted_hash\s*=\s*"([^"]*)"/m), en = txt.match(/^\s*enabled\s*=\s*(true|false)/m);
+  return { ...(th ? { trusted_hash: th[1] } : {}), ...(en ? { enabled: en[1] === 'true' } : {}) };
+}
 export function codexDoctor({ ok, bad, note }) {
   if (!codexPresent()) return;
   const f = hooksFile();
@@ -711,15 +739,20 @@ export function codexDoctor({ ok, bad, note }) {
   if (missing.length) bad(`Codex：缺 ${missing.join(' ')} 的条目——重跑 vibetrail init`);
   const drift = mine.filter((m) => m.h.command !== hookCommand('codex', m.ev) || m.h.timeout !== TIMEOUT[m.ev]);
   if (drift.length) note(`Codex：${drift.length} 条命令或超时与这一版不同（改过的条目要在 Codex 里重新信任）`);
-  // 信任（hooks/src/engine/discovery.rs:655-700）：config.toml 的 [hooks.state."<hooks.json 路径>:<事件>:<组>:<条>"] 要有 trusted_hash，
-  // 哈希与当前配置一致才跑。这里只查有没有信任记录，哈希对不对以 Codex 的 /hooks 为准
+  // 信任（hooks/src/engine/discovery.rs:655-700）：config.toml 的 [hooks.state."<hooks.json 路径>:<事件>:<组>:<条>"] 里 trusted_hash 与当前条目的哈希一致、
+  // 且没被关掉（enabled = false）才跑。哈希照 Codex 自己的算法算（codexHookHash），不再只看「有没有记录」（Codex 09-17 意见 3）
   const toml = readText(path.join(codexHome(), 'config.toml')) || '';
-  const untrusted = mine.filter((m) => {
-    const i = toml.indexOf(`"${f}:${LABEL[m.ev] ?? m.ev}:${m.gi}:${m.hi}"`);
-    return i < 0 || !/trusted_hash\s*=/.test(toml.slice(i, i + 400));
-  });
-  if (untrusted.length) note(`Codex：${untrusted.length} 条 hook 在 Codex 里还没信任过，没信任的不会跑——桌面版在「设置 → 钩子」里逐条点「信任」，CLI 里用 /hooks`);
-  else ok(`Codex：${mine.length} 条 hook 都有信任记录（哈希是否仍匹配以 Codex 的 /hooks 为准）`);
+  const disabled = [], untrusted = [], modified = [];
+  for (const m of mine) {
+    const st = trustStateOf(toml, codexTrustKey(m.ev, m.gi, m.hi));
+    if (st.enabled === false) disabled.push(m.ev);
+    else if (!st.trusted_hash) untrusted.push(m.ev);
+    else if (st.trusted_hash !== codexHookHash(m.ev, doc.hooks[m.ev][m.gi], m.h)) modified.push(m.ev);
+  }
+  if (disabled.length) bad(`Codex：${disabled.join(' ')} 在 Codex 里被关掉了（enabled = false），不会跑`);
+  if (untrusted.length) bad(`Codex：${untrusted.join(' ')} 还没在 Codex 里信任，不会跑——桌面版在「设置 → 钩子」里逐条点「信任」，CLI 里用 /hooks`);
+  if (modified.length) bad(`Codex：${modified.join(' ')} 信任之后条目改过（哈希对不上），Codex 不会跑——到「设置 → 钩子」重新信任`);
+  if (!disabled.length && !untrusted.length && !modified.length) ok(`Codex：${mine.length} 条 hook 都已信任，哈希与当前条目一致`);
   const feat = (toml.match(/^\[features\]\s*$([\s\S]*?)(?=^\[|(?![\s\S]))/m) || [])[1] || '';
   if (/^\s*(codex_)?hooks\s*=\s*false/m.test(feat)) bad('Codex：config.toml 里 [features] hooks = false，hook 整个关着');
 }
