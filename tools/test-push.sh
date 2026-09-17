@@ -317,6 +317,21 @@ if (vtRedactToken(JSON.stringify({ x: "前 " + q + " 后" }), q).includes("01234
 check "写 spool 之前就换掉：块文件里没有 token（原文与 JSON 转义的都没有），有占位" '[ $? -eq 0 ] && ! grep -rq -- "$TOKEN" "$VT/spool" && grep -rq "已去掉上报 token" "$VT/spool/pa-0000000000000001/sess-w"'
 rm -f "$VT/token"
 
+echo "════ 16. 503 IDENTITY_UNAVAILABLE：照样只退避，提示说出「token 可能不属于这个环境」；连着 3 次点名先换 token；换一种错或推成功就从头数 ════"
+restart_stub; reset_push
+gen --pkey pa-0000000000000001 --sid sess-a --stamp "$(now)" --n 5
+echo identity > "$S/plan"
+out=$(vt push 2>&1); rc=$?
+check "一次：退出码 1、数据原样、不隔离，提示 token 可能不属于这个环境、给出 vibetrail token" '[ $rc -eq 1 ] && [ "$(pending)" = 5 ] && [ "$(rejected)" = 0 ] && grep -q "token 不属于这个环境" <<<"$out" && grep -q "vibetrail token" <<<"$out" && [ "$(st "S.last_error.kind+\",\"+S.same_error")" = "server,1" ]'
+out=$(vt doctor 2>&1)
+check "doctor：一次时说明可能是 token，但还不点名先换 token" 'grep -q "校验 token 没成" <<<"$out" && ! grep -q "先换 token" <<<"$out"'
+printf 'identity\nidentity\n' > "$S/plan"; vt push >/dev/null 2>&1; out=$(vt push 2>&1)
+check "连着 3 次：push 输出、doctor、push --list 都点名先换 token 再手动推" '[ "$(st "S.same_error")" = 3 ] && grep -q "连着 3 次都是服务端校验 token 没成：先换 token" <<<"$out" && grep -q "先换 token" <<<"$(vt doctor 2>&1)" && grep -q "先换 token" <<<"$(vt push --list 2>&1)"'
+echo 503 > "$S/plan"; vt push >/dev/null 2>&1
+check "换成别的错（503 INDEX_UNAVAILABLE）：从 1 重新数，不再点名换 token" '[ "$(st "S.same_error+\",\"+S.failures")" = "1,4" ] && ! grep -q "先换 token" <<<"$(vt doctor 2>&1)"'
+vt push >/dev/null 2>&1
+check "推成功：计数与失败次数清零、5 条收下" '[ "$(st "S.same_error+\",\"+S.failures")" = "0,0" ] && [ "$(got)" = 5 ]'
+
 echo
 [ "$skipped_schema" -gt 0 ] && echo "（没装 python jsonschema，跳过 $skipped_schema 项 schema 校验）"
 echo "通过 $pass 项，失败 $fail 项"

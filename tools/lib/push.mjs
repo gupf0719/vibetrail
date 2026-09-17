@@ -306,6 +306,9 @@ function commit(run, st, batch, res, q) {
 
 function backoff(st, stop) {
   st.failures += 1;
+  // 同一种错误连着出现几次：IDENTITY_UNAVAILABLE 连着 IDENTITY_STREAK 次就点名换 token（identityHint）；换一种错、推成功都从头数
+  const same = st.failures > 1 && st.last_error?.status === stop.status && st.last_error?.code === stop.code;
+  st.same_error = same ? num(st.same_error, 1) + 1 : 1;
   const s = Math.min(BACKOFF_BASE_S * 2 ** Math.min(st.failures - 1, 12), BACKOFF_CAP_S) * (0.8 + Math.random() * 0.4);
   st.next_at = Date.now() + Math.round(Math.min(s, BACKOFF_CAP_S) * 1000);
   st.last_error = { at: isoNow(), kind: stop.kind, status: stop.status, code: stop.code };
@@ -352,7 +355,7 @@ export async function pushRun({ trigger = 'manual', maxBatches = Infinity, budge
       if (!stop && q.stale.length > 0) commit(run, st, { items: [], settled: [], local: [] }, { acked: [], rejected: [], unsent: [] }, q);
     }
     if (stop) backoff(st, stop);
-    else if (run.requests > 0) { st.failures = 0; st.next_at = 0; st.last_ok_at = isoNow(); }
+    else if (run.requests > 0) { st.failures = 0; st.same_error = 0; st.next_at = 0; st.last_ok_at = isoNow(); }
     if (stop || run.requests > 0) {
       savePushState(st);
       logRun({ at: isoNow(), trigger, ms: Date.now() - t0, requests: run.requests, ...run.sum, ...(stop ? { stop } : {}) });
@@ -428,7 +431,15 @@ const KIND_TEXT = {
   auth: 'token 无效、过期或没有权限（重填：vibetrail token）', network: '连不上端点', server: '服务端暂时不可用',
   config: '端点或客户端配置不对（地址、路径？）', client: '批次外壳不对（client / device_id，重跑 vibetrail init）',
 };
-export const describeStop = (e) => `${e.status ? `HTTP ${e.status} ` : ''}${e.code ? `${e.code} ` : ''}${KIND_TEXT[e.kind] ?? e.kind}`;
+// 后端把「账户服务挂了」与「账户服务不认这个 token」都回成 503 IDENTITY_UNAVAILABLE（AccountUserIdentityResolver：401 / 403 以外的非 2xx 与异常都算不可用），
+// 客户端从响应里分不出来，照接入指南按暂时失败退避，但提示里要把 token 这种可能说出来——09-17 本机原先的 token 就是这样，换成测试环境的才推通（用户会请后端改成 401）
+const CODE_TEXT = {
+  IDENTITY_UNAVAILABLE: '服务端校验 token 没成：可能是账户服务出了问题，也可能是 token 不属于这个环境——一直这样就换 token（vibetrail token）',
+};
+const IDENTITY_STREAK = 3;
+export const describeStop = (e) => `${e.status ? `HTTP ${e.status} ` : ''}${e.code ? `${e.code} ` : ''}${CODE_TEXT[e.code] ?? KIND_TEXT[e.kind] ?? e.kind}`;
+export const identityHint = (st) => (st.failures > 0 && st.last_error?.code === 'IDENTITY_UNAVAILABLE' && num(st.same_error) >= IDENTITY_STREAK
+  ? `连着 ${num(st.same_error)} 次都是服务端校验 token 没成：先换 token（vibetrail token），再手动推一次（vibetrail push）；换了还这样，就是账户服务或 Collector 的配置问题，找后端` : '');
 const fmtAt = (ms) => `${new Date(ms).toISOString().slice(5, 16).replace('T', ' ')}Z`;
 const fmtAgo = (ms) => { const s = Math.max(Math.round((Date.now() - ms) / 1000), 0); return s < 90 ? `${s} 秒` : s < 5400 ? `${Math.round(s / 60)} 分钟` : s < 172800 ? `${Math.round(s / 3600)} 小时` : `${Math.round(s / 86400)} 天`; };
 const fmtBytes = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : n >= 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} B`);
@@ -443,6 +454,7 @@ export function pushDoctor({ ok, note }) {
   if (st.failures > 0 && st.last_error) {
     note(`push 连续失败 ${st.failures} 次，最近一次 ${st.last_error.at}：${describeStop(st.last_error)}；`
       + `${st.next_at > Date.now() ? `${fmtAt(st.next_at)} 之前自动触发都不推` : '下一次 hook 再试'}，手动重试：vibetrail push`);
+    if (identityHint(st)) note(identityHint(st));
   } else if (st.last_ok_at) {
     const t = st.totals;
     ok(`上次推送成功 ${st.last_ok_at}；累计发出 ${num(t.events)} 条：新收 ${num(t.accepted)}、重复 ${num(t.duplicate)}、隔离 ${num(t.rejected)}`
@@ -479,6 +491,7 @@ function pushList() {
       + `→ ${!ep.url ? '端点没配，不推' : st.next_at > Date.now() ? `退避中，${fmtAt(st.next_at)} 之前自动触发都不推` : hit ? '下一次 Stop 会推' : '还没到，Stop 不推；开会话、关会话时照推'}`);
   }
   if (st.failures > 0 && st.last_error) say(`退避：连续失败 ${st.failures} 次（${describeStop(st.last_error)}），${st.next_at > Date.now() ? `${fmtAt(st.next_at)} 之前自动触发都不推` : '已过退避期'}`);
+  if (identityHint(st)) say(`  ${identityHint(st)}`);
   if (st.last_ok_at) say(`上次成功：${st.last_ok_at}；累计发出 ${num(st.totals.events)} 条：新收 ${num(st.totals.accepted)}、重复 ${num(st.totals.duplicate)}、隔离 ${num(st.totals.rejected)}`);
   const r = rejectedSummary();
   if (r.events > 0) say(`隔离：${r.events} 条（${codesText(r.codes) || '原因记录已清'}），在 ${rejectedDir()}，原因 ${rejectLog()}；放回待发：vibetrail push --requeue`);
@@ -566,6 +579,8 @@ export async function cmdPush(argv) {
   if (r.result === 'stopped') {
     say(`✗ 停下了：${describeStop(r.stop)}。已发 ${line}；还剩 ${left} 条，已经发出去的不会重发`);
     say('  自动推送按退避再试（1 分钟起、翻倍到 1 小时）；修好后可以直接再跑 vibetrail push');
+    const hint = identityHint(loadPushState());
+    if (hint) say(`  ${hint}`);
     return 1;
   }
   say(s.batches === 0 && s.rejected === 0 ? '没有待发的事件' : `✓ 发完 ${line}${left > 0 ? `；又来了 ${left} 条待发` : ''}`);

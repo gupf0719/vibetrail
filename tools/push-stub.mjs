@@ -8,7 +8,7 @@
 //   port             启动后写入监听端口
 //   requests.jsonl   每个请求一行：状态码、条数、字节、batch_id、event_id 列表、带没带 token（不记 token 本身）
 //   events.jsonl     新收的事件（每个 event_id 第一次收到时写一行）
-//   plan             可选，每行一个动作，每个请求消耗一行：ok | 503 | 401 | 404 | 400 | hang | reset | envelope | slow
+//   plan             可选，每行一个动作，每个请求消耗一行：ok | 503 | 401 | 404 | 400 | hang | reset | envelope | slow | identity（503 IDENTITY_UNAVAILABLE）
 //   token            可选，有它就要求请求头 Onepaas-Api-Access-Token 与之相同，否则 401
 //   event_limit      可选，单条事件的字节上限（默认 1 MiB），超了 413 EVENT_TOO_LARGE
 //   accept_all       可选，有它就跳过内容检查（用来测 --requeue 之后重发）
@@ -95,6 +95,7 @@ const server = http.createServer((req, res) => {
     if (plan === 'reset') { rec(0); req.socket.destroy(); return; }
     if (/^\d{3}$/.test(plan)) return reply(Number(plan), { code: plan === '503' ? 'INDEX_UNAVAILABLE' : plan === '401' ? 'INVALID_IDENTITY' : 'PLAN', message: 'planned ' + plan });
     if (plan === 'envelope') return reply(422, { code: 'INVALID_EVENT', message: 'Schema validation failed at /client/version' });
+    if (plan === 'identity') return reply(503, { code: 'IDENTITY_UNAVAILABLE', message: 'Account validation service is unavailable; retry later' });
     const [status, obj] = handle(body, req.headers);
     if (plan === 'slow') { setTimeout(() => reply(status, obj), 300); return; }
     reply(status, obj);
