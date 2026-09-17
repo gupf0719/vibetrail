@@ -18,7 +18,8 @@ import {
 export const RULE = 'codex-v1';
 export const CODEX_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd', 'PermissionRequest'];
 // 超时与 async 定死不改：Codex 按整组配置算信任哈希，改一个字就要人重新信任（G12 §3 问题 1）
-const TIMEOUT = { SessionStart: 10, UserPromptSubmit: 10, Stop: 120, SessionEnd: 5, PermissionRequest: 30 };
+// SessionEnd 最多 3 秒（hooks/src/events/session_end.rs:23，超了 Codex 在设置里报「clamping SessionEnd hook timeout to 3s」，用户 09-17 截图）
+const TIMEOUT = { SessionStart: 10, UserPromptSubmit: 10, Stop: 120, SessionEnd: 3, PermissionRequest: 30 };
 const SYNC = new Set(['SessionStart', 'UserPromptSubmit', 'SessionEnd', 'PermissionRequest']);
 const LABEL = { SessionStart: 'session_start', UserPromptSubmit: 'user_prompt_submit', Stop: 'stop', SessionEnd: 'session_end', PermissionRequest: 'permission_request' };
 const CAPS = ['session.start', 'session.end', 'turn.start', 'turn.end', 'message.user', 'message.assistant', 'tool.request', 'tool.end',
@@ -713,7 +714,7 @@ export function codexDoctor({ ok, bad, note }) {
     const i = toml.indexOf(`"${f}:${LABEL[m.ev] ?? m.ev}:${m.gi}:${m.hi}"`);
     return i < 0 || !/trusted_hash\s*=/.test(toml.slice(i, i + 400));
   });
-  if (untrusted.length) note(`Codex：${untrusted.length} 条 hook 在 Codex 里还没信任过，没信任的不会跑——CLI 里用 /hooks 信任（桌面版入口待核）`);
+  if (untrusted.length) note(`Codex：${untrusted.length} 条 hook 在 Codex 里还没信任过，没信任的不会跑——桌面版在「设置 → 钩子」里逐条点「信任」，CLI 里用 /hooks`);
   else ok(`Codex：${mine.length} 条 hook 都有信任记录（哈希是否仍匹配以 Codex 的 /hooks 为准）`);
   const feat = (toml.match(/^\[features\]\s*$([\s\S]*?)(?=^\[|(?![\s\S]))/m) || [])[1] || '';
   if (/^\s*(codex_)?hooks\s*=\s*false/m.test(feat)) bad('Codex：config.toml 里 [features] hooks = false，hook 整个关着');

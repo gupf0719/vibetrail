@@ -518,7 +518,7 @@ export async function cmdInit(argv) {
     if (on) say(r.changed ? `✓ ${AGENT_LABEL[name]} 的 hook 条目 → ${r.file}` : `✓ ${AGENT_LABEL[name]} 的 hook 条目已是最新（${r.file} 没动）`);
     else if (r.changed) say(`✓ 没选 ${AGENT_LABEL[name]}：已从 ${r.file} 去掉 vibetrail 的条目`);
   }
-  if (agents.includes('codex')) say('  Codex 要先信任这 5 条 hook 才会跑：CLI 里用 /hooks 信任（桌面版入口待核）；条目改过就要重新信任');
+  if (agents.includes('codex')) say('  Codex 要先信任这 5 条 hook 才会跑：桌面版在「设置 → 钩子」里逐条点「信任」，CLI 里用 /hooks；条目改过就要重新信任');
 
   // 3b. 上报 token（用户 09-16：init 要引导填）。终端里没填过就问一次，回车跳过；不在终端里（脚本、测试）不问，只提示怎么填
   say('');

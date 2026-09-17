@@ -43,6 +43,7 @@ check "config 记下 agents" 'grep -q "^agents=claude,codex,cursor$" "$VT/config
 check "Codex：5 个事件各挂一条，Stop 是 async，别人的 Stop 条目在前面原样留着" \
   '[ "$(jq -c "[.hooks | to_entries[] | select(any(.value[].hooks[]; .command | test(\"vibetrail-hook\")))] | map(.key) | sort" "$T/codex/hooks.json")" = "[\"PermissionRequest\",\"SessionEnd\",\"SessionStart\",\"Stop\",\"UserPromptSubmit\"]" ] &&
    [ "$(jq -c ".hooks.Stop[0].hooks[0].command, .hooks.Stop[1].hooks[0].async" "$T/codex/hooks.json" | tr -d "\n")" = "\"/usr/bin/true\"true" ]'
+check "Codex：SessionEnd 超时不超过 Codex 的上限 3 秒（超了设置里报加载问题，用户 09-17 截图）" '[ "$(jq ".hooks.SessionEnd[0].hooks[0].timeout" "$T/codex/hooks.json")" -le 3 ]'
 check "Codex：命令带家名参数（vibetrail-hook codex <事件>）" 'jq -e ".hooks.SessionStart[0].hooks[0].command | test(\"vibetrail-hook'"'"' codex SessionStart\")" "$T/codex/hooks.json" >/dev/null'
 check "Cursor：10 个事件、version 1，别人的 stop 条目与空数组都留着" \
   '[ "$(jq "[.hooks[][] | select(.command | test(\"vibetrail-hook\"))] | length" "$T/cursor/hooks.json")" = 10 ] &&

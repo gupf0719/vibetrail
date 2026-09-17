@@ -830,7 +830,7 @@ Bash 非零退出文档已答、grep 类退出码 1 不算失败，收尾事件�
 - `tools/lib/cursor.mjs`：**只用 hook 入参、不读 transcript**（格式没样本），挂 10 个事件写 `~/.cursor/hooks.json`；每个 hook 先写应答（beforeSubmitPrompt 放行、其余 `{}`）再丢后台；`user_email` 不出本机；token 原样放 `cursor.usage_raw`、不填 `payload.usage`。
 - **init 选装哪几家**（照 teamai `init.ts:592` 的 `promptForSelfModeAgents`）：`--agents claude,codex,cursor` 指定 > 不在终端里就挂本机检测到的 > 终端里第一次列出来选（回车 = 检测到的全部）；选择记进 config 的 `agents=`，重跑 init 沿用；没选的那家把自家条目删掉；uninstall 三家都清；doctor 按选择分家报。运行时在临时目录时不碰真实的 `~/.codex`、`~/.cursor`（同 settings 的保护）。
 - 回归 `tools/test-agents.sh` 44 项（含 U18 同款的补采窗口与分段读）：init 选择与装卸对称、未登记零写入、Codex 一整段会话（轮中提交、apply_patch 的 files、子 agent、人拒绝 / 没证据的拒绝、插话、打断补 cancelled、幂等、schema）、Cursor 一整段（应答、工具、子 agent、files、commit、没等到 stop 的轮、邮箱不出本机、schema）、真实配置没被动过。**fixture 是照源码与本机桌面版的形状手搭的**，§4 实测后换成真记录。
-- **09-17 本机实测（Codex CLI 0.154 的 `exec`，vibetrail 仓里跑一个只读小任务）**：真装（`init --agents claude,codex`）后跑一次，`--dangerously-bypass-hook-trust` 只对这一次调用跳过信任、不写信任记录。SessionStart / UserPromptSubmit / Stop / SessionEnd 都触发了，出 10 条事件：会话起止与 turn.start 是 hook 发的（turn.start 带轮起 HEAD），message.user、tool.request / tool.end、2 条 message.assistant、带用量与 vcs 的 turn.end、base_instructions 从 rollout 推，全部过 schema；hook 的 `turn_id` 与 rollout 的相同；surface 是 cli。另把本机 09-16 桌面版的真实会话在沙箱里走了一遍 hook 路径：25 条过 schema、65 条记录全读、没有不认识的类型。**还没测**：拒绝、打断、插话、子 agent（exec 下做不出来，要人在桌面版或 CLI 交互里操作），桌面版里 hook 跑不跑、信任入口在哪。
+- **09-17 本机实测（Codex CLI 0.154 的 `exec`，vibetrail 仓里跑一个只读小任务）**：真装（`init --agents claude,codex`）后跑一次，`--dangerously-bypass-hook-trust` 只对这一次调用跳过信任、不写信任记录。SessionStart / UserPromptSubmit / Stop / SessionEnd 都触发了，出 10 条事件：会话起止与 turn.start 是 hook 发的（turn.start 带轮起 HEAD），message.user、tool.request / tool.end、2 条 message.assistant、带用量与 vcs 的 turn.end、base_instructions 从 rollout 推，全部过 schema；hook 的 `turn_id` 与 rollout 的相同；surface 是 cli。另把本机 09-16 桌面版的真实会话在沙箱里走了一遍 hook 路径：25 条过 schema、65 条记录全读、没有不认识的类型。**还没测**：拒绝、打断、插话、子 agent（exec 下做不出来，要人在桌面版或 CLI 交互里操作），桌面版里 hook 跑不跑。**信任入口**（用户 09-17 截图）：桌面版「设置 → 钩子 → 用户配置」里逐条点「信任」；那里还报了加载问题「clamping SessionEnd hook timeout to 3s」——Codex 的 SessionEnd 超时最多 3 秒（`hooks/src/events/session_end.rs:23`），已改成 3，SessionEnd 那一条要重新信任一次（超时也算进信任哈希）。
 - 还没做：§4 实测三遍；K27；Codex 桌面版的信任入口；`projects pick` 的候选仓算上 Codex 的 cwd；DESIGN 的「多家」一节（实测后写）。
 
 ### 1. 结论
@@ -941,7 +941,7 @@ doctor 分家报：Codex 的信任状态与特性开关；Cursor 有没有企业
 - [x] Codex 第一版（09-17）：rollout 映射、拒绝双条件、hooks.json 读写、信任记录检查、补做、doctor；回归在 `tools/test-agents.sh`
 - [x] Cursor 第一版（09-17）：只用 hook 入参；实测后再定要不要改成读 transcript
 - [x] init 选装哪几家（照 teamai）、uninstall 三家都清、doctor 分家报
-- [ ] Codex 桌面版的信任入口；`projects pick` 算上 Codex 的 cwd；Cursor 的 token 口径
+- [ ] ~~Codex 桌面版的信任入口~~（设置 → 钩子，09-17）；`projects pick` 算上 Codex 的 cwd；Cursor 的 token 口径
 - [ ] 文档：DESIGN 加「多家」一节（实测后）；README / DEMO 同步；中心表关 G12
 
 ### 7. 待定（先记录、暂不定）
