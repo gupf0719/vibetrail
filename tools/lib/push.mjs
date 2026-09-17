@@ -10,7 +10,7 @@
 // - token 只进请求头：不进命令行、日志、state；fetch 抛的错只记 code，不记 message（header 值非法时 message 里带着值）。
 import fs from 'node:fs';
 import path from 'node:path';
-import { VT_HOME, VT_RUNTIME_VERSION, vtConf, vtToken, vtLogError, eventId } from './hook.mjs';
+import { VT_HOME, VT_RUNTIME_VERSION, vtConf, vtToken, vtLogError, eventId, vtRedactToken } from './hook.mjs';
 
 export const API_PATH = '/api/v1/collection/batches';
 const MAX_BATCH_EVENTS = 100;                                   // 协议：每批 1～100 条
@@ -152,12 +152,14 @@ function localProblem(e, bytes) {
   return '';
 }
 
-// → { items: 要发的, settled: 不发也算了结的（空行、批内重复 id）, local: 本地不合格、要隔离的 }
-function takeBatch(q, envBytes) {
+// → { items: 要发的, settled: 不发也算了结的（空行、批内重复 id）, local: 本地不合格、要隔离的 }。
+// 每行先把当前的 token 换成占位（老版本写进 spool 的块里可能有，hook.mjs 的 vtRedactToken），字节按换过的算
+function takeBatch(q, envBytes, token) {
   const b = { items: [], settled: [], local: [] };
   const ids = new Set();
   let size = envBytes;
-  for (let it = q.peek(); it; it = q.peek()) {
+  for (let raw = q.peek(); raw; raw = q.peek()) {
+    const it = { ...raw, text: vtRedactToken(raw.text, token) };
     if (it.text.trim() === '') { b.settled.push(it); q.take(); continue; }
     const bytes = Buffer.byteLength(it.text, 'utf8');
     let e = null;
@@ -338,7 +340,7 @@ export async function pushRun({ trigger = 'manual', maxBatches = Infinity, budge
       const q = new Queue(blocks, st.cursors);
       const envBytes = envelopeBytes(run.client);
       while (run.sum.batches < maxBatches && Date.now() - t0 < budgetMs) {
-        const batch = takeBatch(q, envBytes);
+        const batch = takeBatch(q, envBytes, run.token);
         if (batch.items.length + batch.settled.length + batch.local.length === 0) break;
         const res = batch.items.length > 0 ? await deliver(run, st, batch.items) : { acked: [], rejected: [], stop: null, unsent: [] };
         if (batch.items.length > 0) run.sum.batches++;
@@ -488,7 +490,7 @@ function pushShow(json) {
   const client = clientOf();
   if (!client) { process.stderr.write('✗ config 里的 device_id 不是 UUID，重跑 vibetrail init\n'); return 1; }
   const q = new Queue(listBlocks(), loadPushState().cursors);
-  const b = takeBatch(q, envelopeBytes(client));
+  const b = takeBatch(q, envelopeBytes(client), vtToken());
   if (b.items.length === 0) {
     say(b.local.length > 0 ? `没有能发的事件；有 ${b.local.length} 条本地就不合格，下次 push 会隔离` : '没有待发的事件');
     return 0;

@@ -43,6 +43,16 @@ export function vtConf(key, dflt = '') {
 // config 常被整份贴出来问问题；用户 09-16 要 init 引导填
 export const tokenPath = () => path.join(VT_HOME, 'token');
 export const vtToken = () => (readText(tokenPath()) || '').trim();
+// 接入指南：token 不能进请求正文、事件、日志与本地缓存（验收清单「验证日志、错误信息和本地缓存不包含 Token」）。
+// 全采正文时人把 token 贴进对话、命令把它打出来，都会原样进事件（09-17 真出现过：用户在对话里贴了新 token），
+// 所以写 spool 之前把当前填的这个 token 换成占位，原文与 JSON 转义后的写法都换；push 发之前再查一遍（lib/push.mjs）
+export const TOKEN_PLACEHOLDER = '[vibetrail: 已去掉上报 token]';
+export function vtRedactToken(text, token = vtToken()) {
+  if (!token || token.length < 8) return text;
+  let out = text;
+  for (const form of new Set([token, JSON.stringify(token).slice(1, -1)])) if (out.includes(form)) out = out.split(form).join(TOKEN_PLACEHOLDER);
+  return out;
+}
 export const vtSha = (s) => sha1(Buffer.from(String(s), 'utf8')).slice(0, 16);
 export const vtSlug = (p) => String(p).replace(/[^A-Za-z0-9]/g, '-');
 export const vtRealpath = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
@@ -187,7 +197,7 @@ export function vtSpoolWrite(pkey, sid, name, events) {   // 去掉已写过的 
   // 子 agent 文件在一次 hook 里会映射两遍（先写起止与调用，收到完成信号再补最后一次回答），所以很常见（09-17 端到端测试发现）。撞名时 pid 后面加 _2、_3
   let chunk = `${stamp}-${process.pid}-${name}.jsonl`;
   for (let n = 2; exists(path.join(dest, chunk)); n++) chunk = `${stamp}-${process.pid}_${n}-${name}.jsonl`;
-  const body = fresh.map((e) => JSON.stringify(e)).join('\n') + '\n';
+  const body = vtRedactToken(fresh.map((e) => JSON.stringify(e)).join('\n') + '\n');
   try {
     fs.writeFileSync(path.join(dest, '.' + chunk + '.tmp'), body);
     fs.renameSync(path.join(dest, '.' + chunk + '.tmp'), path.join(dest, chunk));

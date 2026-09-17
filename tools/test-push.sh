@@ -301,6 +301,22 @@ gen --pkey pa-0000000000000001 --sid sess-a --stamp "$(now)" --n 7
 out=$(cd "$REPO" && vt sync 2>&1); rc=$?
 check "sync：补采、推送 7 条" '[ $rc -eq 0 ] && grep -q "补采完" <<<"$out" && grep -q "推送 1 批：新收 7" <<<"$out" && [ "$(got)" = 7 ]'
 
+echo "════ 15. token 不出本机：写 spool 之前换成占位，push 发之前再查一遍（接入指南：本地缓存与请求正文不能有 Token） ════"
+restart_stub; reset_push
+printf '%s\n' "$TOKEN" > "$VT/token"
+gen --pkey pa-0000000000000001 --sid sess-a --stamp "$(now)" --n 3 --patch "{\"1\":{\"payload\":{\"text\":\"我的 token 是 $TOKEN 帮我填上\",\"author_type\":\"human\"}}}"
+vt push >/dev/null 2>&1
+check "push：老块里带着的 token 发出去之前换成占位，3 条都收下、仍过 schema" '[ "$(got)" = 3 ] && ! grep -q "$TOKEN" "$S/events.jsonl" && grep -q "已去掉上报 token" "$S/events.jsonl" && schema_ok < "$S/events.jsonl"'
+node --input-type=module -e '
+import { vtSpoolWrite, vtRedactToken } from "'"$SELF"'/lib/hook.mjs";
+const t = process.argv[1];
+vtSpoolWrite("pa-0000000000000001", "sess-w", "hook-test", [{ event_id: "11111111-2222-5333-a444-555555555555", type: "message.user", payload: { text: "贴进来的 " + t + " 与转义的 " + JSON.stringify({ t }) } }]);
+const q = "a\"b\\c-0123456789";                                   // 带引号与反斜杠的 token：JSON 转义后的写法也要换掉
+if (vtRedactToken(JSON.stringify({ x: "前 " + q + " 后" }), q).includes("0123456789")) process.exit(1);
+' "$TOKEN"
+check "写 spool 之前就换掉：块文件里没有 token（原文与 JSON 转义的都没有），有占位" '[ $? -eq 0 ] && ! grep -rq -- "$TOKEN" "$VT/spool" && grep -rq "已去掉上报 token" "$VT/spool/pa-0000000000000001/sess-w"'
+rm -f "$VT/token"
+
 echo
 [ "$skipped_schema" -gt 0 ] && echo "（没装 python jsonschema，跳过 $skipped_schema 项 schema 校验）"
 echo "通过 $pass 项，失败 $fail 项"
