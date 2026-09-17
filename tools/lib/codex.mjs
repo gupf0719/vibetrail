@@ -7,7 +7,7 @@
 // 相关判定标着「待实测」（G12 §4），拿到样本后按实况改、升 RULE。
 import fs from 'node:fs';
 import path from 'node:path';
-import { VT_HOME, vtConf, vtGitSnapshot, vtLock, vtUnlock, vtFprint, vtWriteJson } from './hook.mjs';
+import { VT_HOME, vtConf, vtGitSnapshot, vtLock, vtUnlock, vtFprint, vtWriteJson, vtBackfillCutoffMs } from './hook.mjs';
 import { displayDir } from './map.mjs';
 import {
   readText, readJson, isFile, isDir, mkdirp, nowIso, epochSec, isObj, opt, sha256, capture, validSid, sleepSync, codeify, agentEnabled,
@@ -23,7 +23,7 @@ const SYNC = new Set(['SessionStart', 'UserPromptSubmit', 'SessionEnd', 'Permiss
 const LABEL = { SessionStart: 'session_start', UserPromptSubmit: 'user_prompt_submit', Stop: 'stop', SessionEnd: 'session_end', PermissionRequest: 'permission_request' };
 const CAPS = ['session.start', 'session.end', 'turn.start', 'turn.end', 'message.user', 'message.assistant', 'tool.request', 'tool.end',
   'permission.decision', 'subagent.start', 'subagent.end', 'usage', 'vcs', 'file.relation', 'ext.codex'];
-const MAX_READ = 50 * 1024 * 1024;
+const MAX_READ = () => (Number(process.env.VIBETRAIL_READ_MAX_BYTES) > 0 ? Number(process.env.VIBETRAIL_READ_MAX_BYTES) : 50 * 1024 * 1024);
 
 export const codexHome = () => process.env.VIBETRAIL_CODEX_HOME || process.env.CODEX_HOME || path.join(process.env.HOME || '', '.codex');
 export const codexPresent = () => isDir(codexHome());
@@ -65,25 +65,31 @@ const compactMeta = (m) => (isObj(m) ? {
   ...opt('history_mode', m.history_mode), ...(m.source !== undefined ? { source: m.source } : {}),
 } : null);
 
-function readSlice(file, from) {                      // 从 from 读到最后一个换行符；超过 50 MB 只读尾部（照 hook.mjs）
+// 从 from 读到最后一个换行符，分段读完、不丢最老的一段（U18，用户 09-17 定，同 hook.mjs）；每段不超过 VIBETRAIL_READ_MAX_BYTES（默认 50 MB）
+function readSlice(file, from) {
   const size = fs.statSync(file).size;
-  if (size <= from) return { lines: [], end: from };
-  let start = from;
-  if (size - from > MAX_READ) start = size - MAX_READ;
-  const buf = Buffer.alloc(size - start);
-  const fd = fs.openSync(file, 'r');
-  fs.readSync(fd, buf, 0, buf.length, start);
-  fs.closeSync(fd);
-  const last = buf.lastIndexOf(0x0a);
-  if (last < 0) return { lines: [], end: from };
-  let pos = start > from ? buf.indexOf(0x0a) + 1 : 0;
   const lines = [];
-  while (pos <= last) {
-    const nl = buf.indexOf(0x0a, pos);
-    lines.push({ off: start + pos, raw: buf.subarray(pos, nl).toString('utf8') });
-    pos = nl + 1;
-  }
-  return { lines, end: start + last + 1 };
+  let pos = from, carry = Buffer.alloc(0);
+  const fd = fs.openSync(file, 'r');
+  try {
+    while (pos < size) {
+      const n = Math.min(MAX_READ(), size - pos);
+      const chunk = Buffer.alloc(n);
+      fs.readSync(fd, chunk, 0, n, pos);
+      const buf = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+      const base = pos - carry.length;
+      const last = buf.lastIndexOf(0x0a);
+      let p = 0;
+      while (p <= last) {
+        const nl = buf.indexOf(0x0a, p);
+        lines.push({ off: base + p, raw: buf.subarray(p, nl).toString('utf8') });
+        p = nl + 1;
+      }
+      carry = buf.subarray(p);                          // 半行留到下一段接上；读到头还是半行就不算读过
+      pos += n;
+    }
+  } finally { fs.closeSync(fd); }
+  return { lines, end: Math.max(from, size - carry.length) };
 }
 const tailText = (file, n) => {
   try {
@@ -446,13 +452,23 @@ export function processFile(sid, ctx, file, fileKey, { child = null, close = '',
     st = { rewrites: (st.rewrites ?? 0) + 1 }; consumed = 0; ck = 0;
   }
   const slice = readSlice(file, ck);
+  // 补采老会话最多补两天（U18，同 hook.mjs）：从没读过的文件从窗口内的第一条记录读起；已经在跟的每次都读，不按天截
+  let skippedOld = 0;
+  const firstRead = !isFile(stFile) && ck === 0;
+  const cutoff = firstRead ? vtBackfillCutoffMs() : null;
+  if (cutoff !== null && slice.lines.length) {
+    const i = slice.lines.findIndex((l) => { const m = l.raw.match(/"timestamp":"([^"]+)"/); const t = m ? Date.parse(m[1]) : NaN; return !Number.isFinite(t) || t >= cutoff; });
+    const k = i < 0 ? slice.lines.length : i;
+    if (k > 0) { skippedOld = (k < slice.lines.length ? slice.lines[k].off : slice.end) - slice.lines[0].off; slice.lines = slice.lines.slice(k); }
+  }
   const meta = st.meta ?? metaOf(file);
   const res = mapRollout(slice.lines, { sid, ctx, meta, fileKey, child, perms: permsOf(sid), parentTurn, close, cap: capture(), usageRecords: st.usage_records === true });
   if (!emit(ctx.pkey, sid, `codex-${fileKey}`, res.events, ev)) return null;
   const nst = {
     consumed_bytes: slice.end, checkpoint_byte: res.ledger.open_off ?? slice.end, fprint: vtFprint(file, slice.end) ?? '',
     meta: compactMeta(res.meta ?? meta), usage_records: res.ledger.usage_records, open_turn: res.ledger.open_turn,
-    records: res.ledger.records, bad_json: res.ledger.bad_json, unknown: res.ledger.unknown, rewrites: st.rewrites ?? 0, updated_at: nowIso(),
+    records: res.ledger.records, bad_json: res.ledger.bad_json, unknown: res.ledger.unknown, rewrites: st.rewrites ?? 0,
+    ...((st.skipped_old_bytes ?? 0) + skippedOld > 0 ? { skipped_old_bytes: (st.skipped_old_bytes ?? 0) + skippedOld } : {}), updated_at: nowIso(),
   };
   vtWriteJson(stFile, nst);
   return nst;

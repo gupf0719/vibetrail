@@ -823,13 +823,13 @@ Bash 非零退出文档已答、grep 类退出码 1 不算失败，收尾事件�
 用户 09-17：「接下来去实现codex和cursor的采集。至于数据的push，另一个对话完成claude的push，他们可以直接用」（U19 关）；
 「codex和cursor的transcript内容和格式和cluade应该是不一样的」；「如果用户电脑同时拥有claude，codex和cursor，我觉得要让他们判断下装哪个，teamai怎么做的」。
 
-- **不拆 Claude 的代码**（与 §5「结构」原计划不同）：push 那个对话同时在改 `cli.mjs` / `hook.mjs`，两家加在新文件里，共用文件只插几行，少冲突。Claude 那一路一行没动，test-map 246/246、test-hook-flow 134/134 原样全绿。
+- **不拆 Claude 的代码**（与 §5「结构」原计划不同）：push 那个对话同时在改 `cli.mjs` / `hook.mjs`，两家加在新文件里，共用文件只插几行，少冲突。Claude 那一路一行没动，test-map 246/246、test-hook-flow 145/145（与 U18 合并后）原样全绿。
 - `tools/lib/agents.mjs`：两家共用、与格式无关的部分（门控、事件头、超 1 MiB 去正文、写 spool、轮次证据、文件相对路径、改宿主 hooks.json 的原子写与备份、`agents=` 选择）。
 - `tools/lib/codex.mjs`：挂 5 个 hook 写 `~/.codex/hooks.json`；Stop / SessionEnd / SessionStart 补做时按 rollout 自己的记录类型映射（§5「Codex 怎么采」），子 agent 按日期目录找 `source` 指回父线程的 rollout；拒绝按 §3 问题 2 的双条件判；doctor 查信任记录与特性开关。
-  本机 2 份真实会话映射出 28 条事件全部过 schema，条数与记录对得上。
+  本机 2 份真实会话映射出 28 条事件全部过 schema，条数与记录对得上。读取照 U18：分段读完，从没读过的 rollout 第一次只读补采窗口（`backfill_days`）内的记录。
 - `tools/lib/cursor.mjs`：**只用 hook 入参、不读 transcript**（格式没样本），挂 10 个事件写 `~/.cursor/hooks.json`；每个 hook 先写应答（beforeSubmitPrompt 放行、其余 `{}`）再丢后台；`user_email` 不出本机；token 原样放 `cursor.usage_raw`、不填 `payload.usage`。
 - **init 选装哪几家**（照 teamai `init.ts:592` 的 `promptForSelfModeAgents`）：`--agents claude,codex,cursor` 指定 > 不在终端里就挂本机检测到的 > 终端里第一次列出来选（回车 = 检测到的全部）；选择记进 config 的 `agents=`，重跑 init 沿用；没选的那家把自家条目删掉；uninstall 三家都清；doctor 按选择分家报。运行时在临时目录时不碰真实的 `~/.codex`、`~/.cursor`（同 settings 的保护）。
-- 回归 `tools/test-agents.sh` 42 项：init 选择与装卸对称、未登记零写入、Codex 一整段会话（轮中提交、apply_patch 的 files、子 agent、人拒绝 / 没证据的拒绝、插话、打断补 cancelled、幂等、schema）、Cursor 一整段（应答、工具、子 agent、files、commit、没等到 stop 的轮、邮箱不出本机、schema）、真实配置没被动过。**fixture 是照源码与本机桌面版的形状手搭的**，§4 实测后换成真记录。
+- 回归 `tools/test-agents.sh` 44 项（含 U18 同款的补采窗口与分段读）：init 选择与装卸对称、未登记零写入、Codex 一整段会话（轮中提交、apply_patch 的 files、子 agent、人拒绝 / 没证据的拒绝、插话、打断补 cancelled、幂等、schema）、Cursor 一整段（应答、工具、子 agent、files、commit、没等到 stop 的轮、邮箱不出本机、schema）、真实配置没被动过。**fixture 是照源码与本机桌面版的形状手搭的**，§4 实测后换成真记录。
 - 还没做：§4 实测三遍；K27；Codex 桌面版的信任入口；`projects pick` 的候选仓算上 Codex 的 cwd；DESIGN 的「多家」一节（实测后写）。
 
 ### 1. 结论

@@ -21,7 +21,7 @@ REAL_SUM=$(real_sum)
 
 export VIBETRAIL_HOME=$T/vt VIBETRAIL_CLAUDE_PROJECTS=$T/claude/projects VIBETRAIL_CLAUDE_SETTINGS=$T/claude/settings.json \
   VIBETRAIL_CODEX_HOME=$T/codex VIBETRAIL_CURSOR_HOME=$T/cursor VIBETRAIL_CLAUDE_BINARIES=/nonexistent \
-  VIBETRAIL_STABLE_WAIT=0 VIBETRAIL_FOREGROUND=1 VIBETRAIL_STOP_WAIT=0
+  VIBETRAIL_STABLE_WAIT=0 VIBETRAIL_FOREGROUND=1 VIBETRAIL_STOP_WAIT=0 VIBETRAIL_BACKFILL_DAYS=all   # 夹具的时间是写死的，别让补采窗口（U18）过两天把它们挡掉
 VT=$VIBETRAIL_HOME
 vt(){ node "$SELF/vibetrail.mjs" "$@"; }
 hook(){ printf '%s' "$3" | node "$SELF/vibetrail.mjs" hook "$1" "$2"; }
@@ -156,6 +156,21 @@ check "轮次成对：三轮 turn.start / turn.end 各三条" '[ "$(q "[(map(sel
 check "event_id 不重复" '[ "$(q "map(.event_id) | (length == (unique | length))")" = true ]'
 check "Codex 的全部事件过协议 1.0 schema" 'spool | schema_ok'
 check "state 里记了 rollout 的消费进度，没有还开着的轮" '[ "$(jq -c "[.consumed_bytes == $(wc -c < "$R" | tr -d " "), .open_turn]" "$VT/state/$SID/codex-main.json")" = "[true,null]" ]'
+
+echo "════ 3b. U18 同款：从没读过的 rollout 第一次只读补采窗口内的记录；分段读完（每段 200 字节也不丢不重） ════"
+SIDB=019a0000-0000-7000-8000-00000000bbbb; RB=$DAY/rollout-2026-09-01T10-00-00-$SIDB.jsonl
+OLD=$(node -e 'console.log(new Date(Date.now() - 10 * 86400000).toISOString())'); NEW=$(node -e 'console.log(new Date(Date.now() - 3600000).toISOString())')
+for l in "{\"timestamp\":\"$OLD\",\"type\":\"session_meta\",\"payload\":{\"id\":\"$SIDB\",\"cwd\":\"$REPO\",\"originator\":\"codex_cli_rs\",\"cli_version\":\"0.154.0\",\"history_mode\":\"paginated\"}}" \
+         "{\"timestamp\":\"$OLD\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"old1\"}}" \
+         "{\"timestamp\":\"$OLD\",\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"turn_id\":\"old1\",\"item\":{\"type\":\"UserMessage\",\"id\":\"o1\",\"content\":[{\"type\":\"text\",\"text\":\"十天前的一句话，第一次读时不补\"}]}}}" \
+         "{\"timestamp\":\"$OLD\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"old1\"}}" \
+         "{\"timestamp\":\"$NEW\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"new1\"}}" \
+         "{\"timestamp\":\"$NEW\",\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"turn_id\":\"new1\",\"item\":{\"type\":\"UserMessage\",\"id\":\"n1\",\"content\":[{\"type\":\"text\",\"text\":\"一小时前的一句话，要读\"}]}}}" \
+         "{\"timestamp\":\"$NEW\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"new1\"}}"; do printf '%s\n' "$l" >> "$RB"; done
+VIBETRAIL_BACKFILL_DAYS=2 VIBETRAIL_READ_MAX_BYTES=200 hook codex Stop "$(jq -n -c --arg sid "$SIDB" --arg tp "$RB" --arg cwd "$REPO" '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "Stop", turn_id: "new1"}')"
+check "第一次读：十天前那一轮不补，一小时前那一轮读到（turn.start / message.user / turn.end 各一条）" \
+  '[ "$(q "map(select(.session_id == \"'"$SIDB"'\")) | map([.type, .turn_id])")" = "[[\"turn.start\",\"new1\"],[\"message.user\",\"new1\"],[\"turn.end\",\"new1\"]]" ]'
+check "state 记了跳过的老字节数，分段读到了文件末尾" '[ "$(jq -c "[(.skipped_old_bytes > 0), (.consumed_bytes == $(wc -c < "$RB" | tr -d " "))]" "$VT/state/$SIDB/codex-main.json")" = "[true,true]" ]'
 
 echo "════ 4. Cursor：只用 hook 入参；应答、会话 / 轮次 / 工具 / 子 agent / 文件 / commit；不带邮箱 ════"
 CONV=cccccccc-0000-4000-8000-000000000001
