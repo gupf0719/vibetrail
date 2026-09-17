@@ -183,6 +183,7 @@ add '{"timestamp":"2026-09-17T02:01:05.000Z","type":"response_item","payload":{"
 add '{"timestamp":"2026-09-17T02:01:06.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"t2","reason":"interrupted"}}'
 # 第 3 轮：没有弹框证据的拒绝（不判人拒）
 hook codex UserPromptSubmit "$(P '{hook_event_name: "UserPromptSubmit", turn_id: "t3", prompt: "改名"}')"
+check "UserPromptSubmit 时顺带补读（codex-v6）：上一轮按停止打断、没有 Stop，下一句话一提交它的 turn.end 就写出来，不等下一次 Stop" '[ "$(q "map(select(.type == \"turn.end\" and .turn_id == \"t2\")) | map(.payload.status.code)")" = "[\"interrupted\"]" ]'
 add '{"timestamp":"2026-09-17T02:02:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t3"}}'
 add '{"timestamp":"2026-09-17T02:02:00.100Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"t3","item":{"type":"UserMessage","id":"u4","content":[{"type":"text","text":"改名"}]}}}'
 add '{"timestamp":"2026-09-17T02:02:01.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"call_5","input":"*** Begin Patch\n*** Delete File: README\n*** End Patch"}}'

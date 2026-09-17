@@ -15,9 +15,10 @@ import {
   detach, hookCommand, isOurs, readHostJson, writeHostJson, sameJson, writeTextGuarded,
 } from './agents.mjs';
 
-export const RULE = 'codex-v5';                          // v2（09-17）：拒绝只认整条输出；v3：弹框证据按时间窗、一对一配拒绝，轮结束后到来的记录不挂上去；
+export const RULE = 'codex-v6';                          // v2（09-17）：拒绝只认整条输出；v3：弹框证据按时间窗、一对一配拒绝，轮结束后到来的记录不挂上去；
                                                          // v4（同日，照 Pilot）：跳过子 agent / fork 文件里抄来的父会话历史、子 agent 补 parent_call_id、认两种搜索调用；
-                                                         // v5（同日）：自动审批（auto_review）下被拒不判人拒，guardian 审批线程不采
+                                                         // v5（同日）：自动审批（auto_review）下被拒不判人拒，guardian 审批线程不采；
+                                                         // v6（同日）：UserPromptSubmit 时顺带补读之前没读的轮（打断后 Stop 不再来）
 export const CODEX_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd', 'PermissionRequest'];
 // 超时与 async 定死不改：Codex 按整组配置算信任哈希，改一个字就要人重新信任（G12 §3 问题 1）
 // SessionEnd 最多 3 秒（hooks/src/events/session_end.rs:23，超了 Codex 在设置里报「clamping SessionEnd hook timeout to 3s」，用户 09-17 截图）
@@ -723,6 +724,10 @@ export function runCodexHook(event, raw) {
       e.extensions = { ...e.extensions, ...opt('codex.permission_mode', p.permission_mode), ...opt('vibetrail.dirty_files', snap?.dirty_files) };
       e._key = `${turnId}|turn.start`;
       out([e]);
+      // 顺带补读（codex-v6，09-17）：用户桌面版实测，按停止打断一轮之后这个会话的 Stop hook 再没来过，之后正常结束的轮一直没读出来；
+      // 打断本来也不触发 Stop。这个 hook 本来就在后台跑、不让人等，所以把之前没读的（打断的、Stop 没来的）在这里读掉，
+      // 这一轮自己还开着，读取进度停在它开头、留给 Stop。Claude 那一路不在 UserPromptSubmit 读（U11），这里是 Codex 自己的取舍
+      if (file) processSession(sid, ctx, file, { ev: event });
       break;
     }
     case 'PermissionRequest': {                         // 弹过审批框的证据（入参没有 tool_use_id，只按轮对）；不带参数
