@@ -210,10 +210,29 @@ add '{"timestamp":"2026-09-17T02:03:09.000Z","type":"event_msg","payload":{"type
 hook codex Stop "$(P '{hook_event_name: "Stop", turn_id: "t4", stop_hook_active: false}')"
 check "t4：一次弹框只配窗口内最早那次拒绝（call_7 人拒）；同一弹框不再配给 call_8；窗口外的 call_9 不算人拒" \
   '[ "$(q "map(select(.type == \"permission.decision\" and .turn_id == \"t4\")) | sort_by(.payload.call_id) | map([.payload.call_id, .payload.decided_by, (.is_divergence // false)])")" = "[[\"call_7\",\"user\",true],[\"call_8\",\"unknown\",false],[\"call_9\",\"unknown\",false]]" ]'
+# 第 5 轮（codex-v5）：自动审批（approvals_reviewer = auto_review）下，弹框证据落在窗口里也不判人拒——审批先交给 guardian 模型审
+hook codex UserPromptSubmit "$(P '{hook_event_name: "UserPromptSubmit", turn_id: "t5", prompt: "自动审批下再删一次"}')"
+add '{"timestamp":"2026-09-17T02:04:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t5"}}'
+add '{"timestamp":"2026-09-17T02:04:00.050Z","type":"turn_context","payload":{"turn_id":"t5","model":"gpt-5-codex","approval_policy":"on-request","approvals_reviewer":"auto_review"}}'
+add '{"timestamp":"2026-09-17T02:04:00.100Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"t5","item":{"type":"UserMessage","id":"u6","content":[{"type":"text","text":"自动审批下再删一次"}]}}}'
+C10=$(TS -1000)
+hook codex PermissionRequest "$(P '{hook_event_name: "PermissionRequest", turn_id: "t5", tool_name: "Bash", tool_input: {command: "rm README"}}')"
+O10=$(TS 1000)
+add "$(jq -n -c --arg ts "$C10" '{timestamp: $ts, type: "response_item", payload: {type: "function_call", name: "shell", arguments: "{\"command\":[\"rm\",\"README\"]}", call_id: "call_10"}}')"
+add "$(jq -n -c --arg ts "$O10" '{timestamp: $ts, type: "response_item", payload: {type: "function_call_output", call_id: "call_10", output: "exec command rejected by user"}}')"
+add '{"timestamp":"2026-09-17T02:04:09.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t5"}}'
+hook codex Stop "$(P '{hook_event_name: "Stop", turn_id: "t5", stop_hook_active: false}')"
+check "t5：自动审批下弹框证据在窗口里也不判人拒（decided_by unknown、不标分歧），记下 approvals_reviewer（codex-v5）" \
+  '[ "$(q "map(select(.type == \"permission.decision\" and .payload.call_id == \"call_10\")) | map([.payload.decided_by, (.is_divergence // false), .extensions[\"codex.approvals_reviewer\"]])")" = "[[\"unknown\",false,\"auto_review\"]]" ]'
+# guardian 自动审批线程自己的 hook（若会触发）：不当成独立会话采（codex-v5）
+GSID=019a0000-0000-7000-8000-00000000abcd; RG=$DAY/rollout-2026-09-17T10-04-00-$GSID.jsonl
+printf '%s\n' "$(jq -n -c --arg id "$GSID" --arg cwd "$REPO" '{timestamp: "2026-09-17T02:04:00.500Z", type: "session_meta", payload: {id: $id, cwd: $cwd, originator: "Codex Desktop", cli_version: "0.154.0", history_mode: "paginated", thread_source: "guardian_review", source: {subagent: {other: "guardian"}}}}')" > "$RG"
+for ev in SessionStart UserPromptSubmit Stop; do hook codex $ev "$(jq -n -c --arg sid "$GSID" --arg tp "$RG" --arg cwd "$REPO" --arg ev "$ev" '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: $ev, turn_id: "g1", source: "startup"}')"; done
+check "guardian 自动审批线程自己的 hook：不建 state、不写 spool（codex-v5）" '[ ! -d "$VT/state/$GSID" ] && [ -z "$(cat "$VT"/spool/*/"$GSID"/*.jsonl 2>/dev/null)" ]'
 hook codex SessionEnd "$(jq -n -c --arg sid "$SID" --arg tp "$R" --arg cwd "$REPO" '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "SessionEnd", reason: "other"}')"
 check "会话：session.start / session.end 各一条，agent 是 codex 0.154.0、surface cli" \
   '[ "$(q "map(select(.type | test(\"^session\\\\.\"))) | map([.type, .agent.name, .agent.version, .agent.surface])")" = "[[\"session.start\",\"codex\",\"0.154.0\",\"cli\"],[\"session.end\",\"codex\",\"0.154.0\",\"cli\"]]" ]'
-check "轮次成对：四轮 turn.start / turn.end 各四条" '[ "$(q "[(map(select(.type == \"turn.start\")) | length), (map(select(.type == \"turn.end\")) | length)]")" = "[4,4]" ]'
+check "轮次成对：五轮 turn.start / turn.end 各五条" '[ "$(q "[(map(select(.type == \"turn.start\")) | length), (map(select(.type == \"turn.end\")) | length)]")" = "[5,5]" ]'
 check "event_id 不重复" '[ "$(q "map(.event_id) | (length == (unique | length))")" = true ]'
 check "Codex 的全部事件过协议 1.0 schema" 'spool | schema_ok'
 check "两轮之间才到的回复不挂到已经结束的轮上：不发，计数 1（codex-v3）" '[ "$(q "map(select(.type == \"message.assistant\" and ((.payload.text // \"\") | test(\"孤儿\")))) | length")" = 0 ] && [ "$(jq .orphan_items "$VT/state/$SID/codex-main.json")" = 1 ]'

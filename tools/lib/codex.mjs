@@ -15,8 +15,9 @@ import {
   detach, hookCommand, isOurs, readHostJson, writeHostJson, sameJson, writeTextGuarded,
 } from './agents.mjs';
 
-export const RULE = 'codex-v4';                          // v2（09-17）：拒绝只认整条输出；v3：弹框证据按时间窗、一对一配拒绝，轮结束后到来的记录不挂上去；
-                                                         // v4（同日，照 Pilot）：跳过子 agent / fork 文件里抄来的父会话历史、子 agent 补 parent_call_id、认两种搜索调用
+export const RULE = 'codex-v5';                          // v2（09-17）：拒绝只认整条输出；v3：弹框证据按时间窗、一对一配拒绝，轮结束后到来的记录不挂上去；
+                                                         // v4（同日，照 Pilot）：跳过子 agent / fork 文件里抄来的父会话历史、子 agent 补 parent_call_id、认两种搜索调用；
+                                                         // v5（同日）：自动审批（auto_review）下被拒不判人拒，guardian 审批线程不采
 export const CODEX_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd', 'PermissionRequest'];
 // 超时与 async 定死不改：Codex 按整组配置算信任哈希，改一个字就要人重新信任（G12 §3 问题 1）
 // SessionEnd 最多 3 秒（hooks/src/events/session_end.rs:23，超了 Codex 在设置里报「clamping SessionEnd hook timeout to 3s」，用户 09-17 截图）
@@ -67,6 +68,9 @@ export function metaOf(file) {
   } catch {}
   return first;
 }
+// guardian 自动审批线程：thread_source = guardian_review，source = {subagent: {other: "guardian"}}（09-17 本机桌面版实测）
+const isGuardian = (m) => isObj(m) && (String(m.thread_source ?? '').toLowerCase() === 'guardian_review'
+  || String(isObj(m.source) && isObj(m.source.subagent) ? m.source.subagent.other ?? '' : '').toLowerCase() === 'guardian');
 // 会抄父会话历史的文件：fork 出来的（forked_from_id）、子 agent（source 是 subagent 或 thread_source 是 subagent）
 const copiesHistory = (m) => isObj(m) && Boolean(m.forked_from_id || spawnOf(m) || String(m.thread_source ?? '').toLowerCase() === 'subagent');
 // Codex 的 turn id 是 UUIDv7，前 48 位是创建时刻（毫秒）
@@ -283,8 +287,11 @@ export function mapRollout(lines, o) {
       const policy = POLICY.test(whole);
       // 人拒绝要有弹框证据落在「调用发出 → 结果回来」之间，而且一次弹框只配一次拒绝（codex-v3）。v2 只要同一轮弹过框就算，
       // 一轮里一次允许的弹框加一次非人为的拒绝就会误标成人拒（Codex 09-17 自己提的意见 1）
+      // 自动审批（turn_context.approvals_reviewer = auto_review）下，审批先交给 Codex 的 guardian 模型审，拒掉的不一定是人：
+      // 弹框证据在窗口里也不判人拒、不标分歧，只记下审批方式（codex-v5，09-17 用户桌面版上发现开着自动审批）
+      const autoReview = String(t.reviewer ?? '').toLowerCase() === 'auto_review';
       const lo = Date.parse(c.at ?? at) - PERM_SLACK_MS, hi = Date.parse(at) + PERM_SLACK_MS;
-      const perm = policy ? null : (o.perms ?? []).find((x) => !usedPerms.has(x._id) && (x.turn_id === t.id || (t.root && x.turn_id === t.root))
+      const perm = policy || autoReview ? null : (o.perms ?? []).find((x) => !usedPerms.has(x._id) && (x.turn_id === t.id || (t.root && x.turn_id === t.root))
         && Date.parse(x.at) >= lo && Date.parse(x.at) <= hi);
       if (perm) usedPerms.add(perm._id);
       const human = Boolean(perm);
@@ -294,6 +301,7 @@ export function mapRollout(lines, o) {
       if (human) e.is_divergence = true;
       e.extensions['vibetrail.denial_evidence'] = [...(itemStatus === 'declined' ? ['item_declined'] : []),
         ...(REJECTED.test(whole) || POLICY.test(whole) ? ['output_text'] : []), ...(human ? ['permission_request_in_window'] : [])];
+      if (t.reviewer) e.extensions['codex.approvals_reviewer'] = t.reviewer;
       push(e, `${cid}|permission.decision`);
       return;
     }
@@ -402,6 +410,7 @@ export function mapRollout(lines, o) {
         const t = turnOf(p.turn_id, off, at);
         if (!t) break;
         t.model = p.model ?? t.model; t.approval = p.approval_policy ?? t.approval; t.cwd = p.cwd ?? t.cwd; t.root = p.root_turn_id ?? t.root;
+        t.reviewer = p.approvals_reviewer ?? t.reviewer;   // user / auto_review（审批先交给 guardian 模型审）
         break;
       }
       case 'token_usage_record': {
@@ -672,14 +681,15 @@ export function runCodexHook(event, raw) {
   const ctx = gate([cwd]);
   if (!ctx) return;                                     // 未登记的仓：什么都不写
   const SD = path.join(VT_HOME, 'state', sid);
-  if (!mkdirp(SD)) return;
   const sessFile = path.join(SD, 'codex.json');
   const sess = readJson(sessFile, {});
   const tp = String(p.transcript_path ?? '');
   const file = tp && isFile(tp) ? tp : (sess.transcript_path && isFile(sess.transcript_path) ? sess.transcript_path : '');
   const meta = file ? (readJson(path.join(SD, 'codex-main.json'), {}).meta ?? metaOf(file)) : null;
-  // 子 agent 线程自己的 hook（若会触发）：它的一切从父会话那边的子 rollout 推，这里不发会话 / 轮次事件（待实测）
-  if (spawnOf(meta)) return;
+  // 子 agent 线程自己的 hook（若会触发）：它的一切从父会话那边的子 rollout 推，这里不发会话 / 轮次事件（待实测）；
+  // guardian 自动审批线程（codex-v5）：是模型在审审批、不是人的会话，不采
+  if (spawnOf(meta) || isGuardian(meta)) return;
+  if (!mkdirp(SD)) return;                              // 跳过的线程连空的 state 目录都不留
   vtWriteJson(sessFile, { ...sess, agent: 'codex', workspace: ctx.workspace, cwd, ...(file ? { transcript_path: file } : {}), ...opt('model', p.model), updated_at: nowIso() });
   const agent = { name: 'codex', version: meta?.cli_version ?? null, surface: surfaceOf(meta?.originator) };
   const now = nowIso();
