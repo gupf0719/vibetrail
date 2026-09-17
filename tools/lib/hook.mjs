@@ -12,7 +12,9 @@ import { mapRecords, RULE_VERSIONS, displayDir, BAD_LINE, BLANK_LINE } from './m
 
 export const VT_RUNTIME_VERSION = '0.2.0-dev';
 const VT_NS = '6c90e594-0cb4-59d0-9186-740d215c8b7f';   // uuid5(NS_URL, "vibetrail")，DESIGN §4.2
-const MAX_READ_BYTES = 50 * 1024 * 1024;                // 单次最多读 50 MB（照 Pilot 的 MAX_TRANSCRIPT_BYTES，全采后更要紧）
+// 一段最多读 50 MB（照 Pilot 的 MAX_TRANSCRIPT_BYTES）。用户 09-17 定（U18）：超了不丢最早那段，分段读完——读完一段就写 spool、推进进度，接着读下一段。
+// 测试用 VIBETRAIL_READ_MAX_BYTES 调小
+const MAX_READ_BYTES = Number(process.env.VIBETRAIL_READ_MAX_BYTES) > 0 ? Number(process.env.VIBETRAIL_READ_MAX_BYTES) : 50 * 1024 * 1024;
 
 export const VT_HOME = process.env.VIBETRAIL_HOME || path.join(process.env.HOME || '', '.vibetrail');
 const claudeDir = () => process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || '', '.claude');
@@ -424,9 +426,9 @@ export function vtWorkflowLaunch(mainT, runId) {
 
 // A11 完整性钉子的运行时部分：每份 transcript 新读到的记录走到了哪（映射账本的 new 计数），按会话累计在 state/<sid>/integrity.json，doctor 汇总。
 // 与 main.json 一样随 uninstall 删、文件被重写时这份文件的计数清零（从头重读，不重复计）。恒等式：seen = records + bad_json + skipped_non_object + skipped_no_uuid + replayed + inherited
-const INTEGRITY_KEYS = ['seen', 'records', 'bad_json', 'skipped_non_object', 'skipped_no_uuid', 'replayed', 'inherited', 'content_dropped', 'marker', 'marker_without_hit', 'truncated_bytes'];
+const INTEGRITY_KEYS = ['seen', 'records', 'bad_json', 'skipped_non_object', 'skipped_no_uuid', 'replayed', 'inherited', 'content_dropped', 'marker', 'marker_without_hit', 'skipped_old_bytes'];
 export const vtIntegrity = (sid) => objOr(readJson(path.join(VT_HOME, 'state', sid, 'integrity.json'), {}));
-export function vtIntegrityAdd(sid, name, nw, { reset = false, truncatedBytes = 0 } = {}) {
+export function vtIntegrityAdd(sid, name, nw, { reset = false, skippedOldBytes = 0 } = {}) {
   try {
     const cur = vtIntegrity(sid);
     const files = objOr(cur.files);
@@ -435,7 +437,7 @@ export function vtIntegrityAdd(sid, name, nw, { reset = false, truncatedBytes = 
     const add = (k, v) => { if (typeof v === 'number' && v > 0) f[k] = (f[k] ?? 0) + v; };
     for (const k of ['seen', 'records', 'bad_json', 'skipped_non_object', 'skipped_no_uuid', 'replayed', 'inherited', 'content_dropped']) add(k, n[k]);
     add('marker', objOr(n.sentinel).marker); add('marker_without_hit', objOr(n.sentinel).marker_without_hit);
-    add('truncated_bytes', truncatedBytes);
+    add('skipped_old_bytes', skippedOldBytes);   // 补采老会话时窗口外没读的字节（没读就不算 seen，恒等式照旧）
     const ut = objOr(f.unknown_types);
     for (const [k, v] of Object.entries(objOr(n.unknown_types))) if (typeof v === 'number') ut[k] = (ut[k] ?? 0) + v;
     if (Object.keys(ut).length > 0) f.unknown_types = ut;
@@ -552,6 +554,46 @@ export function hookEvents(event, p, ctx) {    // → [事件…]（0 或 1 条�
 }
 
 // ---------- 一份 transcript：从 checkpoint 起映射（原 vibetrail-map 的编排） ----------
+// 补采老会话最多补两天（用户 09-17 定）：只管从没读过的 transcript——补做时最后修改在窗口外的会话整个跳过，第一次读一份文件时从窗口内的第一条记录读起。
+// 已经在跟的会话每次 hook 都读，不按天截。config 的 backfill_days（init 写默认 2，all = 不限）；测试用 VIBETRAIL_BACKFILL_DAYS
+export function vtBackfillCutoffMs() {
+  const v = String(process.env.VIBETRAIL_BACKFILL_DAYS ?? vtConf('backfill_days', '2')).trim();
+  if (v === '' || v === 'all') return null;
+  const d = Number(v);
+  return Number.isFinite(d) && d >= 0 ? Date.now() - d * 86400000 : null;
+}
+// 一份文件里第一条时间不早于 cutoffMs 的记录：{byte, line}（line 从 1 数）。按块扫、只在每行里找 "timestamp":"，不整份读进内存；
+// 一条都没有就给可读的末尾，之后追加的照常读
+function backfillStart(file, consumed, cutoffMs) {
+  const KEY = Buffer.from('"timestamp":"');
+  const CH = 4 * 1024 * 1024;
+  const fd = fs.openSync(file, 'r');
+  try {
+    let carry = Buffer.alloc(0), base = 0, line = 1, pos = 0;   // base：carry 第一个字节在文件里的偏移
+    while (pos < consumed) {
+      const n = Math.min(CH, consumed - pos);
+      const b = Buffer.alloc(n);
+      fs.readSync(fd, b, 0, n, pos);
+      pos += n;
+      const data = carry.length ? Buffer.concat([carry, b]) : b;
+      let st = 0;
+      for (;;) {
+        const nl = data.indexOf(0x0a, st);
+        if (nl < 0) break;
+        const k = data.indexOf(KEY, st);
+        if (k >= 0 && k < nl) {
+          const e = data.indexOf(0x22, k + KEY.length);
+          const t = e > 0 && e < nl ? Date.parse(data.toString('utf8', k + KEY.length, e)) : NaN;
+          if (!Number.isNaN(t) && t >= cutoffMs) return { byte: base + st, line };
+        }
+        st = nl + 1; line++;
+      }
+      carry = data.subarray(st); base += st;
+    }
+    return { byte: consumed, line };
+  } finally { fs.closeSync(fd); }
+}
+
 export function mapFile(file, opts) {
   // sid / meta / 父实例从路径推（原 vibetrail-map 的这一段）：
   // 子 agent 文件是 …/<sid>/subagents/agent-<id>.jsonl，workflow 起的在 …/<sid>/subagents/workflows/<runId>/agent-<id>.jsonl（K11），meta 是同名 .meta.json；
@@ -601,7 +643,7 @@ export function mapFile(file, opts) {
     sid, project_id, workspace_id, workspace_roots = null, parent_instance = 'main', meta = null,
     start_line = 1, start_byte = null, from_line = 0, seenFile = '', hook_turns = {}, hook_perms = [],
     perm_since = '', perm_periods = null, split_decisions = {}, close_last = '', stop_turn = '', turns = true, capture_content = '1', vt_version = VT_RUNTIME_VERSION,
-    done_ts = null,
+    done_ts = null, backfill_since_ms = null,
   } = opts;
   // 这个会话已知的子 agent 与 workflow run：没给就看这个会话的 subagents 目录（递归）
   const sessionSubRoot = subRoot || path.join(path.dirname(file), sid, 'subagents');
@@ -638,22 +680,44 @@ export function mapFile(file, opts) {
   }
   if (sb > consumed) throw new Error(`起读偏移 ${sb} 超过文件可读长度 ${consumed}（文件被重写过？从 0 重读）`);
 
-  // 单次最多读 50 MB（照 Pilot）：超了从尾部读，并对齐到行首——宁可丢最老的，也不让一次 hook 吃满内存
-  let readFrom = sb, truncated = 0;
-  if (consumed - sb > MAX_READ_BYTES) { readFrom = consumed - MAX_READ_BYTES; truncated = readFrom - sb; }
-  const fd = fs.openSync(file, 'r');
-  const slice = Buffer.alloc(consumed - readFrom);
-  if (slice.length > 0) fs.readSync(fd, slice, 0, slice.length, readFrom);
-  fs.closeSync(fd);
-  let text = slice.toString('utf8');
-  let firstLine = start_line;
-  if (truncated > 0) {
-    const nl = text.indexOf('\n');
-    text = nl >= 0 ? text.slice(nl + 1) : '';
-    // 丢掉的行数要补进行号，否则 from_line 的门控会错位
-    const dropped = (() => { const b = fs.readFileSync(file); let c = 0; for (let i = sb; i < readFrom + (text ? 0 : 0); i++) if (b[i] === 0x0a) c++; return c; })();
-    firstLine = start_line + dropped + 1;
+  // 补采老会话最多补两天（用户 09-17 定）：从没读过的文件从窗口内的第一条记录读起，更早的不读，行号照算
+  let firstLine = start_line, fromLine = from_line, skippedOld = 0;
+  if (backfill_since_ms !== null && backfill_since_ms !== undefined && sb === 0 && from_line === 0 && start_line === 1 && consumed > 0) {
+    const b = backfillStart(file, consumed, backfill_since_ms);
+    if (b.byte > 0) { skippedOld = b.byte; sb = b.byte; firstLine = b.line; fromLine = b.line - 1; }
   }
+
+  // 分段读（用户 09-17 定，U18；以前超过 50 MB 就只读尾部、丢最早那段）：一段最多 MAX_READ_BYTES，对齐到段里最后一个换行；
+  // 一行就超过上限的读到这一行结尾（每段至少一整行，保证往前走）。没读完（more）的这一段不关轮、不写出末尾的调用，
+  // 调用方写完 spool、推进进度后从 checkpoint 接着读下一段
+  let segEnd = consumed;
+  let slice;
+  const fd = fs.openSync(file, 'r');
+  try {
+    const want = Math.max(Math.min(consumed - sb, MAX_READ_BYTES), 0);
+    slice = Buffer.alloc(want);
+    if (want > 0) fs.readSync(fd, slice, 0, want, sb);
+    if (sb + want < consumed) {
+      const idx = slice.lastIndexOf(0x0a);
+      if (idx >= 0) slice = slice.subarray(0, idx + 1);
+      else {
+        const pieces = [slice];
+        let pos = sb + want;
+        while (pos < consumed) {
+          const n = Math.min(1024 * 1024, consumed - pos);
+          const b = Buffer.alloc(n);
+          fs.readSync(fd, b, 0, n, pos);
+          const nl = b.indexOf(0x0a);
+          if (nl >= 0) { pieces.push(b.subarray(0, nl + 1)); break; }
+          pieces.push(b); pos += n;
+        }
+        slice = Buffer.concat(pieces);
+      }
+      segEnd = sb + slice.length;
+    }
+  } finally { fs.closeSync(fd); }
+  const more = segEnd < consumed;
+  const text = slice.toString('utf8');
 
   // 按物理行喂：坏行、空行也占位（BAD_LINE / BLANK_LINE），映射器的行号才与这里按换行符换算的字节 checkpoint 一致（09-16 修：以前直接丢，
   // 中间一出现坏行，checkpoint 换算成字节就错位一行）。text 停在最后一个换行符之后，split 出来的最后一段是空串，不是一行
@@ -665,24 +729,24 @@ export function mapFile(file, opts) {
     try { records.push(JSON.parse(line)); } catch { records.push(BAD_LINE); }
   }
   const { events, ledger } = mapRecords(records, {
-    sid, project_id, workspace_id, workspace_roots, parent_instance, start_line: firstLine, from_line, meta,
+    sid, project_id, workspace_id, workspace_roots, parent_instance, start_line: firstLine, from_line: fromLine, meta,
     seen_uuids: seenFile && isFile(seenFile)
       ? readText(seenFile).split('\n').filter(Boolean).map((l) => { const [u, n] = l.split('\t'); return [u, Number(n)]; })
       : [],
-    hook_turns, hook_perms, perm_since, perm_periods, split_decisions, known_agents, workflow_runs, done_ts, close_last, stop_turn, turns, vt_version, rule_version: RULE_VERSIONS.diverge, capture_content,
+    hook_turns, hook_perms, perm_since, perm_periods, split_decisions, known_agents, workflow_runs, done_ts,
+    close_last: more ? '' : close_last, stop_turn: more ? '' : stop_turn, turns, vt_version, rule_version: RULE_VERSIONS.diverge, capture_content,
   });
 
-  // 下次的起读字节：checkpoint 行的偏移
+  // 下次的起读字节：checkpoint 行在这一段里的偏移（以前把整份文件读进来数行，大文件时白占内存）
   let ckByte = sb;
   if (ledger.checkpoint_line > firstLine) {
-    const buf = fs.readFileSync(file);
-    let n = 0, i = 0;
-    while (n < ledger.checkpoint_line - 1) { const j = buf.indexOf(0x0a, i); if (j < 0) { i = buf.length; break; } i = j + 1; n++; }
-    ckByte = i;
-  } else if (ledger.checkpoint_line <= firstLine && truncated > 0) ckByte = readFrom;
+    let n = firstLine, k = 0;
+    while (n < ledger.checkpoint_line) { const nl = slice.indexOf(0x0a, k); if (nl < 0) { k = slice.length; break; } k = nl + 1; n++; }
+    ckByte = sb + k;
+  }
 
   const full = { ...ledger, file, sid, parent_instance, start_byte: sb, checkpoint_byte: ckByte,
-    consumed_bytes: consumed, file_bytes: total, ...(truncated > 0 ? { truncated_bytes: truncated } : {}) };
+    consumed_bytes: segEnd, file_bytes: total, more, ...(skippedOld > 0 ? { skipped_old_bytes: skippedOld } : {}) };
   return { events: vtFillIds(sid, events), ledger: full };
 }
 
@@ -776,11 +840,21 @@ export function runHook(event, payload) {
     // workflow 起的 agent（K11）看同目录 journal.jsonl 里它有没有终态行；<name>.done 是老版本 SubagentStop hook 留下的（记的是当时的文件大小），升级过渡期照认
     const aid = name.replace(/^agent-/, '');
     const ag = vtAgents(s2);
-    const known = subRoot ? vtKnownAgents(subRoot) : {};
-    for (const [k, v] of Object.entries(ag.launched)) known[k] = { ...objOr(v), ...objOr(known[k]) };
-    for (const [k, v] of Object.entries(ag.files)) known[k] = { ...objOr(known[k]), files: objOr(v), files_outside: ag.files_outside[k] ?? 0 };
-    const runs = subRoot ? vtWorkflowRuns(subRoot) : {};
-    for (const [rid, w] of Object.entries(ag.workflows)) if (runs[rid]) runs[rid] = { ...objOr(w), ...runs[rid], ...(w.call_id ? { call_id: w.call_id } : {}) };
+    // 已知的子 agent 与 workflow run：子 agent 文件 + agents.json 里记下的后台启动、子 agent 改的文件。分段读时每段都要重新取——
+    // 前一段读到的后台启动存进 agents.json 之后，后一段的完成通知才认得出（09-17 拿 106 MB 的真实 transcript 对拍时发现少了 3 条 subagent.end）
+    const knownFrom = (a) => {
+      const k = subRoot ? vtKnownAgents(subRoot) : {};
+      for (const [x, v] of Object.entries(a.launched)) k[x] = { ...objOr(v), ...objOr(k[x]) };
+      for (const [x, v] of Object.entries(a.files)) k[x] = { ...objOr(k[x]), files: objOr(v), files_outside: a.files_outside[x] ?? 0 };
+      return k;
+    };
+    const runsFrom = (a) => {
+      const r = subRoot ? vtWorkflowRuns(subRoot) : {};
+      for (const [rid, w] of Object.entries(a.workflows)) if (r[rid]) r[rid] = { ...objOr(w), ...r[rid], ...(w.call_id ? { call_id: w.call_id } : {}) };
+      return r;
+    };
+    const known = knownFrom(ag);
+    const runs = runsFrom(ag);
     const run = workflowRunOf(f);
     let doneTs = null, meta;
     if (name !== 'main') {
@@ -801,6 +875,7 @@ export function runHook(event, payload) {
       }
     }
     let ino = null; try { ino = fs.statSync(f).ino; } catch {}
+    const hadState = isFile(stFile);
     let lines = 0, consumed = 0, ckl = 1, ckb = 0, fpOld = '', rewrites = 0, open = '', closed = false, callOpen = false, lastTs = null;
     if (isFile(stFile)) {
       const st = readJson(stFile, {});
@@ -820,35 +895,48 @@ export function runHook(event, payload) {
       try { fs.unlinkSync(seenFile); } catch {}
       lines = 0; consumed = 0; ckl = 1; ckb = 0; rewrites += 1; rewritten = true;
     }
-    let out;
-    try {
-      out = mapFile(f, { sid: s2, project_id: ctx.project_id, workspace_id: ctx.workspace_id, workspace_roots: ctx.roots,
-        start_line: ckl, start_byte: ckb, from_line: lines, seenFile,
-        hook_turns: name === 'main' ? vtHookTurns(s2) : {},
-        hook_perms: vtHookPerms(s2), perm_periods: vtPermPeriods(), split_decisions: vtSplits(s2),
-        close_last: name === 'main' || close ? close : '', stop_turn: name === 'main' ? stopTurn : '',
-        known_agents: known, workflow_runs: name === 'main' ? runs : {}, ...(meta ? { meta } : {}),
-        done_ts: doneTs, capture_content: vtConf('capture_content', '1') });
-    } catch (e) { vtLogError(ev, s2, `map:${name}`, 2); return; }
-    // 结论先落盘再写 spool：反过来的话，spool 写进去了、结论没存上，下次重读就可能判出另一种、发出矛盾的事件
-    if (!vtSplitsSave(s2, out.ledger.split_decisions_new)) { vtLogError(ev, s2, `splits:${name}`, 1); return; }
-    if (!vtAgentsSave(s2, out.ledger.agents, out.ledger.agent_files, out.ledger.agent_files_outside)) vtLogError(ev, s2, `agents:${name}`, 1);
-    if (!vtSpoolWrite(ctx.pkey, s2, name, out.events)) { vtLogError(ev, s2, `spool:${name}`, 1); return; }
-    const srcLines = (out.ledger.sources || []).map(([u, n]) => `${u}\t${n}`).join('\n');
-    if (srcLines) { try { fs.appendFileSync(seenFile, srcLines + '\n'); } catch {} }
-    const fp = vtFprint(f, out.ledger.consumed_bytes) ?? '';
-    const stNew = { lines: out.ledger.lines, consumed_bytes: out.ledger.consumed_bytes, file_bytes: out.ledger.file_bytes,
-      checkpoint_line: out.ledger.checkpoint_line, checkpoint_byte: out.ledger.checkpoint_byte,
-      parent_instance: out.ledger.parent_instance, fprint: fp, rewrites,
-      turn_open: out.ledger.turns.open ?? null, turn_closed: out.ledger.turns.closed ?? false,
-      call_open: out.ledger.trace?.call_open ?? false, last_ts: out.ledger.last_ts ?? null, updated_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z') };
-    let stateOk = true;
-    try { fs.writeFileSync(stFile + '.tmp', JSON.stringify(stNew) + '\n'); fs.renameSync(stFile + '.tmp', stFile); } catch { stateOk = false; }
-    // A11：state 推进了才记这次新读到的行（写不进 state 的话下次会重读，先记就重复计）；文件被重写从头读的，先把这份文件的计数清零
-    if (stateOk && !vtIntegrityAdd(s2, name, out.ledger.new, { reset: rewritten, truncatedBytes: out.ledger.truncated_bytes ?? 0 })) vtLogError(ev, s2, `integrity:${name}`, 1);
-    if (name === 'main') {
-      const model = out.ledger.turns?.model;
-      if (model) vtWriteJson(path.join(sd, 'session.json'), { ...readJson(path.join(sd, 'session.json'), {}), model });
+    // 分段读完（用户 09-17 定，U18）：一段最多 MAX_READ_BYTES，写完 spool、推进进度就接着读下一段；一次 hook 读太久（默认 60 s）剩下的下次接着读。
+    // 补采老会话最多补两天：只对从没读过的文件、只在第一段用
+    const budgetMs = Number(process.env.VIBETRAIL_READ_BUDGET_MS ?? vtConf('read_budget_ms', '60000'));
+    const tStart = Date.now();
+    const backfill = hadState ? null : vtBackfillCutoffMs();
+    for (let seg = 0; ; seg++) {
+      // checkpoint 落在读到的位置往前超过半个上限（一轮就超过 25 MB）：从读到的地方接着读，否则每段都在重读同一截、走不动；代价是这一轮从中间接上
+      if (consumed - ckb > MAX_READ_BYTES / 2) { ckl = lines + 1; ckb = consumed; }
+      const agSeg = seg === 0 ? ag : vtAgents(s2);
+      let out;
+      try {
+        out = mapFile(f, { sid: s2, project_id: ctx.project_id, workspace_id: ctx.workspace_id, workspace_roots: ctx.roots,
+          start_line: ckl, start_byte: ckb, from_line: lines, seenFile,
+          hook_turns: name === 'main' ? vtHookTurns(s2) : {},
+          hook_perms: vtHookPerms(s2), perm_periods: vtPermPeriods(), split_decisions: vtSplits(s2),
+          close_last: name === 'main' || close ? close : '', stop_turn: name === 'main' ? stopTurn : '',
+          known_agents: seg === 0 ? known : knownFrom(agSeg), workflow_runs: name === 'main' ? (seg === 0 ? runs : runsFrom(agSeg)) : {}, ...(meta ? { meta } : {}),
+          done_ts: doneTs, capture_content: vtConf('capture_content', '1'), backfill_since_ms: seg === 0 ? backfill : null });
+      } catch (e) { vtLogError(ev, s2, `map:${name}`, 2); return; }
+      // 结论先落盘再写 spool：反过来的话，spool 写进去了、结论没存上，下次重读就可能判出另一种、发出矛盾的事件
+      if (!vtSplitsSave(s2, out.ledger.split_decisions_new)) { vtLogError(ev, s2, `splits:${name}`, 1); return; }
+      if (!vtAgentsSave(s2, out.ledger.agents, out.ledger.agent_files, out.ledger.agent_files_outside)) vtLogError(ev, s2, `agents:${name}`, 1);
+      if (!vtSpoolWrite(ctx.pkey, s2, name, out.events)) { vtLogError(ev, s2, `spool:${name}`, 1); return; }
+      const srcLines = (out.ledger.sources || []).map(([u, n]) => `${u}\t${n}`).join('\n');
+      if (srcLines) { try { fs.appendFileSync(seenFile, srcLines + '\n'); } catch {} }
+      const fp = vtFprint(f, out.ledger.consumed_bytes) ?? '';
+      const stNew = { lines: out.ledger.lines, consumed_bytes: out.ledger.consumed_bytes, file_bytes: out.ledger.file_bytes,
+        checkpoint_line: out.ledger.checkpoint_line, checkpoint_byte: out.ledger.checkpoint_byte,
+        parent_instance: out.ledger.parent_instance, fprint: fp, rewrites,
+        turn_open: out.ledger.turns.open ?? null, turn_closed: out.ledger.turns.closed ?? false,
+        call_open: out.ledger.trace?.call_open ?? false, last_ts: out.ledger.last_ts ?? null, updated_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z') };
+      let stateOk = true;
+      try { fs.writeFileSync(stFile + '.tmp', JSON.stringify(stNew) + '\n'); fs.renameSync(stFile + '.tmp', stFile); } catch { stateOk = false; }
+      // A11：state 推进了才记这次新读到的行（写不进 state 的话下次会重读，先记就重复计）；文件被重写从头读的，先把这份文件的计数清零
+      if (stateOk && !vtIntegrityAdd(s2, name, out.ledger.new, { reset: rewritten && seg === 0, skippedOldBytes: out.ledger.skipped_old_bytes ?? 0 })) vtLogError(ev, s2, `integrity:${name}`, 1);
+      if (name === 'main') {
+        const model = out.ledger.turns?.model;
+        if (model) vtWriteJson(path.join(sd, 'session.json'), { ...readJson(path.join(sd, 'session.json'), {}), model });
+      }
+      if (!stateOk || !out.ledger.more) break;
+      if (Date.now() - tStart >= budgetMs) break;                          // 剩下的下次 hook 接着读
+      lines = stNew.lines; consumed = stNew.consumed_bytes; ckl = stNew.checkpoint_line; ckb = stNew.checkpoint_byte;
     }
   };
 
@@ -946,6 +1034,7 @@ export function runHook(event, payload) {
   const catchUp = () => {
     const idle = Number(vtConf('turn_idle_close', '3600'));
     const now = epochSec();
+    const backfillCutoff = vtBackfillCutoffMs();
     const saved = { ...ctx };
     for (const [repo, dir] of catchUpDirs()) {
       setProject(repo);
@@ -953,6 +1042,11 @@ export function runHook(event, payload) {
       try { names = fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')); } catch { continue; }
       for (const t of names.sort()) {
         const full = path.join(dir, t), s2 = t.replace(/\.jsonl$/, '');
+        // 补采老会话最多补两天（用户 09-17 定）：从没读过、最后修改又在窗口外的会话整个跳过，不建 state；当前会话照读
+        if (backfillCutoff !== null && s2 !== sid && !isFile(path.join(VT_HOME, 'state', s2, 'main.json'))) {
+          let mtMs = Date.now(); try { mtMs = fs.statSync(full).mtimeMs; } catch {}
+          if (mtMs < backfillCutoff) continue;
+        }
         let close = '';
         if (s2 === sid) { if (source === 'resume') close = 'resume'; }
         else {

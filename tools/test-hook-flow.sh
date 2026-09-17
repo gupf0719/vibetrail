@@ -25,7 +25,8 @@ REPO=$T/demo-proj; mkdir -p "$REPO"; REPO=$(cd "$REPO" && pwd -P)
 REAL_SETTINGS=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json
 REAL_SUM=$( { cat "$REAL_SETTINGS" 2>/dev/null || true; } | cksum)
 # VIBETRAIL_STOP_WAIT=0：这里的 transcript 多数没有答完标记，Stop 不等（K24 单独一节按真实时序测）
-export VIBETRAIL_HOME=$T/vt VIBETRAIL_CLAUDE_PROJECTS=$T/claude/projects VIBETRAIL_CLAUDE_SETTINGS=$T/claude/settings.json VIBETRAIL_STABLE_WAIT=0 VIBETRAIL_FOREGROUND=1 VIBETRAIL_STOP_WAIT=0
+# VIBETRAIL_BACKFILL_DAYS=all：这里的记录时间戳是写死的（09-11、09-15），补采老会话只补两天的规则会把它们当成老历史跳过；补采窗口在第 23 节单独测
+export VIBETRAIL_HOME=$T/vt VIBETRAIL_CLAUDE_PROJECTS=$T/claude/projects VIBETRAIL_CLAUDE_SETTINGS=$T/claude/settings.json VIBETRAIL_STABLE_WAIT=0 VIBETRAIL_FOREGROUND=1 VIBETRAIL_STOP_WAIT=0 VIBETRAIL_BACKFILL_DAYS=all
 . "$SELF/vibetrail-lib.sh"; VT_HOME=$VIBETRAIL_HOME
 # 全采正文默认开（用户 09-16）。下面这一大批断言钉的是「只带元数据」那个形态——它现在是 capture_content=0 的行为，
 # 仍然是支持的模式，显式关掉开关跑；全采的端到端在最后一节单测
@@ -820,6 +821,93 @@ hook SessionStart "$(jq -n -c --arg sid "$SID" --arg tp "$TR" --arg cwd "$WT21" 
 check "路径不出本机：worktree 里开的会话，session.start 的 vibetrail.cwd 与 vibetrail.worktree 都是 .claude/worktrees/wt21，找不到绝对路径" \
     '[ "$(cat "$VT_HOME/spool/$PKEY/$SID"/*.jsonl 2>/dev/null | jq -s -c "map(select(.type == \"session.start\")) | map([.extensions[\"vibetrail.cwd\"], .extensions[\"vibetrail.worktree\"]])")" = "[[\".claude/worktrees/wt21\",\".claude/worktrees/wt21\"]]" ] && ! cat "$VT_HOME/spool/$PKEY/$SID"/*.jsonl | grep -qF "$REPO_NP"'
 SID=$sid0; TR=$tr0
+
+echo "════ 23. 分段读完与补采老会话最多两天（用户 09-17 定，U18）：一段最多 N 字节、写完一段接着读，一次 hook 读不完的下次接着读；从没读过的会话只补最近两天，已经在跟的照读 ════"
+B=$T/bf-home; BP=$B/claude/projects/$(vt_slug "$REPO"); mkdir -p "$B/.claude" "$BP"
+# bsync <home 名> [环境变量赋值…]：在隔离的 home 里登记 REPO 再补采一遍（补采与 hook 走同一条 processSession）
+bsync(){ local h=$B/$1; shift
+    ( cd "$REPO" && env VIBETRAIL_HOME="$h" VIBETRAIL_CLAUDE_SETTINGS="$B/.claude/settings.json" VIBETRAIL_CLAUDE_PROJECTS="$B/claude/projects" "$@" bash "$SELF/vibetrail" projects add >/dev/null 2>&1
+      env VIBETRAIL_HOME="$h" VIBETRAIL_CLAUDE_SETTINGS="$B/.claude/settings.json" VIBETRAIL_CLAUDE_PROJECTS="$B/claude/projects" "$@" bash "$SELF/vibetrail" sync >/dev/null 2>&1 ); }
+# brec <uuid> <parent> <sessionId> <promptId> <类型> <content JSON> <几天前> [额外字段 JSON]：时间戳按「现在往前几天」算
+brec(){ local x=${8:-}; [ -n "$x" ] || x='{}'
+    jq -n -c --arg u "$1" --arg p "$2" --arg s "$3" --arg q "$4" --arg ty "$5" --argjson c "$6" --argjson d "$7" --argjson x "$x" --arg cwd "$REPO" \
+      '{type: $ty, uuid: $u, parentUuid: (if $p == "" then null else $p end), sessionId: $s, promptId: $q, message: {role: $ty, content: $c}, isSidechain: false, cwd: $cwd,
+        version: "2.1.266", entrypoint: "cli", gitBranch: "main", timestamp: ((now - $d * 86400) | todate)} + $x
+       | if $ty == "assistant" then del(.promptId) else . end'; }
+evs(){ cat "$B/$1/spool"/*/"$2"/*.jsonl 2>/dev/null | jq -S -c 'del(.workspace_id)' | sort; }   # 两个 home 的 workspace_id 各自生成，比之前去掉
+
+# 一份约 35 KB、12 轮的会话（每轮：人话、带工具调用的回复、工具结果、收尾回复），时间都在两小时前
+SEG=77770000-0000-4000-8000-000000000023; F23=$BP/$SEG.jsonl; : > "$F23"
+PAD=$(printf 'x%.0s' $(seq 1 400)); prev="r0"
+# 开头先派一个后台 agent（启动结果当场返回），完成通知放在十几轮之后——分段读时两者落在不同的段，后一段要从 agents.json 认出它
+brec u0 "" "$SEG" p0 user '"派一个后台 agent"' 0.08 '{"origin":{"kind":"human"}}' >> "$F23"
+brec a0 u0 "$SEG" p0 assistant '[]' 0.08 '{"message":{"id":"m0","model":"claude-opus-5","role":"assistant","content":[{"type":"tool_use","id":"t0","name":"Agent","input":{"description":"后台跑","prompt":"跑","run_in_background":true}}],"usage":{"input_tokens":5,"output_tokens":5}}}' >> "$F23"
+brec r0 a0 "$SEG" p0 user '[{"type":"tool_result","tool_use_id":"t0","content":"Async agent launched"}]' 0.08 '{"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"abg23","description":"后台跑"}}' >> "$F23"
+for i in $(seq 1 12); do
+    brec "u$i" "$prev" "$SEG" "p$i" user "$(jq -n -c --arg t "第 $i 句 $PAD" '$t')" 0.08 '{"origin":{"kind":"human"}}' >> "$F23"
+    brec "a$i" "u$i" "$SEG" "p$i" assistant '[]' 0.08 "$(jq -n -c --arg i "$i" '{message: {id: ("m" + $i), model: "claude-opus-5", role: "assistant", content: [{type: "tool_use", id: ("t" + $i), name: "Bash", input: {command: ("echo " + $i)}}], usage: {input_tokens: 5, output_tokens: 5}}}')" >> "$F23"
+    brec "r$i" "a$i" "$SEG" "p$i" user "$(jq -n -c --arg i "$i" --arg pad "$PAD" '[{type: "tool_result", tool_use_id: ("t" + $i), content: ("out " + $i + " " + $pad)}]')" 0.08 >> "$F23"
+    brec "e$i" "r$i" "$SEG" "p$i" assistant '[]' 0.08 "$(jq -n -c --arg i "$i" --arg pad "$PAD" '{message: {id: ("n" + $i), model: "claude-opus-5", role: "assistant", stop_reason: "end_turn", content: [{type: "text", text: ("done " + $i + " " + $pad)}], usage: {input_tokens: 5, output_tokens: 5}}}')" >> "$F23"
+    prev="e$i"
+done
+NOTE23=$(jq -n -c '"<task-notification>\n<task-id>abg23</task-id>\n<tool-use-id>t0</tool-use-id>\n<status>completed</status>\n<result>跑完了</result>\n</task-notification>"')
+brec nt e12 "$SEG" p13 user "$NOTE23" 0.08 '{"origin":{"kind":"task-notification"}}' >> "$F23"
+S23=$(wc -c < "$F23" | tr -d ' '); L23=$(wc -l < "$F23" | tr -d ' ')
+bsync whole
+bsync seg VIBETRAIL_READ_MAX_BYTES=16000
+check "分段读完：每段最多 16 KB 读出来的事件与一次读完的逐条一致（一轮约 2 KB，远小于半段，上下文不丢）" '[ -n "$(evs whole "$SEG")" ] && [ "$(evs seg "$SEG")" = "$(evs whole "$SEG")" ]'
+check "分段读完：开头派的后台 agent，完成通知落在后面的段里，照样认出、发 subagent.end（每段都从 agents.json 重新取已知的子 agent）" \
+    'cat "$B/seg/spool"/*/"$SEG"/*.jsonl | jq -s -e "map(select(.type == \"subagent.end\" and .agent_instance_id == \"abg23\")) | length == 1" >/dev/null'
+check "分段读完：一次补采里一段写一块 spool（多于 1 块），state 读到文件末尾，完整性计数 seen 等于行数" \
+    '[ "$(ls "$B/seg/spool"/*/"$SEG" | grep -c -- "-main.jsonl$")" -gt 1 ] && jq -e --argjson s "$S23" ".consumed_bytes == \$s and .lines == $L23" "$B/seg/state/$SEG/main.json" >/dev/null && jq -e ".files.main.seen == $L23" "$B/seg/state/$SEG/integrity.json" >/dev/null'
+# 读太久（预算 0 毫秒）：每次只读一段，剩下的下次接着读
+n23=0
+while [ "$n23" -lt 40 ]; do
+    bsync step VIBETRAIL_READ_MAX_BYTES=16000 VIBETRAIL_READ_BUDGET_MS=0; n23=$((n23 + 1))
+    [ "$(jq -r .consumed_bytes "$B/step/state/$SEG/main.json" 2>/dev/null)" = "$S23" ] && break
+done
+check "一次 hook 读不完就留给下次：每次补采只读一段，${n23} 次读完，事件与一次读完的一致" '[ "$n23" -ge 2 ] && [ "$(evs step "$SEG")" = "$(evs whole "$SEG")" ]'
+
+# 一轮就比半段还大（这里每段 4 KB、一轮约 20 KB）：checkpoint 追不上，从读到的地方接着读——这一轮从中间接上，但一定能读到文件末尾、不会卡在同一截
+BIG=77770000-0000-4000-8000-0000000000b1; FB=$BP/$BIG.jsonl
+{ brec g0 "" "$BIG" pg user '"一轮很长的活"' 0.05 '{"origin":{"kind":"human"}}'
+  for i in $(seq 1 10); do
+      brec "ga$i" "g0" "$BIG" pg assistant '[]' 0.05 "$(jq -n -c --arg i "$i" '{message: {id: ("gm" + $i), model: "claude-opus-5", role: "assistant", content: [{type: "tool_use", id: ("gt" + $i), name: "Bash", input: {command: ("echo " + $i)}}]}}')"
+      brec "gr$i" "ga$i" "$BIG" pg user "$(jq -n -c --arg i "$i" --arg pad "$PAD$PAD$PAD" '[{type: "tool_result", tool_use_id: ("gt" + $i), content: ("out " + $i + " " + $pad)}]')" 0.05
+  done
+} > "$FB"
+bsync giant VIBETRAIL_READ_MAX_BYTES=4000
+check "一轮比半段还大：照样读到文件末尾（state 的 consumed 等于文件大小），没有错误日志" \
+    'jq -e --argjson s "$(wc -c < "$FB" | tr -d " ")" ".consumed_bytes == \$s" "$B/giant/state/$BIG/main.json" >/dev/null && [ ! -s "$B/giant/logs/errors.log" ]'
+
+# 补采老会话最多两天：OLD 三天前的会话（最后修改也在三天前）；MIX 三天前开、今天接着用
+OLD=77770000-0000-4000-8000-0000000000a1; MIX=77770000-0000-4000-8000-0000000000a2
+{ brec o1 "" "$OLD" po user '"三天前的话"' 3 '{"origin":{"kind":"human"}}'
+  brec o2 o1 "$OLD" po assistant '[]' 3 '{"message":{"id":"om","model":"claude-opus-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"三天前的回答"}]}}'
+} > "$BP/$OLD.jsonl"
+perl -e 'utime(time - 3*86400, time - 3*86400, $ARGV[0])' "$BP/$OLD.jsonl"
+{ brec x1 "" "$MIX" px user '"三天前开的会话"' 3 '{"origin":{"kind":"human"}}'
+  brec x2 x1 "$MIX" px assistant '[]' 3 '{"message":{"id":"xm","model":"claude-opus-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"三天前的回答"}]}}'
+  brec y1 x2 "$MIX" py user '"今天接着问"' 0.01 '{"origin":{"kind":"human"}}'
+  brec y2 y1 "$MIX" py assistant '[]' 0.01 '{"message":{"id":"ym","model":"claude-opus-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"今天的回答"}]}}'
+} > "$BP/$MIX.jsonl"
+bsync bf VIBETRAIL_BACKFILL_DAYS=2
+check "补采老会话最多两天：从没读过、最后修改在三天前的会话整个跳过，不建 state、不出 spool" \
+    '[ ! -e "$B/bf/state/$OLD" ] && [ -z "$(ls -d "$B/bf/spool"/*/"$OLD" 2>/dev/null)" ]'
+check "补采老会话最多两天：三天前开、今天还在用的会话从两天内的第一条读起——事件只有今天那一轮，三天前那一轮一条都没有" \
+    '[ "$(cat "$B/bf/spool"/*/"$MIX"/*.jsonl | jq -s -c "[(map(.turn_id) | unique), (map(select(.provenance.source_event_id == \"x1\" or .provenance.source_event_id == \"x2\")) | length)]")" = "[[\"py\"],0]" ]'
+check "补采窗口外没读的字节进完整性计数（等于前两行的长度，不算 seen），行号照算（state 的 lines 是 4）" \
+    'jq -e --argjson b "$(head -n 2 "$BP/$MIX.jsonl" | wc -c | tr -d " ")" ".files.main.skipped_old_bytes == \$b and .files.main.seen == 2" "$B/bf/state/$MIX/integrity.json" >/dev/null && jq -e ".lines == 4" "$B/bf/state/$MIX/main.json" >/dev/null'
+o=$( cd "$REPO" && VIBETRAIL_HOME=$B/bf VIBETRAIL_CLAUDE_SETTINGS=$B/.claude/settings.json VIBETRAIL_CLAUDE_PROJECTS=$B/claude/projects VIBETRAIL_BACKFILL_DAYS=2 bash "$SELF/vibetrail" doctor 2>&1 )
+check "doctor 说明补采只补了最近两天、跳过了多少" 'printf "%s" "$o" | grep -q "补采老会话只补最近 2 天"'
+# 已经在跟的会话照读：MIX 读过之后再追加时间戳在三天前的记录，照样采（不按天截）
+{ brec z1 y2 "$MIX" pz user '"后面追加的话"' 3 '{"origin":{"kind":"human"}}'
+  brec z2 z1 "$MIX" pz assistant '[]' 3 '{"message":{"id":"zm","model":"claude-opus-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"后面追加的回答"}]}}'
+} >> "$BP/$MIX.jsonl"
+bsync bf VIBETRAIL_BACKFILL_DAYS=2
+check "已经在跟的会话照读：之后追加的记录哪怕时间戳在三天前也照样采" \
+    'cat "$B/bf/spool"/*/"$MIX"/*.jsonl | jq -s -e "any(.[]; .turn_id == \"pz\" and .type == \"turn.start\")" >/dev/null'
+check "这一节没有错误日志" '[ ! -s "$B/whole/logs/errors.log" ] && [ ! -s "$B/seg/logs/errors.log" ] && [ ! -s "$B/step/logs/errors.log" ] && [ ! -s "$B/bf/logs/errors.log" ]'
 
 check "测试没有动真实的 settings.json（${REAL_SETTINGS}）" '[ "$( { cat "$REAL_SETTINGS" 2>/dev/null || true; } | cksum)" = "$REAL_SUM" ]'
 echo

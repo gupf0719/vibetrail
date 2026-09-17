@@ -406,6 +406,7 @@ export async function cmdInit(argv) {
   confSet('node', process.execPath);
   if (!vtConf('device_id', '')) confSet('device_id', crypto.randomUUID());
   if (!vtConf('turn_idle_close', '')) confSet('turn_idle_close', '3600');
+  if (!vtConf('backfill_days', '')) confSet('backfill_days', '2');          // 补采老会话最多补两天（用户 09-17 定；all = 不限）
   if (!vtConf('push_max_age', '')) confSet('push_max_age', '3600');
   if (!vtConf('push_max_events', '')) confSet('push_max_events', '100');
   if (!(readText(path.join(VT_HOME, 'config')) || '').split('\n').some((l) => l.startsWith('endpoint='))) confSet('endpoint', '');
@@ -876,7 +877,7 @@ export async function cmdDoctor() {
   if (rw > 0) note(`有 ${rw} 次 transcript 被重写后从头重读（offset 信任检查，DESIGN §3.3）`);
 
   // A11 完整性（运行时部分）：每份 transcript 新读到的记录走到了哪，按会话累计在 state/<sid>/integrity.json
-  const tot = {}; const unknownTypes = {}; const noHit = new Set(); const broken = []; const truncated = new Set(); let nInteg = 0;
+  const tot = {}; const unknownTypes = {}; const noHit = new Set(); const broken = []; const oldSkipped = new Set(); let nInteg = 0;
   try {
     for (const d of fs.readdirSync(path.join(VT_HOME, 'state'))) {
       const integ = readJson(path.join(VT_HOME, 'state', d, 'integrity.json'), null);
@@ -887,7 +888,7 @@ export async function cmdDoctor() {
         for (const [k, v] of Object.entries(f)) if (typeof v === 'number') tot[k] = (tot[k] ?? 0) + v;
         for (const [k, v] of Object.entries(f.unknown_types ?? {})) if (typeof v === 'number') unknownTypes[k] = (unknownTypes[k] ?? 0) + v;
         if ((f.marker_without_hit ?? 0) > 0) noHit.add(d.slice(0, 8));
-        if ((f.truncated_bytes ?? 0) > 0) truncated.add(d.slice(0, 8));
+        if ((f.skipped_old_bytes ?? 0) > 0) oldSkipped.add(d.slice(0, 8));
         const g = (k) => f[k] ?? 0;
         if (g('seen') !== g('records') + g('bad_json') + g('skipped_non_object') + g('skipped_no_uuid') + g('replayed') + g('inherited')) broken.push(`${d.slice(0, 8)}/${name}`);
       }
@@ -903,7 +904,8 @@ export async function cmdDoctor() {
     const uk = Object.entries(unknownTypes).sort((a, b) => b[1] - a[1]);
     if (uk.length) note(`transcript 里有 ${uk.length} 种不认识的记录类型：${uk.slice(0, 6).map(([k, v]) => `${k} ×${v}`).join('、')}${uk.length > 6 ? ' 等' : ''}——新版 Claude Code 加的，看要不要映射（在 map.mjs 的已知清单里登记或加映射）`);
     if (t('content_dropped') > 0) say(`  · 超过协议 1 MiB 的事件去掉正文照发 ${t('content_dropped')} 条（vibetrail.content_dropped = size）`);
-    if (truncated.size) note(`单次读超过 50 MB、丢掉了最老的 ${Math.round(t('truncated_bytes') / 1048576)} MB 没读（会话 ${[...truncated].slice(0, 5).join('、')}）`);
+    if (oldSkipped.size) say(`  · 补采老会话只补最近 ${vtConf('backfill_days', '2')} 天：${oldSkipped.size} 个会话第一次读时跳过了更早的 ${(t('skipped_old_bytes') / 1048576).toFixed(1)} MB（config 的 backfill_days，all = 不限）`);
+    if (t('truncated_bytes') > 0) note(`09-17 之前的版本单次读超过 50 MB 时丢过最老的一段，共 ${Math.round(t('truncated_bytes') / 1048576)} MB（现在分段读完，不再丢）`);
   }
 
   // 落后的 transcript
