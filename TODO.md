@@ -115,16 +115,16 @@
   - 先修 K14（uninstall 留 spool 删 ids）再上 push，否则重装后待发翻倍。
   - 要测再加：块超 100 条分批与游标续传、4xx 只丢一批、进程在 ack 与删块之间被杀不重不丢、token 不出现在进程列表。
 - [x] **全采与协议补齐**（2026-09-16 核出、同日做完 K20–K23，`a34bbf5`）：K20 排队的人话全采时发 `message.user`（`delivery: queued`，本机这台 35 条）；K21 按停止打断工具补 `tool.end(cancelled)`；K22 `turn.end.files[]`（量过：有改动的轮平均 3.5 个文件、最多 10 个、路径约 100 字节，每条 turn.end 不到 1 KB；根外的只计数）；K23 `capture_content=0` 时 `subagent.start` 不带 `task`。
-  **还开着**：K11 workflow 子 agent 遇到样本时递归扫 `subagents/`（本机仍没有样本）；K25 DESIGN 补全采的决策条目、改 §0 / §2 / D5；子 agent 自己改的文件没进任何 `files[]`（它的 `subagent.end` 由父文件发，父不解析子 transcript）。
-- [ ] 完整性钉子：每类记录条数进出相等、映射后事件全部过 schema（这两条测试期已在 `test-map.sh` 钉住；运行时要进账本与 doctor）、超 1 MiB 被拒计数、未知记录类型 / 事件名告警（A11；G10、G6）。
+  **还开着**：~~K11 workflow 子 agent~~（09-16 第二批做了）；K25 DESIGN 补全采的决策条目、改 §0 / §2 / D5；~~子 agent 自己改的文件没进任何 `files[]`~~（09-16 第二批做了，见 K22）。
+- [x] **09-16 第二批与 09-17 收尾**（`6cb3786` / `f81ff53` / `f9f8dd6` / `03847f8`）：K11 workflow 子 agent（递归扫 `subagents/`、按 runId 挂回 Workflow 调用、journal 判完成）；K22 的子 agent 部分（子 agent 自己改读的文件进它的 `subagent.end` 与那一轮的 `files[]`，hook 改成子 agent 文件先映射）；A11 运行时计数与 doctor；路径不出本机（`vibetrail.cwd` / `vibetrail.worktree` / `cwd_changed` 相对主 checkout，`instructions_loaded` 相对工作区根，根外换成 `~` 形）；rule_version 升到 diverge / turn / ext v3；坏行、空行占行号。09-17 收尾：test-hook-flow 的版本号改从 `RULE_VERSIONS` 读，新第 22 节走 hook 的端到端，修掉同一次 hook 里 spool 块互相覆盖（K26，会丢数据），登记 `auto_mode_exit`；沙箱里对本机 20 个会话真实补采，16,697 条全过 schema、没有错误日志。
+- [x] **完整性钉子**（运行时部分 2026-09-16 第二批 `6cb3786` / `f81ff53`，09-17 `03847f8` 补端到端）：映射账本加 `new` 计数，只数新读到的行，恒等式 seen = 进映射 + 坏行 + 不是对象 + 没 uuid + 回放副本 + 复制来的历史；hook 按文件累计进 `state/<sid>/integrity.json`（文件被重写时那份清零）；doctor 汇总读过多少条，点名恒等式破了、坏行、拒绝标记没认出、不认识的记录类型 / 附件类型 / system 子类型、超 1 MiB 去正文、单次读超 50 MB 截断。坏行、空行占行号（以前直接丢，中间有坏行时 checkpoint 换算成字节会错一行）。09-17 本机 20 个会话真实补采：54 份 transcript 恒等式全成立。**还没做**：服务端拒收的计数（随 push）；doctor 看最近会话的 `stop_hook_summary` 有没有跑过我们的命令。原记：完整性钉子：每类记录条数进出相等、映射后事件全部过 schema（这两条测试期已在 `test-map.sh` 钉住；运行时要进账本与 doctor）、超 1 MiB 被拒计数、未知记录类型 / 事件名告警（A11；G10、G6）。
   **09-16**：映射账本里 in / out / replayed / skipped_no_uuid / sentinel 已有，K8 修后再加 inherited；缺的是把它们按会话累计进 state、由 doctor 汇总（哪个会话 `marker_without_hit` > 0、`skipped_*` > 0、replayed 异常多），
   并在 test-hook-flow 里做成恒等式断言（记录数 = 出事件的 + 跳过的 + 不产事件的）——Pilot 的恒等式只写在文档里、测试 grep 不到，正是要避免的（G10）。
   **09-16 补**：D13 之后没有 hook 侧的类型化事件可以对账（DESIGN §3.2），「已知清单之外的记录类型 / attachment 类型」告警更要紧；超过 1 MiB 现在是去掉正文照发（`vibetrail.content_dropped` = size），条数进 doctor。
 - [ ] 回归（用户 09-15：先不急着做）：两路各有带断言的测试，输入用 [experiments/collect-demo/scenario.json](experiments/collect-demo/scenario.json) 回放，补上 SessionStart 补做、
   打断后无 Stop、后台子 agent 晚于父 Stop、一轮多 commit、端点未配置 / 配置后断网五个场景。分歧一路已有 `test-hook-flow.sh`，其中补做与打断后无 Stop 已覆盖；
   轮次元数据一路现在只有 demo.sh 端到端跑一遍、没有断言。（09-16 起本机装了 jsonschema，两套回归里的 schema 项不再跳过。）
-  **09-16 已补**：K8 / K12 / K13（test-map 第 7 段）、K14 / K16（test-hook-flow 第 17 段）、后台子 agent 晚于父 Stop（test-hook-flow 第 7 段，D13）。**还缺**：summary 与 Stop 同一秒落盘时两条路 event_id 相同且只留一条（D7 补记）、一轮多 commit、端点未配置 / 配置后断网（随 push）；push 的见上。
-  turn.start / turn.end 成对、status、commits 的断言也还没有（demo.sh 只打印）。
+  **09-16 已补**：K8 / K12 / K13（test-map 第 7 段）、K14 / K16（test-hook-flow 第 17 段）、后台子 agent 晚于父 Stop（test-hook-flow 第 7 段，D13）。**09-16 / 09-17 又补**：答完标记与 Stop 两条路只留一条 turn.end（test-hook-flow 第 21 节，K24 改成 Stop 时等标记）；两轮 turn.start / turn.end 成对、status、一轮两次提交按顺序进 commits、嵌套与 workflow 子 agent、子 agent 改的文件（第 22 节）。**还缺**：端点未配置 / 配置后断网（随 push）；push 的见上。
 - [ ] 查询端只留 push 前本地预览（G9，读取不归本项目）：`vibetrail list / show` 已做（09-15），`push --list / --show` 随 push；然后 OPEN-ISSUES 关 G7。
   退役脚本 09-15 已按用户要求归档到 `old/`（`old/README.md`），审计线的几份随 U6 定去留。
   **09-16 加**：`vibetrail show --bodies` 只列 `content_state = included` 的事件（被拒调用的 `tool.request.input`、被打断的回复、之后人的下一句），

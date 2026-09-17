@@ -95,7 +95,7 @@ bash tools/vibetrail init
 想马上看到登记过的仓以前的会话（装之前开的那些），跑 `~/.vibetrail/bin/vibetrail sync` 补采一遍；平时下次开会话时会自动补。
 空闲超过一小时的会话，补采时连最后一轮一起关掉；最近一小时内还在用的，最后一轮要等它下次答完（或空闲满一小时）才出 `turn.end`，不是漏采。
 
-**数据文件在** `~/.vibetrail/spool/<项目目录名>-<hash>/<会话 id>/`，每个文件是一次 hook 产出的一块，文件名 `<UTC 时间>-<pid>-<来源>.jsonl`，
+**数据文件在** `~/.vibetrail/spool/<项目目录名>-<hash>/<会话 id>/`，每个文件是一次 hook 产出的一块，文件名 `<UTC 时间>-<pid>-<来源>.jsonl`（同一次 hook 同一秒写同一来源的第二块，pid 后加 `_2`），
 来源是 `hook-<事件名小写>`（hook 当场给的，如 `hook-userpromptsubmit`）、`main`（解析主会话 transcript 得出的）或 `agent-<id>`（子 agent 的 transcript）。每行一条 paas-coding-hook 协议 1.0 事件，直接 `cat` 就能看。
 这就是将来要 push 的全部内容。**2026-09-16 起默认全采正文**（用户定，推翻原先的「只带元数据」）：人的 prompt、模型输出、
 工具参数与结果原样进事件（`payload.text` / `payload.input` / `payload.output`），thinking 进 `extensions["vibetrail.reasoning"]`，
@@ -113,7 +113,7 @@ bash tools/vibetrail init
 | 人拒绝一次工具调用 | `permission.decision`（decided_by user，注明是看权限框还是按权限模式分出来的）+ `tool.request`（被拒的命令），这一轮以「拒绝后停下」关；auto 模式的分类器拦下、权限链路故障也发 `permission.decision`，decided_by 分别是 policy、system |
 | 人按停止打断 | `turn.end`（interrupted）+ 被打断的回复 `message.assistant` + 在跑的调用 `tool.request`；打断的是正在跑的工具时 kind 是 `interrupt_tool`（「按停止打断工具」） |
 | 分歧之后人说的第一句话 | `message.user`，指回那次分歧 |
-| 子 agent 起止 | `subagent.start`（类型、任务、派它的调用）/ `subagent.end`（完成 / 出错 / 被停、耗时、token，全采时带它最后的回答）；后台跑的子 agent 看它的完成通知 |
+| 子 agent 起止 | `subagent.start`（类型、任务、派它的调用）/ `subagent.end`（完成 / 出错 / 被停、耗时、token，它自己改读了哪些文件，全采时带它最后的回答）；后台跑的子 agent 看它的完成通知；workflow 起的 agent 同样有，带 `vibetrail.workflow`（run、阶段）；子 agent 改的文件也算进这一轮 `turn.end` 的 files |
 | 弹权限框 | `ext.claude.permission_request`（工具名、权限模式，不带参数）；用来分「人拒绝」与「按停止打断工具」 |
 | API 出错结束一轮 | 这一轮的 `turn.end` 状态就是那个错误（如 `rate_limit`），等下一次模型答完才写 |
 | CLAUDE.md 加载、切换目录 | `ext.claude.instructions_loaded`（每个文件的路径、大小、哈希，全采时带正文）、`ext.claude.cwd_changed`（从哪到哪） |
@@ -144,7 +144,7 @@ bash experiments/collect-demo/report.sh -o experiments/collect-demo/out/report.m
 ~/.vibetrail/bin/vibetrail uninstall
 ```
 
-`doctor` 查运行时（MANIFEST 逐个校验）、node 版本（≥ 20）与**映射器跑不跑得通**（真 import 一次 `lib/map.mjs` 再拿一条假记录跑一遍：映射器起不来的话 transcript 那一路一条都不出，而 hook 仍然全部 exit 0）、hook 条目（包括命令指向的脚本在不在）、hook 有没有被全局开关关掉（`disableAllHooks` / 企业策略的 `allowManagedHooksOnly`）、有没有重复挂载（同一事件挂在 HOME 与项目两处会触发两遍）、登记表、有没有落后没采的会话、错误日志（映射失败单独点出条数）、上报 token 填没填（只显示末 4 位，文件别人能读时告警）。
+`doctor` 查运行时（MANIFEST 逐个校验）、node 版本（≥ 20）与**映射器跑不跑得通**（真 import 一次 `lib/map.mjs` 再拿一条假记录跑一遍：映射器起不来的话 transcript 那一路一条都不出，而 hook 仍然全部 exit 0）、hook 条目（包括命令指向的脚本在不在）、hook 有没有被全局开关关掉（`disableAllHooks` / 企业策略的 `allowManagedHooksOnly`）、有没有重复挂载（同一事件挂在 HOME 与项目两处会触发两遍）、登记表、有没有落后没采的会话、错误日志（映射失败单独点出条数）、完整性（每份 transcript 读到的记录都有去处；坏行、不认识的记录类型、判据没认出的拒绝标记单独点名）、上报 token 填没填（只显示末 4 位，文件别人能读时告警）。
 卸载只去掉 settings 里自己的条目和运行时，已采的数据、配置、上报 token、登记表留着；加 `--purge` 连 `~/.vibetrail` 整个删掉。
 
 ## 演示时要说清楚的

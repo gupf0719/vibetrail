@@ -155,6 +155,12 @@ G6 的哨兵改由语料里「已知清单之外的 `type` / `attachment.type`�
 - **子 agent 的信号**（09-16，D13）：`state/<sid>/agents.json`——`launched`（后台派出的 agent 与派它的调用，很多后台 agent 没有自己的 transcript 文件，
   之后的 `<task-notification>` 靠它认）、`done`（agentId → 完成信号的时间）、`calls_done`（派它的调用 id → 调用结果的时间，同步 agent 出错时拿不到 agentId）。
   只增不改；映射子 agent 文件时「完成信号的时间不早于文件最后一条记录」才写出最后一次调用。
+  09-16 第二批加了三样：`workflows`（runId → 派它的 Workflow 调用与 taskId，K11）、`files` / `files_outside`（agentId → 它自己改读的文件与根外的次数，K22 子 agent 部分）。
+  映射顺序也跟着改：子 agent 文件先（深的在前）、主会话后，完成信号变了再把子 agent 文件补一遍——父文件发子 agent 的 `subagent.end`、关这一轮时要用到子 agent 改了哪些文件，
+  子 agent「写完了」又要看父文件里的信号。子 agent 文件递归扫 `subagents/`（最多 3 层），workflow 起的在 `subagents/workflows/<runId>/` 下、跑完没有看同目录的 `journal.jsonl`。
+- **完整性计数**（A11，09-16 第二批）：`state/<sid>/integrity.json` 按 transcript 文件累计映射账本的 `new` 计数（只数新读到的行）：seen、进映射的、坏行、不是对象、没 uuid、回放副本、复制来的历史、
+  超 1 MiB 去正文、拒绝标记与判据没认出的、不认识的记录类型 / 附件类型 / system 子类型、单次读超 50 MB 截断的字节。state 推进了才记，文件被重写从头读时那份清零；doctor 汇总并查恒等式
+  seen = 进映射 + 坏行 + 不是对象 + 没 uuid + 回放副本 + 复制来的。坏行、空行在映射器里也占行号，行号才与字节 checkpoint 对得上。
 - **从本轮开头读，不从文件头读**（U11，09-15 定）。映射要回看的东西都在同一轮里，所以只重读本轮：106 MB 的会话一次从 10.5 s
   降到 0.19 s；676 轮里九成不超过 0.4 MB。借的是 Pilot「只读新字节」的思路，但它不保留上下文、全靠 Stop 恰好切在轮边界，
   我们退到本轮开头，边界落在轮中间也不丢上下文。首次整读仍是 O(文件)，106 MB 约 12 s，只发生一次、在后台。
@@ -172,7 +178,8 @@ G6 的哨兵改由语料里「已知清单之外的 `type` / `attachment.type`�
   失败日志 `logs/errors.log` 只留元数据（时间、事件、会话、阶段、退出码），不留 payload（teamai 上报失败把整份 context 连 prompt 摘要写盘，别学）。
 - **本机不是存档，spool 是过手的 outbox**：push 在产出数据的同一个 hook 里发（Stop 异步、按门槛；SessionEnd 与 SessionStart 补做不看门槛，§4），服务端 ack 即删；本机常驻只有
   `state/`（offset、push 水位与退避记录，KB 级）与还没 ack 的块。任何一条事件在本机最多待约 1 小时加到下一次 hook 的间隔。端点未配置的现阶段它才是「全部」，文件可读、不压缩，就是用户要先看的「输出内容」。
-- 布局：`~/.vibetrail/spool/<项目键>/<sid>/` 下是**块文件**：每次 hook 产出一块 `<UTC 时间>-<pid>-<名>.jsonl`（协议形状的事件，每行一条），
+- 布局：`~/.vibetrail/spool/<项目键>/<sid>/` 下是**块文件**：每次 hook 产出一块 `<UTC 时间>-<pid>-<名>.jsonl`（协议形状的事件，每行一条；同一进程同一秒再写同一来源时 pid 后加 `_2`、`_3`——
+  子 agent 文件一次 hook 里会映射两遍，以前第二块把第一块整个盖掉、第一块的事件就此丢了，K26），
   临时文件 + rename 写入，写入后不再改；push 按块发、ack 后整块删，不用改写一个不断增长的 `events.jsonl`（09-15 改，原写法是单个 events.jsonl + manifest.json）。
   块名里的 UTC 时间就是门槛计时的依据（§4）：最早待发事件的时间直接从文件名取，不另记状态。
   offset 等进度在 `state/`（上一条），不放 spool。项目键 = 主 checkout 目录名 + 路径 sha1 前 16 位。
@@ -251,7 +258,7 @@ flowchart LR
 | 子 agent 文件里的打断 | `subagent.end`，status `cancelled` | 父会话那条是 `turn.end`，两个事实，不去重（K1 关闭）；统计打断只数 `turn.end` |
 | 轮次 | `turn.start`（model、vcs）/ `turn.end`（status、usage、vcs、commits[]） | `turn.start`：UserPromptSubmit 当场发（provenance `hook`）；hook 没跑的轮由映射层按 promptId 补位（同一 event_id，先写的留下）。`turn.end`：**模型答完就发**（D7）——Stop hook 当场关（`closed_by` = `stop`），被拦下后再 Stop 时补发一条 `stops` 更大的；重读到 `stop_hook_summary` 且之前没有拦停反馈也关（`summary`）；拒绝后停下的在 for-tool-use 打断处关（`denied`）；打断的由分歧一路发 `interrupted`；没有标记的退到兜底：下一轮开始、会话结束（`session_end`）、同会话恢复（`resume`）、空闲超过 `turn_idle_close`（`idle`）。status：summary / hook 记到的 Stop / 最后一条回复 `end_turn` 是 `completed` / `success`，`preventedContinuation` 是 `hook_stopped` / `cancellation`，拒绝是 `denied` / `denial`，API 出错结束的轮是 `<错误类型>` / `error`（transcript 的 `isApiErrorMessage` + `error`，依据 `api_error`；09-16 前取 StopFailure），没有证据是 `unknown` / `unknown`；依据记在 `vibetrail.end_evidence`。usage 与打断同一定义（§4.2）；vcs、commits 取 hook 快照（Stop 优先，其次 gap）；打断的 turn.end 也补上这两样 |
 | 会话、子 agent | `session.start`（source、capabilities）/ `session.end`（reason、status）/ `subagent.start`（agent_type、父实例、`parent_call_id`、task）/ `subagent.end`（status、last_message） | 会话的由 hook payload 直接给。子 agent 的 09-16 起从 transcript 推（D13）：起＝子 agent 文件第一条记录（meta.json 给类型、任务、派它的调用）或父会话里的后台启动结果；止＝同步 agent 的调用结果（status、耗时、token 进 `vibetrail.agent`）或 `<task-notification>`（completed 是 success，killed / stopped 是 cancellation，failed 是 error）；`_key` 与原先 hook 发的相同。capabilities 暂填我们会发的事件类型清单、session.end 的 status 填 `completed` / `success`、reason 按 code 规范化——都是自定义取值，接 collector 前确认（U13） |
-| 扩展事件 | hook 出的：`ext.claude.permission_request`（provenance `hook` + `source_event`）。transcript 出的：`ext.claude.api_error`、`prompt_snapshot`、`instructions_loaded`、`cwd_changed`（`source_event` 填来源记录的类型：`api_error` / `prompt_snapshot` / `instructions` / `cwd`） | `instructions_loaded` 的 payload 是逐个文件的路径、类型、sha256、字节数，全采时正文进 `extensions["vibetrail.instructions"]`。09-16 前还有 hook 出的 `post_tool_use_failure` / `permission_denied` / `stop_failure` / `notification` / `subagent_stop`（内部 agent），D13 去掉 |
+| 扩展事件 | hook 出的：`ext.claude.permission_request`（provenance `hook` + `source_event`）。transcript 出的：`ext.claude.api_error`、`prompt_snapshot`、`instructions_loaded`、`cwd_changed`（`source_event` 填来源记录的类型：`api_error` / `prompt_snapshot` / `instructions` / `cwd`） | `instructions_loaded` 的 payload 是逐个文件的路径（09-16 第二批起相对工作区根、仓外的换成 `~` 形，§4.2）、类型、sha256、字节数，全采时正文进 `extensions["vibetrail.instructions"]`；`cwd_changed` 的 old / new 同样不写本机绝对路径。09-16 前还有 hook 出的 `post_tool_use_failure` / `permission_denied` / `stop_failure` / `notification` / `subagent_stop`（内部 agent），D13 去掉 |
 
 Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-batch-1.0.schema.json)）：枚举类字段全是小写 `code` 型；`permission.decision` 必填
 `permission_id` / `tool_name` / `decision` / `decided_by`；`provenance.kind=transcript` 必带 `rule_version`；`files[].evidence=tool_argument` 只能是
@@ -267,10 +274,10 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
 | `status.category` 用推荐值（success / failure / cancellation / denial / skipped / unknown，不认识的按 other 统计）；各事件有推荐 code | ✅ 09-16 改（K18）：`tool.end` 是 succeeded / failed / cancelled，分类 `error` 一律改 `failure`；来源自己的状态（interrupted、denied、hook_stopped、rate_limit、killed）留在 code |
 | `usage` 来源没给的字段省略、不传 0；cached 通常是 input 的子集，不能各项直接相加 | ✅ 09-16 定（U12）：input 含缓存创建与缓存读，cached 是 input 的子集，total = input + output，没给的不填（§4.2） |
 | Stop hook 阻止停止时轮次仍在继续，不得提前发 `turn.end` | ✅ 09-16 改（K24）：Stop 时先等答完标记 / 拦停反馈落盘（上限 `stop_wait`，默认 10 s）再关，拦停了不关；等不到才走 D7 的老路 |
-| 映射规则改了就升 `rule_version`，不改写已收的历史事件 | ✅ 09-16 升到 v2 基线（K19）；test-map 钉着：输出变了而版本号没升就红 |
+| 映射规则改了就升 `rule_version`，不改写已收的历史事件 | ✅ 09-16 升到 v2 基线（K19），同日第二批 diverge / turn / ext 升 v3（子 agent 文件、workflow、按 meta 认同步 agent 的结束、路径相对化），call 仍是 v2；test-map 钉着：输出变了而版本号没升就红 |
 | 工具调用中断导致轮次终止，`tool.end(cancelled)` 与 `turn.end` 各发一条 | ✅ 09-16 改（K21）：K7 判成按停止的那类补 `tool.end(cancelled)`，判成人拒绝的仍只发 `permission.decision` |
 | 排队消息用 `delivery=queued`，不能当成人的实时输入 | ✅ 09-16 改（K20）：全采时每条排队的人话一条 `message.user`（delivery queued），不算分歧之后的下一句；关掉全采只计数 |
-| `turn.end.files[]` 是查询「每轮改了哪些文件」的标准入口 | ✅ 09-16 做了（K22）：Edit / MultiEdit / NotebookEdit / Write / Read 成功的结果记进当前轮，路径相对主 checkout 或 worktree 根，根外的只计数（K2） |
+| `turn.end.files[]` 是查询「每轮改了哪些文件」的标准入口 | ✅ 09-16 做了（K22）：Edit / MultiEdit / NotebookEdit / Write / Read 成功的结果记进当前轮，路径相对主 checkout 或 worktree 根，根外的只计数（K2）；同日第二批补上子 agent 自己改读的文件（进它的 `subagent.end.files[]`，并进收到结束信号的那一轮） |
 | `content_state=omitted` 时 text / input / output / task / last_message 与 `raw` 必须缺失，不能用空串冒充 | ✅（09-16 起 `subagent.start` 的 `task` 也只在全采时带，K23） |
 | `is_divergence` 只标人发起的拒绝、打断、纠正，且必须带 `turn_id` | ✅ |
 | 执行前被拒只发 `permission.decision`，不发假的 `tool.end` | ✅ |
@@ -332,6 +339,7 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
   vcs 只有 branch——transcript 里没有 HEAD，hook 侧补。Stop 路径的 `turn.end` 用同一定义。
 - **哨兵（G6）。** 被拒记录的 `toolUseResult` 是字符串 `User rejected tool use`（或 `Error: Permission to use …` 原文），与正文判据是两个独立字段；
   账本记 `sentinel.marker`（带这个标记的记录数）与 `sentinel.marker_without_hit`（有标记、判据却没认出人拒）。本机 45 个标记、0 次漏判。
+- **本机路径不出本机**（用户 09-16 定相对路径，第二批做完）：目录类字段——`session.start` 的 `vibetrail.cwd`、hook 事件的 `vibetrail.worktree`、`ext.claude.cwd_changed` 的 old / new——在主 checkout 里的写成相对主 checkout 的路径（本身是 `.`，desktop 的 worktree 是 `.claude/worktrees/<名>`，保留是哪个 worktree），其余把 `/Users/<名>`、`/home/<名>` 换成 `~`；文件类字段——`turn.end.files[]`、`subagent.end.files[]`、`instructions_loaded` 的 path——相对工作区根，根外的 `files[]` 只计数、CLAUDE.md 换成 `~` 形。macOS 上 `/private/tmp` 与 `/tmp` 算同一处。`tool.request` 的参数与工具结果是正文（全采时原样），不改。test-hook-flow 第 22 节钉着：会话的 spool 里找不到主 checkout 的绝对路径。
 - **状态有上界**：tool_use 索引 500 条、记录链 400 条；分歧引用的永远是最近几条记录。多态字段一律先判 type（判据的铁律照用）。
   jq 的函数参数在调用处的输入上求值：`$r | slim(.ln)` 里的 `.ln` 是 `$r.ln`，第一版因此所有行号都是 null，断链兜底从未生效（09-15 修，fixture 钉着）。
 - **默认值**：`project_id` / `workspace_id` / 工作区根没传就按 transcript 第一条记录的 `cwd` 推——`cwd` 在本机的 git 仓里就与 hook 同一套（主 checkout 的项目名、持久化的工作区 UUID、它的 worktree 当根），
@@ -356,7 +364,7 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
 | 机器级（一次） | 运行时放 `~/.vibetrail/bin/`（hook 命令必须是绝对路径，触发时还不知道在哪个仓）；往 `~/.claude/settings.json` 写 hook 条目；建 `~/.vibetrail/{spool,state,projects,config}`；云端鉴权 token 放 `~/.vibetrail/token`（0600，teamai 的 `~/.teamai/token` 同款；不放 config——config 常被整份贴出来问问题）。09-16 用户要「init 引导用户填 token」：在终端里跑 init、没填过就问一次（raw 模式读、不回显，回车 / Ctrl-C 跳过），不在终端里只提示；`vibetrail token [--status 或 --clear]` 另填、换、查、删，显示只露末 4 位（16 位以下一位不露）；doctor 报填没填、文件别人能读时告警；uninstall 留着，`--purge` 才删。使用前的准备（node ≥ 20 等）写在 DEMO §0，命令行的 sh 包装先查 node 版本、config 里记的 node 版本不够就退到 PATH 里的 | 条目按命令里的 `vibetrail-hook` 认，升级时整条换掉（Pilot 按命令认条目的做法）；改 settings 照 Pilot 的 `writeTextFileAtomic`：与现有的按 JSON 语义相同就不写（重跑 init 不多一份备份、不改人手写的格式），读进来之后被别人改过就不写（备份前、rename 前各查一次），第一次改之前的原样另存 `settings.json.before-vibetrail`、永不覆盖（Pilot 用 `COPYFILE_EXCL` 只备份一次），每次改之前再存一份带时间的（留 10 份），临时文件 + rename（09-15 用户问「backup的目的是啥」后改：原先每次重跑都备份一份，原样那份十次后就被挤掉）；读不懂的 settings 不动；不建守护进程、不改 shell rc、不注入进程 |
 | scope（可配） | `project`（**默认**，用户 09-15 定，参考 teamai）：只采登记过的项目，分发入口查 `~/.vibetrail/projects/`，未登记直接退出（G8）。`user`：本机所有目录都采，不看登记表——用户显式选才开。配置在 `~/.vibetrail/config` | 改配置即生效，hook 每次触发读一次 |
 | 登记（scope=project 的开关） | `vibetrail init` 不登记任何仓（用户 09-16：免得在哪个目录跑一下就误加），由人 `vibetrail projects pick`（从用过 Claude Code 的仓里选，编号前加 - 去掉）/ `add` / `remove [--drop]` / `list`；键 = `git worktree list` 第一条的主 checkout，worktree 共享（D11）。登记表在 HOME，仓里不留痕 | 幂等 |
-| 自检 | `vibetrail doctor`：运行时按 MANIFEST 校验、jq 在不在、条目在不在且指向的运行时存在、**本机每个 Claude Code 都认识登记的事件**（下一段）；scope 与本仓登记了没；spool 积压、transcript 落后（10 分钟没动还没采完）、重写次数、错误日志、端点配没配（09-15 已做）。还没做：最近 N 个会话的 `stop_hook_summary` 里有几个跑过我们的命令、本机语料里有没有已知清单之外的 `type` / `attachment.type` / hook 事件名（G6，随完整性钉子做） | — |
+| 自检 | `vibetrail doctor`：运行时按 MANIFEST 校验、node 版本与映射器探针（D12 前是 jq 在不在）、条目在不在且指向的运行时存在、**本机每个 Claude Code 都认识登记的事件**（下一段）；scope 与本仓登记了没；spool 积压、transcript 落后（10 分钟没动还没采完）、重写次数、错误日志、端点配没配（09-15 已做）。09-16 加：完整性（A11）汇总——每份 transcript 新读到的记录都要有去处（恒等式）、坏行、判据没认出的拒绝标记、不认识的记录类型 / 附件类型 / system 子类型、超 1 MiB 去正文、单次读超 50 MB 截断（`state/<sid>/integrity.json`）。还没做：最近 N 个会话的 `stop_hook_summary` 里有几个跑过我们的命令 | — |
 | 卸载 | `vibetrail uninstall`：去掉 settings 里自家的条目（别的原样留着），删 `~/.vibetrail/bin`、state、logs；spool、config、登记表、settings 备份留着，`--purge` 才整个删。被观测仓里没有东西要还原 | — |
 
 实现 `tools/vibetrail`（init / uninstall / projects / list / show / doctor，09-15）。**只登记本机 Claude Code 都认识的事件**：settings 的 `hooks` 按一个固定的
@@ -471,7 +479,7 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
   没重跑的旧条目调进来，入口直接忽略（门控里的 git 都不跑）；doctor 点名还挂着的旧事件，不算致命。
 - **子 agent 起止**：`_key` 与原先 hook 发的相同（`<agentId>|subagent.start / end`），过渡期两边都来也只算一条；同一个 agent 父文件与子文件都推得出「起」，先到的算。
   「写完了」原来靠 SubagentStop 记的文件大小，改为父会话里完成信号的时间（`state/<sid>/agents.json`，§3.3）：映射子 agent 文件时信号不早于文件最后一条才写出最后一次调用，
-  SendMessage 续上的 agent 之后还会写，要等下一个信号（SendMessage 自己的结果只有 `resumedAgentId`，不算信号）。孙 agent 的信号在排序靠后的兄弟文件里，信号变了就把子 agent 文件再过一遍。
+  SendMessage 续上的 agent 之后还会写，要等下一个信号（SendMessage 自己的结果只有 `resumedAgentId`，不算信号）。孙 agent 的信号在排序靠后的兄弟文件里，信号变了就把子 agent 文件再过一遍（09-16 第二批改成子 agent 文件先映射、深的在前，主会话后，信号变了再补一遍子 agent 文件，§3.3；同一次 hook 里映射两遍的两块 spool 曾经同名互相覆盖，K26）。
   老版本 SubagentStop 留下的 `<name>.done` 照认。
 - **API 出错结束的轮**：`turn.end` 的 status 是那个错误（code 按规范化的 `error`，category `error`），`vibetrail.end_evidence` = `api_error`；老的 StopFailure 证据照认、优先。
 - **CLAUDE.md 加载、切目录**：发 `ext.claude.instructions_loaded`（逐个文件的路径、类型、sha256、字节数，`reason`；全采时正文进 `extensions["vibetrail.instructions"]`）、
@@ -563,7 +571,7 @@ sh 包装按 pin 文件 → 托管运行时 → nvm / volta / fnm / brew 找 nod
 | K10 轮里插话（`attachment/queued_command`） | 丢掉 | 丢掉 | 实测「拒绝之后插话纠正」不会发生：本机 14 次分歧之后人的下一句 9 次都是正常人话、0 次插话——主会话里拒绝与打断都当场结束这一轮。插话本身以前完全没记，改为在 `turn.end` 上记 `vibetrail.queued_prompts`（只计数，不带正文） |
 | 调用挂不回去 | 有：OTLP 的 trace_id（一轮一个）/ span_id（入口 → agent → step → llm / tool），随机生成 | 没有调用这一级 | 协议信封没有 trace / span 字段，层级靠会话、轮、子 agent 实例、父调用、调用这几个 id；原先 `message.assistant` 只记了工具名，`tool.end` 挂不回是哪次调用发起的——补上 `vibetrail.call.tool_call_ids` |
 
-没做的：workflow 子 agent 的 transcript 在 `subagents/workflows/<runId>/` 下，我们只扫 `subagents/` 这一层（本机没有样本，立 K11）；trace / span id 要不要按
+没做的：workflow 子 agent 的 transcript 在 `subagents/workflows/<runId>/` 下，我们只扫 `subagents/` 这一层（本机没有样本，立 K11；09-16 用 Workflow 实测后做了，K11 关）；trace / span id 要不要按
 确定性算法补进 extensions，取决于 collector 的 Span 归档规范怎么从事件建 span（`coding-span-spec.md` 不在本机）。回归：`test-hook-flow.sh` 第 15 段（撤掉修复 6 条全失败）。
 
 ### D9 — 分「人拒绝」与「按停止打断正在跑的工具」：先按 permissionMode 粗分，挂上 PermissionRequest 精确分（2026-09-15，现行）
@@ -777,7 +785,7 @@ D2 的「正文与指针分开」在 D5 后反转：分歧事件自带能判责�
 | A8 | **仓里零写入** | 装完、采完、卸完，被观测仓的工作树与 `.git/` 都不多任何文件（`git status` 与 `.git/hooks` 前后一致） |
 | A9 | **本机可看、但不留存** | 端点未配置：spool 里的文件人能直接打开读，且就是 push 会发的内容，`vibetrail push --list` 列出每一份与大小。配置后：ack 即删，spool 里只剩没传成的 |
 | A10 | push 不重不漏、按门槛发 | 端点未配置：不发、不删。配置后：每批 accepted + duplicate 等于发出的条数，每条事件先过协议 schema；断网期间的数据在网络恢复、退避期过后由后续 hook 补传，重发不产生重复（`event_id` 幂等）。门槛与兜底（D6）：不满 1 小时且不满 100 条的 Stop 不发；满任一条就发，且发的是全机待发；SessionEnd / SessionStart 不看门槛；退避期内所有触发点都不发；4xx 的块进隔离目录、不再重发、计数在 doctor 可见；两个 hook 同时推不产生重复也不丢块 |
-| A11 | 完整性钉子 | 元数据 = 每类记录条数进出相等；分歧 = fixtures 全绿且映射后每条过 schema；hook = scenario.json 回放；未知记录类型 / 事件名告警；超过 1 MiB 被拒的事件计数 |
+| A11 | 完整性钉子 | 元数据 = 每类记录条数进出相等；分歧 = fixtures 全绿且映射后每条过 schema；hook = scenario.json 回放；未知记录类型 / 事件名告警；超过 1 MiB 被拒的事件计数（09-16 运行时部分做了：映射账本的 `new` 计数 → `integrity.json` → doctor，test-map 第 9b 节、test-hook-flow 第 22 节钉着；服务端拒收的计数随 push） |
 
 ## 10. 未定项
 
