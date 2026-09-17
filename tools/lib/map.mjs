@@ -190,7 +190,7 @@ const SIZE_CAP = 1048576 - 1024;   // 协议单条 1 MiB，留 1 KiB 余量（�
 // 之后每改一次映射规则就升对应的一路；test-map.sh 钉着：golden 变了而版本号没升就红
 // 09-16 第二批（同日）：子 agent 自己改的文件进 subagent.end / 被打断的 subagent.end / 那一轮的 files[]、workflow agent 挂回主会话、
 // 同步 agent 按 meta 的 toolUseId 认结束 → turn-v3、diverge-v3；cwd_changed / instructions_loaded 的路径改相对 → ext-v3。call 没变
-export const RULE_VERSIONS = { diverge: 'diverge-v3', turn: 'turn-v3', call: 'call-v2', ext: 'ext-v3' };
+export const RULE_VERSIONS = { diverge: 'diverge-v4', turn: 'turn-v4', call: 'call-v2', ext: 'ext-v3' };
 // 调用方（hook.mjs 的 mapFile）按物理行喂记录：解析不了的行、空行也占一个位置，行号才与字节 checkpoint 对得上（以前直接丢掉，
 // 中间出现坏行时 checkpoint 换算成字节会错位，下次从错的地方读）；坏行计进 A11 的 bad_json
 export const BAD_LINE = Symbol.for('vibetrail.bad_line');
@@ -465,16 +465,17 @@ export function mapRecords(records, args) {
   };
 
   // ---- 轮次元数据 ----
-  const openTurn = (s) => {
+  const openTurn = (s, kind = null) => {
     st.pturn = { id: s.promptId, line: s.ln, last_ts: s.ts, usage: {}, model: null, answered: false,
       interrupted: false, denied: false, git_commit: false, closed: false, end_turn: false, stop_blocked: false,
-      block_pending: false, summary: null, queued: 0, files: {}, files_outside: 0 };
+      block_pending: false, summary: null, queued: 0, files: {}, files_outside: 0, kind };
     if (s.ln > from_line) st.ledger.turns.started += 1;
     const h = hookTurn(s.promptId);
     const vcs = vcsMerge(st.branch, isObj(h.start) ? h.start.vcs : null);
     const e = base(s, 'turn.start', s.uuid, s.ts, { id: s.promptId, inferred: false });
     e.provenance = { kind: 'transcript', rule_version: RULE_VERSIONS.turn, source_event_id: s.uuid };
     e.payload = { ...opt('vcs', vcs) };
+    if (kind !== null) e.extensions = { ...e.extensions, 'vibetrail.turn_kind': kind };
     e._key = s.promptId + '|turn.start';
     emit(e);
   };
@@ -513,7 +514,7 @@ export function mapRecords(records, args) {
       'vibetrail.end_evidence': pt.denied ? 'denial' : evidence,
       'vibetrail.stops': alt(stop ? nz(stop.stops) : null, 0),
       ...opt('vibetrail.dirty_files', isObj(tend) && isObj(tend.vcs) ? nz(tend.vcs.dirty_files) : null),
-      ...opt('vibetrail.queued_prompts', alt(pt.queued, 0) > 0 ? pt.queued : null) };
+      ...opt('vibetrail.queued_prompts', alt(pt.queued, 0) > 0 ? pt.queued : null), ...opt('vibetrail.turn_kind', pt.kind) };
     const stops = alt(stop ? nz(stop.stops) : null, 0);
     e._key = pt.id + '|turn.end' + (stops > 1 ? '|stop' + String(stops) : '');
     if (eof) emitAlways(e); else emit(e);
@@ -622,7 +623,9 @@ export function mapRecords(records, args) {
   const interrupted = (r, s, h, detail) => {
     const t = turnOf(s);
     const kind = alt(nz(h.as_kind), h.kind);
-    const reply = wholeReply(alt(walkUp(s.parentUuid, 200), lastAssistantInTurn(s)));
+    // K29：沿父记录往上找会越过通知记录一路找进上一轮（上一轮早答完了，那条回复不是被打断的），所以只认本轮开头之后的
+    const up = walkUp(s.parentUuid, 200);
+    const reply = wholeReply(up !== null && up.ln >= turnStart() ? up : lastAssistantInTurn(s));
     if (reply !== null && reply.text.length > 0) {
       emit(message(s, t, reply, 'message.assistant', 'agent', { 'vibetrail.trigger': s.uuid, 'vibetrail.kind': kind }));
     }
@@ -677,6 +680,7 @@ export function mapRecords(records, args) {
     const hstops = sub ? null : alt(nz(hookStop(hookTurn(t.id))?.stops), 0);
     e.extensions = { ...e.extensions, 'vibetrail.kind': kind, 'vibetrail.human': true,
       ...(sub ? {} : { 'vibetrail.closed_by': 'interrupt', 'vibetrail.stops': hstops }),
+      ...(!sub && st.pturn !== null && st.pturn.id === t.id ? opt('vibetrail.turn_kind', st.pturn.kind) : {}),
       ...opt('vibetrail.interrupted_uuid', reply ? reply.uuid : null),
       ...opt('vibetrail.split_by', nz(h.split_by) ?? null), ...opt('vibetrail.permission_mode', nz(h.permission_mode) ?? null) };
     e._key = s.uuid + '|' + e.type;
@@ -733,12 +737,23 @@ export function mapRecords(records, args) {
   const turnBoundary = (r, s) => {
     // K12（09-16 复核：turn.end 里 6.4% 是 unknown，106 轮一次模型调用都没有）：以前任何带新 promptId 的 user 记录都开一轮，
     // /compact 后的续接摘要、<task-notification>、只有 tool_result 的记录都被灌成了轮，且与 hook 只在 UserPromptSubmit 发 turn.start 的口径不一致。
-    // 现在只在人话或斜杠命令处开轮，别的记录并入当前轮
-    if (turns && mainRec(r) && r.type === 'user' && (s.human || s.slash)
-        && isStr(r.promptId) && r.promptId !== alt(st.pturn ? st.pturn.id : null, null)) {
+    // 现在只在人话或斜杠命令处开轮，别的记录并入当前轮。返回开了哪种轮（human / notification / null），主循环据此把本轮用量清零
+    if (!(turns && mainRec(r) && r.type === 'user' && isStr(r.promptId) && r.promptId !== alt(st.pturn ? st.pturn.id : null, null))) return null;
+    if (s.human || s.slash) {
       closeTurn('next_turn', s, false);
       openTurn(s);
+      return 'human';
     }
+    // K29（09-17 用户看 collector 页面发现）：上一轮已经关了（答完标记、Stop、打断）之后才来的 <task-notification>，是后台 agent 跑完、
+    // 模型自己接着回复的一轮——以前并进「当前轮」，可当前轮早关了：这一轮的事件挂着通知的 promptId 却没有 turn.start / turn.end（页面上「未知」），
+    // 回复花的 token 哪一轮都不算；人按停止打断它时，turn.end 又拿上一轮的累计用量（本机 0dd3c55d 的 347 万记了三份）。
+    // 现在单独开一轮、打 vibetrail.turn_kind = notification；上一轮还开着时来的照 K12 并进去
+    if ((st.pturn === null || st.pturn.closed) && r.type === 'user'
+        && ((isObj(r.origin) && r.origin.kind === 'task-notification') || /^<task-notification>/.test(alt(s.text, '')))) {
+      openTurn(s, 'notification');
+      return 'notification';
+    }
+    return null;
   };
 
   const stopFeedback = (r, s) => (r.type === 'attachment' && isObj(r.attachment)
@@ -1161,9 +1176,9 @@ export function mapRecords(records, args) {
     st.branch = alt(nz(r.gitBranch), st.branch);
     if (isStr(r.promptId) && r.promptId !== st.turn) { st.turn = r.promptId; st.denials = []; st.stops = []; }
     if ((s.human || s.slash) && isStr(r.permissionMode)) st.perm_mode = r.permissionMode;
-    turnBoundary(r, s);
+    const opened = turnBoundary(r, s);
     index(s);
-    if (s.human) { st.turn_usage = {}; st.turn_model = null; st.turn_line = s.ln; }
+    if (s.human || opened === 'notification') { st.turn_usage = {}; st.turn_model = null; st.turn_line = s.ln; }
     if (s.type === 'assistant' && s.usage !== null && !s.synthetic) {
       const uk = alt(s.mid, alt(s.rid, s.uuid));
       const cur = st.turn_usage[uk];

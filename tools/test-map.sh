@@ -317,6 +317,30 @@ bash "$SELF/vibetrail-map" "$T/k12.jsonl" --sid k12 --project-id /tmp/fx --works
 check "K12: turn.start 只在两句人话处（kp1、kp3），task-notification 的 kp2 不开轮" \
     '[.[] | select(.type=="turn.start") | .turn_id] == ["kp1","kp3"] and ([.[] | select(.type=="turn.end") | .turn_id] == ["kp1"])' "$T/k12.events"
 
+# K29：上一轮已经关了（答完标记落盘）之后才来的 task-notification（真实记录形状：origin.kind = task-notification，正文是字符串）单独开一轮、
+# 打 turn_kind = notification、用量只算本轮；通知一来就被人按停止（模型还没回话）：turn.end(interrupted) 不带用量与模型，
+# 也不把上一轮的回复当成被打断的回复（本机 0dd3c55d：打断的两轮各记了一份上一轮的 347 万，另外 4 轮「未知」）
+{ R q1 ""  k29 np1 user '"第一句人话"'
+  R q2 q1  k29 np1 assistant '[]' "$(AM qm1 '[{"type":"text","text":"做完了"}]')"
+  R q3 q2  k29 "" system '""' '{"subtype":"stop_hook_summary"}'
+  R q4 q3  k29 np2 user '"<task-notification>\n<task-id>a1</task-id>后台 agent 跑完了</task-notification>"' '{"origin":{"kind":"task-notification"}}'
+  R q5 q4  k29 np2 user '[{"type":"text","text":"[Request interrupted by user]"}]'
+  R q6 q5  k29 np3 user '"<task-notification>\n<task-id>a2</task-id>又一个跑完了</task-notification>"' '{"origin":{"kind":"task-notification"}}'
+  R q7 q6  k29 np3 assistant '[]' '{"message":{"id":"qm3","model":"claude-opus-5","role":"assistant","content":[{"type":"text","text":"收到"}],"usage":{"input_tokens":20,"output_tokens":4},"stop_reason":"end_turn"}}'
+  R q8 q7  k29 "" system '""' '{"subtype":"stop_hook_summary"}'
+  R q9 q8  k29 np4 user '"第二句人话"'
+} > "$T/k29.jsonl"
+bash "$SELF/vibetrail-map" "$T/k29.jsonl" --sid k29 --project-id /tmp/fx --workspace-id /tmp/fx --capture-content 0 > "$T/k29.events" 2>/dev/null
+check "K29: 两条通知各开一轮、打 turn_kind = notification，人话的轮不打" \
+    '[.[] | select(.type=="turn.start") | .turn_id] == ["np1","np2","np3","np4"]
+     and [.[] | select(.type=="turn.start" and .extensions["vibetrail.turn_kind"]=="notification") | .turn_id] == ["np2","np3"]' "$T/k29.events"
+check "K29: 三轮各一条 turn.end——用量各算各的（10 / 不填 / 24），不再把上一轮的用量记到打断的通知轮上" \
+    '[.[] | select(.type=="turn.end") | [.turn_id, .payload.status.code, (.payload.usage.total_tokens // null), (.extensions["vibetrail.turn_kind"] // null)]]
+     == [["np1","completed",10,null],["np2","interrupted",null,"notification"],["np3","completed",24,"notification"]]' "$T/k29.events"
+check "K29: 打断的通知轮算分歧、不带模型，也没有把上一轮的回复当成被打断的回复发出来" \
+    'any(.[]; .type=="turn.end" and .turn_id=="np2" and .is_divergence==true and .payload.model==null)
+     and all(.[]; .type != "message.assistant" or .turn_id != "np2")' "$T/k29.events"
+
 # K13：打断发的 turn.end 带 closed_by = interrupt 与 stops，打断后这一轮算关了（state 的 turn_closed 才会是 true，补做不再重读）
 { R i1 ""  k13 ip1 user '"看一下这个"'
   R i2 i1  k13 ip1 assistant '[]' "$(AM im1 '[{"type":"text","text":"我先看看"}]')"

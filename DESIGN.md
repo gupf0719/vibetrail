@@ -353,7 +353,7 @@ Schema 硬规则（[collection-batch-1.0.schema.json](third-party/collection-bat
   不在就用目录名、按 `cwd` 字符串持久化的 UUID、`cwd` 当根（09-16 改，K17 / K22）；hook 分发入口会传真值；`vibetrail.version` 先填 `0.2.0-dev`。
 - **轮次切分**（09-15）。主会话文件里一条 `user` 记录的 promptId 与当前轮不同，就是新的一轮：上一轮关、这一轮开。hook 的 `prompt_id` 与记录的
   `promptId` 是同一个值（09-15 在 desktop 2.1.266 上挂 PostToolUse 探针实测），轮中插话（排队后被并入当前轮的人话）不换 promptId，
-  所以 turn.start / turn.end / 分歧事件的 turn_id 都对得上。只有 user 记录带 promptId（assistant、attachment、system 都不带），它们归当前轮。
+  所以 turn.start / turn.end / 分歧事件的 turn_id 都对得上。只有 user 记录带 promptId（assistant、attachment、system 都不带），它们归当前轮。09-16 K12 起只在人话或斜杠命令处开轮；09-17 K29：上一轮已经关了之后才来的 `<task-notification>`（后台 agent 跑完、模型自己接着回复）单独开一轮，turn.start / turn.end 打 `vibetrail.turn_kind = notification`，用量只算本轮、被打断时还没调用过模型就不填用量与模型；上一轮还开着时来的仍并入当前轮。
   下次起读的 checkpoint 再退到还没关的那一轮的开头，关轮时用量才完整；fixtures 每个切点「前段 ∪ 从 checkpoint 起的后段 == 全量」在切轮打开时同样成立
   （09-15 临时跑过；test-map.sh 的 golden 只钉分歧，调用时带 `--no-turns`）。本机 3.3 MB 的真会话 15 轮，turn.start / turn.end 各 15 条，0.2 s。
   关轮点（D7）：Stop hook（`--close-last stop`）；`stop_hook_summary` 前没有拦停反馈（`hook_blocking_error` / `hook_additional_context` 附件、「Stop hook feedback:」meta 人话）；拒绝的 for-tool-use 打断记录；
