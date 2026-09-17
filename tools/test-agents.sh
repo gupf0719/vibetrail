@@ -78,6 +78,12 @@ mk_trust Stop; out=$(vt doctor 2>&1)
 check "doctor 按哈希核信任：Stop 的记录与当前条目对不上 → 报改过；其余 4 条哈希对上，不报没信任" 'grep -q "Stop 信任之后条目改过" <<<"$out" && ! grep -q "还没在 Codex 里信任" <<<"$out"'
 mk_trust ""; out=$(vt doctor 2>&1)
 check "doctor：5 条哈希都对上 → 报都已信任" 'grep -q "5 条 hook 都已信任，哈希与当前条目一致" <<<"$out"'
+# codex-v4 把信任检查挪进 codexTrustStatus 时删了 doctor 里的 toml，最后的 [features] 检查抛 ReferenceError，doctor 崩在 Codex 这段（09-17 装 push 前发现）；
+# 上面几条只 grep 崩之前打出来的行，所以一直是绿的
+check "doctor 跑到最后一行（不崩在 Codex 那段）" 'grep -q -E "采集工作正常|能用，有告警|有致命项" <<<"$out"'
+printf '\n[features]\nhooks = false\n' >> "$T/codex/config.toml"; out=$(vt doctor 2>&1)
+check "doctor：config.toml 里 [features] hooks = false → 报 hook 整个关着" 'grep -q "hook 整个关着" <<<"$out"'
+mk_trust ""
 
 # init 引导信任（用户 09-17 定）：不在终端里、没带参数只提示；--trust-codex-hooks 才写，只加我们的表、用户原来的内容留着；不再选 Codex 时删掉
 printf '# 我的 Codex 配置\nmodel = "gpt-5"\n\n[projects."/tmp/x"]\ntrust_level = "trusted"\n' > "$T/codex/config.toml"

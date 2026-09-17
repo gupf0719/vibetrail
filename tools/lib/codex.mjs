@@ -908,6 +908,7 @@ export function codexDoctor({ ok, bad, note }) {
   if (untrusted.length) bad(`Codex：${untrusted.join(' ')} 还没在 Codex 里信任，不会跑——桌面版在「设置 → 钩子」里逐条点「信任」，CLI 里用 /hooks`);
   if (modified.length) bad(`Codex：${modified.join(' ')} 信任之后条目改过（哈希对不上），Codex 不会跑——到「设置 → 钩子」重新信任`);
   if (!disabled.length && !untrusted.length && !modified.length) ok(`Codex：${mine.length} 条 hook 都已信任，哈希与当前条目一致`);
+  const toml = readText(path.join(codexHome(), 'config.toml')) || '';   // codex-v4 把信任检查挪走时连这行一起删了，doctor 崩在下面（09-17 补回）
   const feat = (toml.match(/^\[features\]\s*$([\s\S]*?)(?=^\[|(?![\s\S]))/m) || [])[1] || '';
   if (/^\s*(codex_)?hooks\s*=\s*false/m.test(feat)) bad('Codex：config.toml 里 [features] hooks = false，hook 整个关着');
 }
