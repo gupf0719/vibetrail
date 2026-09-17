@@ -59,11 +59,14 @@ replay(){ # 按 scenario 的步骤回放：append 追加一行（cwd 换成临�
         fi
     done < <(jq -c '.steps[]' "$SC")
 }
-# spool 里分歧、轮次、hook 事件在同一条流里；这里只拿分歧那部分（rule_version diverge-v2）与全量分歧映射比。
+# 版本号从 map.mjs 的 RULE_VERSIONS 读，不写死（K19 升版本之后，写死的 diverge-v2 让这里一次红了 8 项，09-17）
+RV_DIVERGE=$(node --input-type=module -e "import { RULE_VERSIONS } from '$SELF/lib/map.mjs'; console.log(RULE_VERSIONS.diverge)")
+RV_CALL=$(node --input-type=module -e "import { RULE_VERSIONS } from '$SELF/lib/map.mjs'; console.log(RULE_VERSIONS.call)")
+# spool 里分歧、轮次、hook 事件在同一条流里；这里只拿分歧那部分（rule_version 是 RULE_VERSIONS.diverge）与全量分歧映射比。
 # 打断的 turn.end 会补上 hook 记的 HEAD / 脏否 / commit，全量映射那边没有 hook 证据，比之前两边都去掉这几项；
 # K22 的 files[] 只有 hook 那边（有工作区根）才有，也去掉
 NORM='del(.payload.vcs.head_sha, .payload.vcs.dirty, .commits, .files, .extensions["vibetrail.commit_method"], .extensions["vibetrail.commit_attribution"], .extensions["vibetrail.files_dropped"])'
-spool_events(){ cat "$SPOOL"/*.jsonl 2>/dev/null | jq -S -c "select(.provenance.rule_version == \"diverge-v2\") | $NORM" | sort; }
+spool_events(){ cat "$SPOOL"/*.jsonl 2>/dev/null | jq -S -c "select(.provenance.rule_version == \"$RV_DIVERGE\") | $NORM" | sort; }
 # K17：全量映射那边 project_id / workspace_id 照 hook 的算法取（登记表 > origin > 目录名；持久化的 UUID），两边才对得上
 full_map(){ bash "$SELF/vibetrail-map" "$TR" --no-turns --sid "$SID" --project-id "$(basename "$REPO")" --workspace-id "$(head -1 "$VT_HOME/workspaces/$(vt_sha "$REPO")")" --ledger /dev/null | jq -S -c "$NORM" | sort; }
 
@@ -146,7 +149,7 @@ printf '%s\n' '{"agentType":"general-purpose","description":"查","spawnDepth":1
   rec s1d s1a P1 user '[{"type":"tool_result","tool_use_id":"st1","content":"Permission to use Bash with command ls has been denied.","is_error":true}]' '{"agentId":"s1","isSidechain":true}'
 } > "$TDIR/$SID/subagents/agent-s1.jsonl"
 hook Stop "$(payload Stop)"
-check "子 agent 的拒绝进 spool，实例 s1、父实例 main、parent_call_id 取 meta" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"diverge-v2\")) | length == 2 and all(.[]; .agent_instance_id == \"s1\" and .parent_agent_instance_id == \"main\" and .parent_call_id == \"toolu_x\")" >/dev/null'
+check "子 agent 的拒绝进 spool，实例 s1、父实例 main、parent_call_id 取 meta" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"$RV_DIVERGE\")) | length == 2 and all(.[]; .agent_instance_id == \"s1\" and .parent_agent_instance_id == \"main\" and .parent_call_id == \"toolu_x\")" >/dev/null'
 check "子 agent 起：文件第一条记录出 subagent.start（类型取 meta；这里关着全采，不带 task、标 omitted，K23）；父会话里还没有它的调用结果，那次模型调用先不写出" \
     'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "(map(select(.type == \"subagent.start\")) | length == 1 and .[0].payload == {agent_type: \"general-purpose\"} and .[0].content_state == \"omitted\" and .[0].parent_call_id == \"toolu_x\") and (map(select(.type == \"message.assistant\")) | length == 0)" >/dev/null'
 # 同步 agent 结束：父会话里出现派它的那次 Agent 调用的结果（带 agentId、status、耗时、token）
@@ -155,7 +158,7 @@ rec s1done u5 prompt-5 user '[{"type":"tool_result","tool_use_id":"toolu_x","con
 hook Stop "$(payload Stop)"
 check "父会话里有了调用结果：subagent.end 记在主会话那一块（实例 s1、父 main、调用 toolu_x、completed、耗时与 token）" \
     'cat "$SPOOL"/*-main.jsonl | jq -s -e "map(select(.type == \"subagent.end\" and .agent_instance_id == \"s1\")) | length == 1 and .[0].parent_call_id == \"toolu_x\" and .[0].payload.status.code == \"completed\" and .[0].extensions[\"vibetrail.agent\"] == {duration_ms: 1200, total_tokens: 300, tool_use_count: 1}" >/dev/null'
-check "子 agent 的那次模型调用这时写出：实例 s1、不带正文；被拒的调用不伪造 tool.end" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"call-v2\")) | length == 1 and .[0].type == \"message.assistant\" and .[0].agent_instance_id == \"s1\" and .[0].content_state == \"omitted\" and (.[0].payload | has(\"text\") | not) and .[0].extensions[\"vibetrail.call\"].tool_calls == [\"Bash\"]" >/dev/null'
+check "子 agent 的那次模型调用这时写出：实例 s1、不带正文；被拒的调用不伪造 tool.end" 'cat "$SPOOL"/*-agent-s1.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"$RV_CALL\")) | length == 1 and .[0].type == \"message.assistant\" and .[0].agent_instance_id == \"s1\" and .[0].content_state == \"omitted\" and (.[0].payload | has(\"text\") | not) and .[0].extensions[\"vibetrail.call\"].tool_calls == [\"Bash\"]" >/dev/null'
 check "完成信号记进 state/<sid>/agents.json" 'jq -e ".done.s1 == \"2026-09-15T12:00:00.000Z\" and .calls_done.toolu_x != null" "$VT_HOME/state/$SID/agents.json" >/dev/null'
 
 # 并行的另一个子 agent s2 是后台派出的（调用结果当场返回 isAsync），它的一次调用只写了一半（2.1.260 边生成边执行工具：tool_use 一个一个写，结果夹在中间）
@@ -167,7 +170,7 @@ rec s2launch s1done prompt-5 user '[{"type":"tool_result","tool_use_id":"toolu_y
   rec s2r s2a P1 user '[{"type":"tool_result","tool_use_id":"s2t1","content":"def add"}]' '{"agentId":"s2","isSidechain":true}'
 } > "$TDIR/$SID/subagents/agent-s2.jsonl"
 hook Stop "$(payload Stop)"
-check "还在跑的子 agent：读到一半的那次调用先不写，工具结果照写" 'cat "$SPOOL"/*-agent-s2.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"call-v2\") | .type) == [\"tool.end\"]" >/dev/null'
+check "还在跑的子 agent：读到一半的那次调用先不写，工具结果照写" 'cat "$SPOOL"/*-agent-s2.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"$RV_CALL\") | .type) == [\"tool.end\"]" >/dev/null'
 check "后台派出的 s2：subagent.start 只有一条（父会话的启动结果与子 agent 文件第一条是同一个事件，先到的算）" \
     'cat "$SPOOL"/*.jsonl | jq -s -e "map(select(.type == \"subagent.start\" and .agent_instance_id == \"s2\")) | length == 1 and .[0].parent_call_id == \"toolu_y\" and (.[0].payload | has(\"task\") | not)" >/dev/null'
 { rec s2b s2r P1 assistant '[]' '{"agentId":"s2","isSidechain":true,"message":{"id":"sm2","model":"claude-sonnet-5","role":"assistant","content":[{"type":"tool_use","id":"s2t2","name":"Grep","input":{"pattern":"add"}}]}}'
@@ -180,7 +183,7 @@ check "后台 agent 还没发完成通知：Stop 时它最后那次回答先不�
 NOTE_S2=$(jq -n -c '"<task-notification>\n<task-id>s2</task-id>\n<tool-use-id>toolu_y</tool-use-id>\n<status>completed</status>\n<summary>Agent \"并行\" completed</summary>\n<result>查完了。</result>\n</task-notification>"')
 rec s2note s2launch prompt-5 user "$NOTE_S2" '{"origin":{"kind":"task-notification"}}' >> "$TR"
 hook Stop "$(payload Stop)"
-check "s2 结束后：夹着工具结果的那次调用仍是一条、两个工具都在，最后一次回答也写出" 'cat "$SPOOL"/*-agent-s2.jsonl 2>/dev/null | jq -s -e "map(select(.type == \"message.assistant\" and .provenance.rule_version == \"call-v2\") | .extensions[\"vibetrail.call\"].tool_calls) == [[\"Read\", \"Grep\"], []]" >/dev/null'
+check "s2 结束后：夹着工具结果的那次调用仍是一条、两个工具都在，最后一次回答也写出" 'cat "$SPOOL"/*-agent-s2.jsonl 2>/dev/null | jq -s -e "map(select(.type == \"message.assistant\" and .provenance.rule_version == \"$RV_CALL\") | .extensions[\"vibetrail.call\"].tool_calls) == [[\"Read\", \"Grep\"], []]" >/dev/null'
 check "通知出 subagent.end（实例 s2、调用 toolu_y、completed）" \
     'cat "$SPOOL"/*.jsonl | jq -s -e "map(select(.type == \"subagent.end\" and .agent_instance_id == \"s2\")) | length == 1 and .[0].parent_call_id == \"toolu_y\" and .[0].payload.status.code == \"completed\"" >/dev/null'
 # s2 被续上（SendMessage）又开始写：记录时间晚于上一次完成信号，续上的那次调用写一半时不写出。SendMessage 自己的结果（resumedAgentId）不是完成信号
@@ -228,7 +231,7 @@ SID2=22222222-3333-4444-8555-666666666666
   rec b3 b2 q1 user '[{"type":"text","text":"[Request interrupted by user]"}]' | jq -c --arg s "$SID2" '.sessionId = $s'
 } > "$TDIR/$SID2.jsonl"
 hook SessionStart "$(payload SessionStart '{"source":"startup"}')"
-check "别的会话的打断被补做进它自己的 spool 目录" 'cat "$VT_HOME/spool/$PKEY/$SID2"/*.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"diverge-v2\") | .type) == [\"message.assistant\", \"turn.end\"]" >/dev/null'
+check "别的会话的打断被补做进它自己的 spool 目录" 'cat "$VT_HOME/spool/$PKEY/$SID2"/*.jsonl 2>/dev/null | jq -s -e "map(select(.provenance.rule_version == \"$RV_DIVERGE\") | .type) == [\"message.assistant\", \"turn.end\"]" >/dev/null'
 
 echo "════ 10. scope=user：未登记的仓也采 ════"
 vt_unregister "$REPO"; rm -rf "$VT_HOME/state" "$VT_HOME/spool"
@@ -711,6 +714,112 @@ k24 4 8 summary
 check "K24: 标记本来就在（重跑 Stop）：不等，立刻关" \
     'VIBETRAIL_STOP_WAIT=8 hook Stop "$(SID=88888888-0000-4000-8000-000000000004 TR=$TDIR/88888888-0000-4000-8000-000000000004.jsonl payload Stop "{\"prompt_id\":\"pw4\"}")"; [ "$(k24ev "map(select(.type == \"turn.end\")) | length")" = 1 ]'
 check "K24 这一节没有错误日志" '[ ! -s "$VT_HOME/logs/errors.log" ]'
+
+echo "════ 22. 走 hook 的端到端（09-16 第二批收尾）：嵌套与 workflow 子 agent（K11）、子 agent 自己改的文件（K22）、扫描范围（G10）、完整性计数与 doctor（A11）、路径不出本机、轮次成对与一轮多 commit ════"
+# 映射层的单测在 test-map 第 9b 节；这里走真的 hook：文件怎么被找到、按什么顺序映射、agents.json / integrity.json 怎么在几次映射之间传递
+S21=55555555-0000-4000-8000-000000000021; T21=$TDIR/$S21.jsonl; SP21=$VT_HOME/spool/$PKEY/$S21; SD21=$VT_HOME/state/$S21
+SUB21=$TDIR/$S21/subagents; WF21=$SUB21/workflows/wf_21
+REPO_NP=${REPO#/private}          # macOS 的临时目录两种写法都会出现，按不带 /private 的找，两种都能命中
+sid0=$SID; tr0=$TR; SID=$S21; TR=$T21
+hook SessionStart "$(payload SessionStart '{"source":"startup"}')"
+hook UserPromptSubmit "$(payload UserPromptSubmit '{"prompt":"派 agent 改文件，再跑个 workflow","prompt_id":"q21a"}')"
+# 这一轮里提交两次（轮起 HEAD 由上面的 UserPromptSubmit 记下）
+( cd "$REPO" && printf 'a\n' > c21a.txt && git add c21a.txt && git commit -q -m c21-one && printf 'b\n' > c21b.txt && git add c21b.txt && git commit -q -m c21-two )
+C21=$(git -C "$REPO" rev-list --reverse -n 2 HEAD | paste -sd' ' -)
+mkdir -p "$WF21" "$TDIR/$S21/workflows"
+# 同步子 agent sa1：改 calc.py、新建 new21.py，又派出 sn2（spawnDepth 2，meta 直接给 parentAgentId）写 docs21.md。子 agent 文件里没有 toolUseResult
+printf '%s\n' '{"agentType":"general-purpose","description":"改文件","toolUseId":"toolu_sa1","spawnDepth":1}' > "$SUB21/agent-sa1.meta.json"
+printf '%s\n' '{"agentType":"Explore","description":"写文档","toolUseId":"toolu_sn2","parentAgentId":"sa1","spawnDepth":2}' > "$SUB21/agent-sn2.meta.json"
+SX='{"agentId":"sa1","isSidechain":true}'; NX='{"agentId":"sn2","isSidechain":true}'; WX='{"agentId":"w21","isSidechain":true}'
+{ rec a1 "" q21a user '"改文件"' "$SX" | jq -c '.parentUuid = null'
+  rec a2 a1 q21a assistant '[]' "$(jq -n -c --arg r "$REPO" --argjson x "$SX" '$x + {message: {id: "am21", model: "claude-sonnet-5", role: "assistant", content: [
+      {type: "tool_use", id: "ta_e", name: "Edit", input: {file_path: ($r + "/calc.py"), old_string: "a", new_string: "b"}},
+      {type: "tool_use", id: "ta_w", name: "Write", input: {file_path: ($r + "/new21.py"), content: "x"}},
+      {type: "tool_use", id: "toolu_sn2", name: "Agent", input: {description: "写文档", prompt: "写"}}]}}')"
+  rec a3 a2 q21a user "$(jq -n -c --arg r "$REPO" '[{type: "tool_result", tool_use_id: "ta_e", content: ("The file " + $r + "/calc.py has been updated successfully.")},
+      {type: "tool_result", tool_use_id: "ta_w", content: ("File created successfully at: " + $r + "/new21.py")}]')" "$SX"
+  rec a4 a3 q21a user '[{"type":"tool_result","tool_use_id":"toolu_sn2","content":[{"type":"text","text":"文档写好了"}]}]' "$SX"
+  rec a5 a4 q21a assistant '[]' "$(jq -n -c --argjson x "$SX" '$x + {message: {id: "am22", model: "claude-sonnet-5", role: "assistant", stop_reason: "end_turn", content: [{type: "text", text: "两处都改了"}]}}')"
+} > "$SUB21/agent-sa1.jsonl"
+{ rec n1 "" q21a user '"写文档"' "$NX" | jq -c '.parentUuid = null'
+  rec n2 n1 q21a assistant '[]' "$(jq -n -c --arg r "$REPO" --argjson x "$NX" '$x + {message: {id: "nm21", model: "claude-sonnet-5", role: "assistant", content: [
+      {type: "tool_use", id: "tn_w", name: "Write", input: {file_path: ($r + "/docs21.md"), content: "x"}}]}}')"
+  rec n3 n2 q21a user "$(jq -n -c --arg r "$REPO" '[{type: "tool_result", tool_use_id: "tn_w", content: ("File created successfully at: " + $r + "/docs21.md")}]')" "$NX"
+  rec n4 n3 q21a assistant '[]' "$(jq -n -c --argjson x "$NX" '$x + {message: {id: "nm22", model: "claude-sonnet-5", role: "assistant", stop_reason: "end_turn", content: [{type: "text", text: "文档写好了"}]}}')"
+} > "$SUB21/agent-sn2.jsonl"
+# workflow 起的 w21（K11）：transcript 在 subagents/workflows/<runId>/ 下，meta 没有 toolUseId；跑完没有看同目录 journal.jsonl，taskId 在 <sid>/workflows/<runId>.json
+printf '%s\n' '{"agentType":"workflow-subagent","description":"wf-label","workflowPhase":"Build","spawnDepth":1}' > "$WF21/agent-w21.meta.json"
+{ rec w1 "" q21a user '"按脚本改 README"' "$WX" | jq -c '.parentUuid = null'
+  rec w2 w1 q21a assistant '[]' "$(jq -n -c --arg r "$REPO" --argjson x "$WX" '$x + {message: {id: "wm21", model: "claude-sonnet-5", role: "assistant", content: [
+      {type: "tool_use", id: "tw_e", name: "Edit", input: {file_path: ($r + "/README21.md"), old_string: "a", new_string: "b"}}]}}')"
+  rec w3 w2 q21a user "$(jq -n -c --arg r "$REPO" '[{type: "tool_result", tool_use_id: "tw_e", content: ("The file " + $r + "/README21.md has been updated successfully.")}]')" "$WX"
+  rec w4 w3 q21a assistant '[]' "$(jq -n -c --argjson x "$WX" '$x + {message: {id: "wm22", model: "claude-sonnet-5", role: "assistant", stop_reason: "end_turn", content: [{type: "text", text: "README 改好了"}]}}')"
+} > "$WF21/agent-w21.jsonl"
+printf '%s\n' '{"type":"started","agentId":"w21","label":"wf-label","phase":"Build"}' '{"type":"result","agentId":"w21","label":"wf-label","phase":"Build","result":"README 改好了"}' > "$WF21/journal.jsonl"
+printf '%s\n' '{"taskId":"wtask21"}' > "$TDIR/$S21/workflows/wf_21.json"
+NOTE21=$(jq -n -c '"<task-notification>\n<task-id>wtask21</task-id>\n<tool-use-id>toolu_wf21</tool-use-id>\n<status>completed</status>\n<summary>Dynamic workflow \"x\" completed</summary>\n</task-notification>"')
+{ rec m1 "" q21a user '"派 agent 改文件，再跑个 workflow"' '{"origin":{"kind":"human"}}' | jq -c '.parentUuid = null'
+  rec m2 m1 q21a assistant '[]' '{"message":{"id":"mm21","model":"claude-opus-5","role":"assistant","content":[{"type":"tool_use","id":"toolu_sa1","name":"Agent","input":{"description":"改文件","prompt":"改"}},{"type":"tool_use","id":"toolu_wf21","name":"Workflow","input":{"script":"x"}}]}}'
+  rec m3 m2 q21a user '[{"type":"tool_result","tool_use_id":"toolu_wf21","content":"Workflow launched in background. Task ID: wtask21"}]' '{"toolUseResult":{"status":"async_launched","taskId":"wtask21","taskType":"local_workflow","workflowName":"x","runId":"wf_21"}}'
+  rec m4 m3 q21a user '[{"type":"tool_result","tool_use_id":"toolu_sa1","content":[{"type":"text","text":"两处都改了"}]}]' '{"toolUseResult":{"status":"completed","agentId":"sa1","agentType":"general-purpose","content":[{"type":"text","text":"两处都改了"}],"totalDurationMs":3000,"totalTokens":500,"totalToolUseCount":4}}'
+  jq -n -c --arg sid "$SID" --arg cwd "$REPO" --argjson p "$NOTE21" '{type: "attachment", uuid: "m5", parentUuid: "m4", promptId: "q21a", sessionId: $sid, cwd: $cwd,
+      timestamp: "2026-09-15T12:00:00.000Z", attachment: {type: "queued_command", commandMode: "task-notification", prompt: $p}}'
+  rec m6 m5 q21a assistant '[]' '{"message":{"id":"mm22","model":"claude-opus-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"都好了"}]}}'
+} > "$T21"
+hook Stop "$(payload Stop '{"prompt_id":"q21a"}')"
+ev21(){ cat "$SP21"/*.jsonl 2>/dev/null | jq -s -c "$1"; }
+
+check "G10 扫描范围：主会话、一级子 agent、被子 agent 派出的、workflow 起的，四份 transcript 各有 state；journal.jsonl 与 meta 不当 transcript" \
+    '[ "$(ls "$SD21" | grep -E "^(main|agent-.+)\.json$" | sort | paste -sd" " -)" = "agent-sa1.json agent-sn2.json agent-w21.json main.json" ]'
+check "G10 扫描范围：spool 里四份 transcript 各出一块" \
+    '[ "$(ls "$SP21" | sed -E -n "s/^[0-9TZ]+-[0-9_]+-(main|agent-[a-z0-9]+)\.jsonl$/\1/p" | sort -u | paste -sd" " -)" = "agent-sa1 agent-sn2 agent-w21 main" ]'
+check "K11: workflow agent 起止挂回主会话那次 Workflow 调用（启动结果里按 runId 找到），完成看 journal；带 vibetrail.workflow 与它改的 README21.md" \
+    '[ "$(ev21 "[(map(select(.type == \"subagent.end\" and .agent_instance_id == \"w21\")) | map([.parent_agent_instance_id, .parent_call_id, .payload.status.code, .extensions[\"vibetrail.workflow\"].run_id, (.files | map(.path + \":\" + .operation) | join(\",\"))])), (map(select(.type == \"subagent.start\" and .agent_instance_id == \"w21\")) | length)]")" = "[[[\"main\",\"toolu_wf21\",\"completed\",\"wf_21\",\"README21.md:modify\"]],1]" ] && jq -e ".workflows.wf_21.call_id == \"toolu_wf21\"" "$SD21/agents.json" >/dev/null'
+check "嵌套子 agent：sn2 的结束在 sa1 的文件里按 meta 的 toolUseId 认出（父实例 sa1），带它自己新建的 docs21.md" \
+    '[ "$(ev21 "map(select(.type == \"subagent.end\" and .agent_instance_id == \"sn2\")) | map([.parent_agent_instance_id, .parent_call_id, .payload.status.code, (.files | map(.path + \":\" + .operation) | join(\",\"))])")" = "[[\"sa1\",\"toolu_sn2\",\"completed\",\"docs21.md:create\"]]" ]'
+check "K22 子 agent 部分：sa1 的 subagent.end 带它自己与 sn2 改读的文件（路径相对主 checkout）" \
+    '[ "$(ev21 "map(select(.type == \"subagent.end\" and .agent_instance_id == \"sa1\")) | map(.files | map(.path + \":\" + .operation) | sort | join(\",\"))")" = "[\"calc.py:modify,docs21.md:create,new21.py:create\"]" ]'
+# 子 agent 文件在这一次 Stop 里映射了两遍（先写起止与调用，收到完成信号再补最后一次回答）：两块同一秒、同一进程，块名撞上时第二块 pid 后加 _2；
+# 以前第二块把第一块整个盖掉，前一块的 event_id 已进 ids、再也补不回来（09-17 发现）
+check "同一次 hook 里映射两遍的子 agent：两块都在，第一块的 subagent.start、tool.end（sa1 连派 sn2 的那次共 3 个）、第一次调用没被盖掉" \
+    '[ "$(ev21 "[\"sa1\", \"sn2\"] as \$ids | [\$ids[] as \$a | map(select(.agent_instance_id == \$a) | .type) | sort]")" = "[[\"message.assistant\",\"message.assistant\",\"subagent.end\",\"subagent.start\",\"tool.end\",\"tool.end\",\"tool.end\"],[\"message.assistant\",\"message.assistant\",\"subagent.end\",\"subagent.start\",\"tool.end\"]]" ] && [ "$(ls "$SP21" | grep -c -- "-agent-sa1\.jsonl$")" = 2 ]'
+check "三个子 agent 都收到完成信号：各自最后那次回答都写出、各一条" \
+    '[ "$(ev21 "[\"am22\", \"nm22\", \"wm22\"] as \$ids | [\$ids[] as \$i | map(select(.type == \"message.assistant\" and .extensions[\"vibetrail.call\"].response_id == \$i)) | length]")" = "[1,1,1]" ]'
+check "这一轮的 turn.end：completed，files[] 并进三个子 agent 改的，commits 是这一轮里的两次提交（按提交顺序）" \
+    '[ "$(ev21 "map(select(.type == \"turn.end\" and .turn_id == \"q21a\")) | map([.payload.status.code, (.files | map(.path + \":\" + .operation) | sort | join(\",\")), (.commits | map(.sha) | join(\" \"))])")" = "[[\"completed\",\"README21.md:modify,calc.py:modify,docs21.md:create,new21.py:create\",\"$C21\"]]" ]'
+check "每条过协议 schema" 'schema_check < <(cat "$SP21"/*.jsonl) >/dev/null'
+check "路径不出本机：这个会话的 spool 里找不到主 checkout 的绝对路径；session.start 的 vibetrail.cwd 与 vibetrail.worktree 是 ." \
+    '! cat "$SP21"/*.jsonl | grep -qF "$REPO_NP" && [ "$(ev21 "map(select(.type == \"session.start\")) | map([.extensions[\"vibetrail.cwd\"], .extensions[\"vibetrail.worktree\"]])")" = "[[\".\",\".\"]]" ]'
+check "A11: integrity.json 按文件累计，每份的 seen 等于它的行数，且 seen = 进映射 + 各种跳过" \
+    'for f in main:"$T21" agent-sa1:"$SUB21/agent-sa1.jsonl" agent-sn2:"$SUB21/agent-sn2.jsonl" agent-w21:"$WF21/agent-w21.jsonl"; do
+       n=${f%%:*}; p=${f#*:}
+       jq -e --arg n "$n" --argjson l "$(wc -l < "$p" | tr -d " ")" ".files[\$n] | .seen == \$l and .seen == (.records + (.bad_json // 0) + (.skipped_non_object // 0) + (.skipped_no_uuid // 0) + (.replayed // 0) + (.inherited // 0))" "$SD21/integrity.json" >/dev/null || exit 1
+     done'
+
+# 第二轮：混进一行坏 JSON 与一种不认识的记录类型
+hook UserPromptSubmit "$(payload UserPromptSubmit '{"prompt":"再看一眼","prompt_id":"q21b"}')"
+{ rec m7 m6 q21b user '"再看一眼"' '{"origin":{"kind":"human"}}'
+  printf 'not json {\n'
+  jq -n -c --arg sid "$SID" '{type: "brand-new-type-21", uuid: "m8x", sessionId: $sid, timestamp: "2026-09-15T12:00:00.000Z"}'
+  rec m9 m7 q21b assistant '[]' '{"message":{"id":"mm23","model":"claude-opus-5","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"看过了"}]}}'
+} >> "$T21"
+hook Stop "$(payload Stop '{"prompt_id":"q21b"}')"
+check "轮次成对：两轮各有 turn.start 与 turn.end、都是 completed，第二轮没有提交就不带 commits" \
+    '[ "$(ev21 "[(map(select(.type == \"turn.start\") | .turn_id) | unique), (map(select(.type == \"turn.end\") | [.turn_id, .payload.status.code, (.commits != null)]) | unique)]")" = "[[\"q21a\",\"q21b\"],[[\"q21a\",\"completed\",true],[\"q21b\",\"completed\",false]]]" ]'
+check "A11: 坏行与不认识的记录类型计进主会话那份（坏行 1、type:brand-new-type-21 1），恒等式照样成立" \
+    'jq -e --argjson l "$(wc -l < "$T21" | tr -d " ")" ".files.main | .seen == \$l and .bad_json == 1 and .unknown_types[\"type:brand-new-type-21\"] == 1 and .seen == (.records + .bad_json + (.skipped_non_object // 0) + (.skipped_no_uuid // 0) + (.replayed // 0) + (.inherited // 0))" "$SD21/integrity.json" >/dev/null'
+o=$(bash "$SELF/vibetrail" doctor 2>&1)
+check "A11 doctor：汇总读过多少条、点名坏行与不认识的记录类型；恒等式没破，不报「有记录没走到映射」" \
+    'printf "%s" "$o" | grep -q "完整性（A11）：" && printf "%s" "$o" | grep -q "行不是 JSON" && printf "%s" "$o" | grep -q "type:brand-new-type-21" && ! printf "%s" "$o" | grep -q "有记录没走到映射"'
+
+# 路径不出本机：desktop worktree 里开的会话，cwd 与 worktree 都记成相对主 checkout 的路径
+WT21=$REPO/.claude/worktrees/wt21
+git -C "$REPO" worktree add -q "$WT21" -b wt21 2>/dev/null
+SID=66666666-0000-4000-8000-000000000021; TR=$TDIR/$SID.jsonl
+hook SessionStart "$(jq -n -c --arg sid "$SID" --arg tp "$TR" --arg cwd "$WT21" '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "SessionStart", source: "startup"}')"
+check "路径不出本机：worktree 里开的会话，session.start 的 vibetrail.cwd 与 vibetrail.worktree 都是 .claude/worktrees/wt21，找不到绝对路径" \
+    '[ "$(cat "$VT_HOME/spool/$PKEY/$SID"/*.jsonl 2>/dev/null | jq -s -c "map(select(.type == \"session.start\")) | map([.extensions[\"vibetrail.cwd\"], .extensions[\"vibetrail.worktree\"]])")" = "[[\".claude/worktrees/wt21\",\".claude/worktrees/wt21\"]]" ] && ! cat "$VT_HOME/spool/$PKEY/$SID"/*.jsonl | grep -qF "$REPO_NP"'
+SID=$sid0; TR=$tr0
 
 check "测试没有动真实的 settings.json（${REAL_SETTINGS}）" '[ "$( { cat "$REAL_SETTINGS" 2>/dev/null || true; } | cksum)" = "$REAL_SUM" ]'
 echo

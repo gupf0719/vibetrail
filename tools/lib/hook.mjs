@@ -181,7 +181,10 @@ export function vtSpoolWrite(pkey, sid, name, events) {   // 去掉已写过的 
   const dest = path.join(VT_HOME, 'spool', pkey, sid);
   if (!mkdirp(dest)) return false;
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
-  const chunk = `${stamp}-${process.pid}-${name}.jsonl`;
+  // 同一进程同一秒再写同一来源时块名会撞上，rename 会把前一块整个盖掉——前一块的 event_id 已经记进 ids，那些事件就永远丢了。
+  // 子 agent 文件在一次 hook 里会映射两遍（先写起止与调用，收到完成信号再补最后一次回答），所以很常见（09-17 端到端测试发现）。撞名时 pid 后面加 _2、_3
+  let chunk = `${stamp}-${process.pid}-${name}.jsonl`;
+  for (let n = 2; exists(path.join(dest, chunk)); n++) chunk = `${stamp}-${process.pid}_${n}-${name}.jsonl`;
   const body = fresh.map((e) => JSON.stringify(e)).join('\n') + '\n';
   try {
     fs.writeFileSync(path.join(dest, '.' + chunk + '.tmp'), body);

@@ -216,12 +216,12 @@ export function displayDir(abs, roots) {
   }
   return tilde(p);
 }
-// A11 完整性钉子：认识的记录类型 / 附件类型 / system 子类型（2026-09-16 本机 34 份文件实测 + 代码里用到的）。清单之外的计进账本 new.unknown_types，
+// A11 完整性钉子：认识的记录类型 / 附件类型 / system 子类型（2026-09-16 本机 34 份文件实测 + 代码里用到的；09-17 真实数据补采报出 auto_mode_exit，只有 bashFirst / steerOnly 两个开关，登记）。清单之外的计进账本 new.unknown_types，
 // doctor 告警——不认识不等于错，Claude Code 每个版本都会加类型；D13 去掉 8 个 hook 之后没有 hook 侧对账了，这是唯一的「有新东西」哨兵
 const KNOWN_TYPES = new Set(['user', 'assistant', 'system', 'attachment', 'summary', 'progress', 'queue-operation', 'last-prompt', 'custom-title',
   'bridge-session', 'atis-latch', 'file-history-snapshot', 'file-history-delta', 'mode']);
 const KNOWN_ATTACHMENTS = new Set(['deferred_tools_delta', 'deferred_tools_record', 'skill_listing', 'remote_session_change', 'agent_listing_delta',
-  'mcp_instructions_delta', 'auto_mode', 'total_tokens_reminder', 'batching_reminder_sent', 'queued_command', 'silent_turn_reminder', 'edited_text_file',
+  'mcp_instructions_delta', 'auto_mode', 'auto_mode_exit', 'total_tokens_reminder', 'batching_reminder_sent', 'queued_command', 'silent_turn_reminder', 'edited_text_file',
   'edited_image_file', 'environment', 'model', 'instructions', 'nested_memory', 'session_context', 'date', 'date_change', 'prompt_snapshot',
   'read_truncation_notice', 'thinking_stripped', 'compact_file_reference', 'file', 'directory', 'hook_blocking_error', 'hook_additional_context',
   'async_hook_response', 'todo_reminder', 'plan_mode', 'output_style', 'diagnostics', 'lsp_diagnostics', 'ide_selection', 'ide_opened_file',
