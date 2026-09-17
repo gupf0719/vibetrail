@@ -805,3 +805,128 @@ Bash 非零退出文档已答、grep 类退出码 1 不算失败，收尾事件�
 
 第六轮的教训和前四轮是同一个毛病换了地方：前五轮都在一台机器上，**样本结论没在另一台机器上复现过就进了决策依据**；
 测量脚本也从没拿它要量的那个场景（同一个 worktree 里 A 改、B 提交）试过——「照想证明的结论搭场景」从 demo 挪到了测量上。
+
+## G12 加 Codex / Cursor 支持：调研与方案（2026-09-17，未开工）
+
+> 用户原话（09-17）：「根据现在已完成的采集，去teamai和pilot看一下，要增加对codex和cursor的支持，先做个调研，看看有没有什么问题并写个方案」；
+> U9 原先默认不做的理由（同日补）：「原定不做适配是打算把采集的内容先确定以及流程打通再去做其他企业的，这样会快不少」。
+> 现状：采集内容 09-16 已对齐协议（K17–K24）、全采已定（DESIGN D14）；**流程还没打通，push 没做**（G7 拆解）。
+> 依据：Codex 源码（`~/program/go/src/codex` @ `536f86e`，08-21）、本机 ChatGPT.app 内置的 `codex-cli 0.154.0-alpha.6.2` 二进制字符串、本机 2 个桌面版会话（09-16）；
+> Cursor 3.20.21 的 app bundle 与官方 hooks 文档（09-17 取）。teamai / Pilot 的做法只用了 `third-party/` 里已有的分析，没重读两家源码。
+> 两家都**还没有打断、拒绝、子 agent 的真实样本**，标「待实测」的都要先过 §4。
+
+### 1. 结论
+
+- **Codex 能做到和 Claude Code 同一套内容，几处比 Claude 还好。** 它的 hook 就是照 Claude 做的（`features/src/lib.rs:96`「Claude-style lifecycle hooks」），事件名和入参几乎一样；
+  会话记录（rollout）里轮次起止、打断、每次模型调用的 token 都是类型化记录，不用匹配字符串。两个硬坑：**用户级 hook 要人在 Codex 里信任过才跑**；**人拒绝审批没有类型化记录**。
+- **Cursor 能做会话、轮次、工具调用、子 agent、改了哪些文件；分歧和 token 做不全。** hook 事件多、每个都带 `transcript_path`，但 hook 里没有 token，
+  人在审批框里拒绝没有 hook；transcript 的格式和位置文档没写，本机没有样本。
+- **代码约一半能共用**：门控、spool、event_id、git 快照与本轮 commit、锁、offset 信任检查、补做调度。按家分开的是 hook 入参、会话记录映射、装 hook 的配置文件、doctor、补做时去哪找会话文件。
+
+### 2. 两家能给什么（对照现在从 Claude Code 采的）
+
+| 采集项 | Claude Code（现状） | Codex | Cursor |
+|---|---|---|---|
+| hook 配置 | `~/.claude/settings.json`，热加载 | `~/.codex/hooks.json` 或 `config.toml` 的 `[hooks]`；特性 `hooks` 是 Stable、默认开（`features/src/lib.rs:1038-1040`）；**用户级 hook 没被信任不跑**（问题 1）；热加载待实测 | `~/.cursor/hooks.json`；项目级 `.cursor/hooks.json` 要工作区被信任；企业 MDM / 团队下发优先；文档说热加载 |
+| 事件 | 挂 5 个 | 11 个：SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / PermissionRequest / Stop / SessionEnd / PreCompact / PostCompact / SubagentStart / SubagentStop（`hooks/schema/generated/`；抽查的几个装的 0.154 里都在） | bundle 里搜到 20 个：sessionStart / sessionEnd / beforeSubmitPrompt / stop / afterAgentResponse / afterAgentThought / preToolUse / postToolUse / postToolUseFailure / before·afterShellExecution / before·afterMCPExecution / beforeReadFile / afterFileEdit / preCompact / subagentStart / subagentStop / 两个 Tab 事件；文档另有 workspaceOpen 等应用级事件 |
+| 会话 / 轮次 / 会话记录 | `session_id` / `prompt_id` / `transcript_path` | `session_id` / `turn_id` / `transcript_path`，每个事件都带（SessionEnd 没有 `turn_id`） | `conversation_id` / `generation_id` / `transcript_path`（关了 transcript 时是 null）；sessionStart / End 另有 `session_id`。`generation_id` 是一轮还是一次模型调用，待实测 |
+| 工作目录 | `cwd` | `cwd`；rollout 的 `turn_context.workspace_roots` | `workspace_roots`（可能多根）；工具事件带 `cwd` |
+| 打断 | 没有 hook；transcript 里只有正文 `[Request interrupted by user`（diverge-v1） | 类型化的 `turn_aborted`，reason `interrupted` / `replaced` / `review_ended` / `budget_limited`，始终落盘（`rollout/src/policy.rs:99-105`、`protocol/src/protocol.rs:3988`） | `stop.status` = `aborted`（按停止时 stop 来不来文档没写，待实测）；`postToolUseFailure.is_interrupt` |
+| 人拒绝审批 | 字符串判据 + PermissionRequest 分「拒绝」与「按停止」（D9） | **没有类型化记录**（问题 2） | **没有 hook**（问题 2） |
+| 一轮答完 | Stop + 等 `stop_hook_summary`（K24） | `task_complete`（`duration_ms`、`last_agent_message`），只在真答完时写，Stop 被别的 hook 拦下不会提前出现 | `stop.status` = `completed` / `error`，`loop_count` |
+| token | assistant 记录的 `usage` | 每次模型响应一条 `token_usage_record`（`usage` / `turn_token_usage` / `thread_token_usage`）；cached 是 input 的子集（`protocol.rs:2245` 的 `non_cached_input` = input − cached），与协议口径一致；`cache_write_input_tokens` 算不算在 input 里待核 | **hook 里没有**（只有 preCompact 给上下文占用） |
+| 调用 trace | assistant 记录 + tool_result | 桌面版记录里每项 `item_completed` 带 `started_at_ms` / `completed_at_ms`，命令执行带 `status` / `exit_code` / `duration` | preToolUse / postToolUse（带 `duration`）/ postToolUseFailure；shell / MCP / 文件的专用事件与通用工具事件重复，按 `tool_use_id` 去重（协议兼容表也这么要求） |
+| 子 agent | `subagents/agent-<id>.jsonl` + meta | 独立 rollout，`session_meta.source` = `SubAgent(ThreadSpawn{parent_thread_id, depth, agent_path, agent_nickname, agent_role})`（`protocol.rs:2658`）；hook 有 SubagentStart / Stop（带 `agent_transcript_path`） | subagentStart（`subagent_id` / `subagent_type` / `task` / `parent_conversation_id` / `tool_call_id`）、subagentStop（`status` / `duration_ms` / `modified_files` / `agent_transcript_path`） |
+| system prompt | `prompt_snapshot` 附件 | `session_meta.base_instructions`（本机样本有） | 没有 |
+| 改了哪些文件 | Edit / Write / Read 的结果 | apply_patch 调用；桌面版记录里的形态待实测 | `afterFileEdit`（`file_path` / `edits`）、subagentStop 的 `modified_files` |
+| 运行形态 | CLI、desktop | CLI、`exec`、桌面版、IDE 扩展；hook 在 core 里调（`core/src/hook_runtime.rs`），按理各形态都跑，桌面版待实测。本机桌面版 `originator` 是 `Codex Desktop`、`source` 却是 `vscode` | IDE、CLI；云端 agent 只跑部分 hook（没有 sessionStart / End）；Tab 只有两个 Tab 事件 |
+
+### 3. 问题
+
+1. **Codex 的用户级 hook 要人信任才跑，改一个字就要重新信任**（最大的坑）。`hooks/src/engine/discovery.rs:655-700`：非托管的 hook，要 config 里
+   `[hooks.state."<文件路径>:<事件>:<组序号>:<条序号>"]` 的 `trusted_hash` 与当前哈希相同才进执行列表；哈希算的是事件名加整组配置（命令、超时、async 都算），
+   对不上是 Modified，同样不跑。后果：init 写完 hooks.json 什么都不会发生，要人去 Codex 里信任；升级改了命令串或超时就静默停采；别的工具在同一事件里往我们前面插一组，序号变了 key 就变，也会停。
+   对策：**不替人写 `trusted_hash`**（那是 Codex 给人的安全确认，自己算好写进去等于绕过它）；命令串与超时定死、永远不改，升级只换 `~/.vibetrail/bin` 里的文件；
+   条目追加在每个事件末尾；init 明说要去 Codex 里信任这几条；doctor 按同一算法算哈希，报「未信任 / 已改动 / 被 `[features] hooks = false` 关掉」。
+2. **人拒绝审批，两家都没有可靠的类型化信号**，而这是人机分歧那一路的核心。
+   - Codex：审批请求事件不落 rollout（`policy.rs:155-183` 归在不持久化那组）；拒绝只体现在工具输出 `exec command rejected by user` / `patch rejected by user`，
+     而源码注释自己说一部分非用户的失败也走这条（`core/src/tools/events.rs:436-441`，带 TODO）。PermissionRequest hook 能证明「弹过框」，但入参没有 `tool_use_id`。
+     对策：同一轮里「PermissionRequest 记到同名工具」且「输出是 rejected by user」才判人拒，发 `permission.decision`（decided_by user）；只满足一条的发 `tool.end(failed)`、不标分歧——
+     宁漏不错，与 diverge-v1「只认字段」一致；`turn_context.approval_policy` 为 `never` 的轮不可能有人拒。协议不许按工具名硬关联 `call_id`，这种判定不带 `call_id`。
+   - Cursor：人在审批框里拒绝没有 hook；hook 自己返回 deny 时 after* 不来。`postToolUseFailure` 有自由字符串 `failure_type` 与 `is_interrupt`，拒绝时来不来、取什么值要实测；
+     拿不到就在 `capabilities` 里不声明 `permission.decision`，不猜。
+3. **Codex 的会话记录格式在换代**：有 legacy 与 paginated 两种 history mode，源码默认 legacy（`protocol.rs:711-715`），本机桌面版 0.154 写的是 paginated（`item_completed` 带 TurnItem），
+   两种模式落盘的事件不一样（`policy.rs:88-134`）。CLI 写哪种待实测。
+4. **Cursor 的 transcript 是黑盒，也没有 token**。文档不写 `transcript_path` 的格式与位置，本机 `~/.cursor/projects/` 下没有 agent-transcripts；token 只可能在本地 SQLite（`state.vscdb`，原地改写的 KV）里，
+   读 SQLite 要 `node:sqlite`（node 22.5 起才有，本机是 21.4），不符合「只依赖 node ≥ 20、只用内建模块」（D12），退路是调 macOS 自带的 `/usr/bin/sqlite3`。
+5. **Cursor 的轮次怎么切还不确定**：`conversation_id` 与 sessionStart 的 `session_id` 是否同值、`generation_id` 是一轮还是一次模型调用、按停止时 stop 来不来，决定 turn.start / turn.end 能不能成对（A2）。
+6. **`agent.name` 与协议推荐值不一致**：我们发 `claude-code`，协议推荐 `claude` / `codex` / `cursor`，collector 按 user + workspace + `agent.name` + `session_id` 关联会话。
+   push 前改不花钱，推出去再改同一会话会分成两份。立 K27。
+7. **没有语料，准确率量不了**。Claude 的判据是 755 个会话实测精确率 100%；Codex 本机只有 2 个会话（没有打断、拒绝、子 agent），Cursor 是 0。
+   两家的判据只能先照源码 / 文档写、拿人造场景验，文档里标「未量」，攒够真实会话再量。
+8. **代码要拆**：`runHook` 里通用部分与 Claude 专有部分（Stop 等答完标记、`subagents/` 目录、`~/.claude/projects` 补做）在一个函数里；`map.mjs` 约 1200 行全是 Claude transcript；
+   `cli.mjs` 的 init / doctor / projects pick 只认 `~/.claude`。
+
+能直接借的（`third-party/` 已有分析）：Pilot 判 Codex 打断用类型化的 `turn_aborted`、不匹配字符串（`docs/codex-aborted-turn-recovery.md`）；Pilot 对 Codex 是 hook 加轮询 `~/.codex/sessions`
+两条入口，轮询出的事件用确定性 id 去重；teamai 的 Codex token 读 rollout 的 `token_usage_record`，改 `~/.codex/config.toml` 用文本手术保注释（我们写 `hooks.json`，不碰 TOML）。
+别学的：teamai 把 Cursor 的 `workspace_roots` 第一项当 cwd（多根工作区会归错）；Pilot 的 `cursor-cli` 声明了 hook 模式但 `events: []`。
+
+### 4. 先做实测（每家一遍人工演示，用户在场）
+
+装一个只把 stdin 落盘的探针（照 `experiments/hook-probe.sh`；要写 `~/.codex/hooks.json` / `~/.cursor/hooks.json`，测完卸掉），Codex 桌面版、Codex CLI、Cursor IDE 各走一遍同一个脚本：
+普通一轮 → 轮中提交一次 → 拒绝一次命令 → 拒绝一次改文件 → 工具跑到一半按停止 → 排队或插话一句 → 起一个子 agent → 手动压缩 → 退出。会话记录拷进 fixtures。要回答：
+
+- Codex：桌面版在哪信任 hook、改命令后是否真停；hooks.json 是否热加载；拒绝与按停止在 paginated 记录里的样子；子 agent 的派活调用 id 在哪；apply_patch 与 AGENTS.md 的形态；CLI 写哪种 history mode。
+- Cursor：`transcript_path` 的位置、格式、是否只追加；按停止时 stop 来不来、status 是什么；拒绝时 postToolUseFailure 来不来、`failure_type` 取值；`generation_id` 与轮的关系；
+  before* 事件什么都不输出时是否照常放行。
+
+### 5. 方案
+
+**顺序**（U19，暂不定）：倾向**先打通 push**（G7 剩下的一项，和哪家无关）→ **Codex** → **Cursor**。理由就是用户说的「先把内容定下来、流程打通」：
+push 打通后采集端要是还要改内容，在一家上改比在三家上改便宜。Codex 在前：hook 与 Claude 同构、记录类型化，成本低；Cursor 分歧与 token 拿不全，等实测结论再定映射。
+
+**结构**：一个运行时，按家分适配层，不做插件、不构建（照 D12）。
+- `lib/hook.mjs` 只留通用部分：门控（cwd → 主 checkout → 登记表）、会话锁、spool、event_id、git 快照与本轮 commit、轮次证据文件、offset 信任检查、补做调度。
+- 新增 `lib/agents/{claude,codex,cursor}.mjs`，每家导出同一组东西：入参归一（会话 / 轮次 / 会话记录路径 / cwd / 事件名）、挂哪些事件与超时、配置文件读写、
+  会话记录映射（Claude 的就是现在的 `map.mjs`）、补做时去哪找会话文件、doctor 检查项、`agent.name` / version / surface。
+- hook 命令多一个家名参数：`vibetrail-hook codex Stop`；Claude 的老条目不带，照旧当 Claude，不用重跑 init。
+- Claude 的 state、spool 路径与 event_id 算法不改（已有数据与 golden 不动、不升 rule_version）；新两家的 `_key` 前面加家名。会话 id 都是 UUID，state 目录不另分家。
+- 拆的时候先只挪 Claude 的代码、不改行为：test-map 的 golden 与 test-hook-flow 原样全绿才算挪完（D12 移植同一个办法）。
+
+**Codex 怎么采**：
+- 挂和 Claude 同名的 5 个：SessionStart / UserPromptSubmit / Stop / SessionEnd / PermissionRequest，写 `~/.codex/hooks.json`；SubagentStart / Stop 不挂，子 agent 从 rollout 推（照 D13）。
+  同步的丢后台立刻退出、stdout 为空（照 DESIGN §3.4）。
+- 轮次：`turn_id` 直接当 turn_id；UserPromptSubmit 发 `turn.start`、记轮起快照；Stop 时读 rollout 到 `task_complete` / `turn_aborted` 再关轮，要不要等、等多久照 K24 的办法实测。
+- 打断：`turn_aborted`（interrupted）→ `turn.end`（code `interrupted` / category `cancellation`），带被打断的回复与之后人的下一句（规则同 Claude）；`replaced` / `budget_limited` 这类不是人发起的，不标分歧。
+- 拒绝：问题 2 的双条件。
+- trace：每条 `token_usage_record` 一条 `message.assistant`（usage 按协议字段直接映射）；每个命令 / patch / MCP 的 `item_completed` 一条 `tool.end`。
+- 子 agent：独立 rollout 按 `parent_thread_id` 挂回父会话，照协议兼容表「子 Agent 使用独立实例关系」用 `agent_instance_id` 区分；字段细节等样本。
+- system prompt：`session_meta.base_instructions` → `ext.codex.base_instructions`，按 sha256 去重（同 Claude 的 `prompt_snapshot`）。
+- 补做：SessionStart 时扫 `~/.codex/sessions/<年>/<月>/<日>/` 最近的 rollout，按 `session_meta.cwd` 归仓；不读 `state_5.sqlite`。
+- surface 看 `session_meta.originator`，不看 `source`。
+
+**Cursor 怎么采**（映射等 §4 的结论）：
+- transcript 够用（有正文、有工具调用、只追加）：只挂生命周期那几个（sessionStart / beforeSubmitPrompt / stop / sessionEnd），其余从 transcript 推，与 Claude 同形。
+- 不够用：再挂 preToolUse / postToolUse / postToolUseFailure / subagentStart / subagentStop / afterFileEdit，按 `tool_use_id` 去重；代价是每次工具调用多起一个进程（D13 不挂 Claude 的 PreToolUse / PostToolUse 就是为这个）。
+- before* 一律不输出决定、exit 0，不影响放行。token 不填；分歧只报确认拿得到的；`capabilities` 按实测如实声明。
+- 多根工作区：每个根分别门控、分别分配 workspace_id（协议要求），会话挂在哪个根暂不定。
+
+**安装与自检**：init 看本机装了哪几家（`~/.codex`、`/Applications/Cursor.app` 或 `~/.cursor`）就挂哪几家，`--agents claude,codex,cursor` 可指定；每家各自备份、各自卸载。
+doctor 分家报：Codex 的信任状态与特性开关；Cursor 有没有企业 / 团队 hook 盖过、`transcript_path` 是不是 null。`projects pick` 的候选仓把 Codex rollout 里的 `cwd` 也算上。
+
+### 6. 拆解
+
+- [ ] push 打通（G7 剩下的一项；先后由 U19 定）
+- [ ] K27：`agent.name` 改成 `claude`（push 前）
+- [ ] §4 实测三遍，会话记录进 fixtures
+- [ ] 拆适配层：只挪 Claude 的代码，golden 与 hook 回归原样全绿
+- [ ] Codex：入参归一、rollout 映射（轮次 / 打断 / trace / token / 子 agent / base_instructions / files）、拒绝双条件、hooks.json 读写、信任检查、补做、doctor；test-map、test-hook-flow 各加 Codex 段
+- [ ] Cursor：按 §4 结论二选一，其余同上
+- [ ] 文档：DESIGN 加「多家」一节、§7「一起采 Codex / Cursor」那行改掉；CAPABILITIES / README / DEMO 同步；中心表关 G12
+
+### 7. 待定（先记录、暂不定）
+
+- 先打通 push 还是先做适配（U19，倾向先 push）。
+- Cursor 要不要读本地 SQLite 补 token（倾向不读：usage 不填，协议允许省略）。
+- Cursor 多根工作区的会话挂哪个根（倾向第一个登记过的根）。
+- Codex 的 legacy history mode 做到什么程度（倾向只出会话、轮次、打断、token）。

@@ -799,7 +799,7 @@ D2 的「正文与指针分开」在 D5 后反转：分歧事件自带能判责�
 | Node + TS + 构建（tsup，teamai 的形态） | 多出构建与包，失去「单文件、cat 能读」；裸 `.mjs` 只用内建模块就够（D12） |
 | 用 `node -e` 逐条替换 `jq -r`（bash + jq + node 三种语言并存） | 一次 node 启动 70 ms，SessionStart 补做读 46 个会话的 state 会到十秒量级；jq 的版本问题也留在几十处小读写里。整个 hook 进一个 node 进程（D12） |
 | 本机「最近一次 hook 触发」心跳检查 | 用来兜住 doctor 查不出来的静默不触发（安全模式、`--settings` 指了别的文件、settings 被别的工具覆盖）。用户 09-16 否掉：云端按「登记过的仓该有数据却一直没有」同样能发现，本机不值得再定一个「多久算不对劲」的阈值。文件里读得出来的那两个开关（`disableAllHooks`、托管设置的 `allowManagedHooksOnly`）doctor 已经查，读不出来的在同一条消息里明说 |
-| 一起采 Codex / Cursor | Pilot 三分之一代码在适配各家格式；地基（hook 热加载、`CLAUDE_CODE_SESSION_ID` 等于文件名）是 Claude Code 特有的实测。默认不做，U9 |
+| ~~一起采 Codex / Cursor~~ | ~~Pilot 三分之一代码在适配各家格式；地基（hook 热加载、`CLAUDE_CODE_SESSION_ID` 等于文件名）是 Claude Code 特有的实测。默认不做，U9~~ **2026-09-17 用户定要做**（U9 关），调研与方案见 [TODO.md G12](TODO.md)，落地后本文另写一节 |
 
 ## 8. 审计记录线（不属 G7，仍在仓内）
 
@@ -829,7 +829,7 @@ D2 的「正文与指针分开」在 D5 后反转：分歧事件自带能判责�
 ## 10. 未定项
 
 只记在 [OPEN-ISSUES.md](OPEN-ISSUES.md)：U2 登记方式 · U4 端点 / token / 谁能看 · U5 spool 上限 ·
-U6 审计线去向 · U7 自建还是改造 Pilot · U8 类型化信号成不成 kind · U9 Codex / Cursor · U12 token 口径 · U13 自定义取值待 collector 确认 ·
+U6 审计线去向 · U7 自建还是改造 Pilot · U8 类型化信号成不成 kind · U19 先 push 还是先做 Codex / Cursor（G12）· U12 token 口径 · U13 自定义取值待 collector 确认 ·
 U17 push 门槛默认值 · U18 单次读 50 MB 上限要不要留 ·
 另有 K6 脱敏（暂缓）、G5（升为前置）、
 G8 / G9 / G6 / G11（G10 09-17 已钉）。**push 之前要先改的**（09-16 对照采集端协议文档核出）**同日改完**：K17 `project_id` / `workspace_id`、K18 状态值、K19 `rule_version`、K24 拦停时不提前发 turn.end、U12 用量口径（§4.1 表里逐条标 ✅）；全采与协议补齐 K20–K23 也已做；全采正文的决策 09-17 补成 D14（K25）。U1 已定（scope 可配，默认 `project`）；U3 / U10 / K1 已由 D5 关闭。
