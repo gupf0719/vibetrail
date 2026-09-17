@@ -13,6 +13,7 @@ import {
 import { KNOWN_AGENTS, selectedAgents } from './agents.mjs';
 import { codexHome, codexPresent, codexInstall, codexUninstall, codexDoctor } from './codex.mjs';
 import { cursorHome, cursorInstall, cursorUninstall, cursorDoctor } from './cursor.mjs';
+import { cmdPush, pushDoctor, pushRun, pushEndpoint, maskToken, pendingBySession, describeStop } from './push.mjs';
 
 const say = (s = '') => process.stdout.write(s + '\n');
 const die = (s) => { process.stderr.write('✗ ' + s + '\n'); process.exit(1); };
@@ -35,7 +36,7 @@ const CORE_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd'];
 const OPT_EVENTS = ['PermissionRequest'];
 const RETIRED_EVENTS = ['SubagentStart', 'SubagentStop', 'PostToolUseFailure', 'Notification', 'PermissionDenied', 'StopFailure', 'InstructionsLoaded', 'CwdChanged'];
 export const RUNTIME_FILES = ['vibetrail', 'vibetrail.mjs', 'lib/map.mjs', 'lib/hook.mjs', 'lib/cli.mjs', 'vibetrail-hook',
-  'lib/agents.mjs', 'lib/codex.mjs', 'lib/cursor.mjs'];
+  'lib/agents.mjs', 'lib/codex.mjs', 'lib/cursor.mjs', 'lib/push.mjs'];
 
 // ---- 采哪几家（TODO G12）：照 teamai 的 promptForSelfModeAgents（init.ts:592）——命令行指定 > 不在终端里就挂本机装了的 > 终端里列出来让人选 ----
 const AGENT_LABEL = { claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor' };
@@ -137,7 +138,6 @@ function ask(prompt, { hidden = false } = {}) {
   });
 }
 
-const maskToken = (t) => (t.length >= 16 ? `末 4 位 ${t.slice(-4)}` : `${t.length} 个字符`);   // 短的一位都不露
 function saveToken(t) {
   mkdirp(VT_HOME);
   const f = tokenPath(), tmp = `${f}.${process.pid}.tmp`;
@@ -666,7 +666,7 @@ export function cmdList() {
   }
   say('');
   say(`共 ${n} 块、${ev} 条事件、${bytes} 字节，都在 ${VT_HOME}/spool/ 下，每行一条协议事件，可以直接打开看。`);
-  say(`端点：${vtConf('endpoint', '') || '没配置（push 不发，这些文件就是将来要推的内容）'}`);
+  say(pushEndpoint().url ? `端点：${pushEndpoint().url}（已经发出去的块会删掉；待发的明细与门槛：vibetrail push --list）` : '端点：没配置（push 不发，这些文件就是将来要推的内容）');
 }
 
 const clip = (s, n) => (typeof s === 'string' ? (s.replace(/\s+/g, ' ').length > n ? s.replace(/\s+/g, ' ').slice(0, n) + '…' : s.replace(/\s+/g, ' ')) : s);
@@ -742,7 +742,7 @@ export function cmdShow(argv) {
   say('（按会话、按时间排；原始事件：vibetrail show --json，文件：vibetrail list）');
 }
 
-export function cmdSync() {
+export async function cmdSync() {
   let repo = vtMainCheckout(process.cwd());
   if (!repo) {
     try {
@@ -754,6 +754,13 @@ export function cmdSync() {
   const before = chunks().length;
   runHook('CatchUp', JSON.stringify({ session_id: 'vibetrail-sync', cwd: repo, hook_event_name: 'CatchUp' }));
   say(`✓ 补采完：spool 从 ${before} 块到 ${chunks().length} 块（vibetrail show / list 看结果）`);
+  if (!pushEndpoint().url) return 0;
+  // 补完接着推（与 SessionStart 补做后一样不看门槛；手动跑的，也不看退避）
+  const r = await pushRun({ trigger: 'sync', ignoreBackoff: true });
+  if (r.result === 'locked') say('· 已有一个 push 在跑，这次不推');
+  else if (r.result === 'stopped') { say(`✗ 推送停下了：${describeStop(r.stop)}；还剩 ${pendingBySession().events} 条待发`); return 1; }
+  else if (r.result === 'ok' && r.sum.batches + r.sum.rejected > 0) say(`✓ 推送 ${r.sum.batches} 批：新收 ${r.sum.accepted}、重复 ${r.sum.duplicate}、隔离 ${r.sum.rejected}`);
+  return 0;
 }
 
 // ---- doctor ----
@@ -1009,9 +1016,7 @@ export async function cmdDoctor() {
   if (agents.includes('codex')) codexDoctor({ ok, bad, note });
   if (agents.includes('cursor')) cursorDoctor({ ok, bad, note });
 
-  const ep = vtConf('endpoint', '');
-  if (ep) ok(`端点：${ep}`);
-  else say('  · 端点没配置：只落本机 spool、不发（push 还没做，DESIGN §4）');
+  pushDoctor({ ok, note });
   const tok = vtToken();
   if (tok) {
     let mode = 0; try { mode = fs.statSync(tokenPath()).mode & 0o777; } catch {}
@@ -1034,6 +1039,7 @@ export const USAGE = `vibetrail：机器级安装、登记与本地查看（DESI
   vibetrail list
   vibetrail show [--session SID] [--type 前缀] [--last N] [--json]
   vibetrail sync
+  vibetrail push [--list | --show [--json] | --requeue]
   vibetrail doctor
   vibetrail version`;
 
@@ -1048,7 +1054,8 @@ export async function cli(argv) {
     case 'projects': await cmdProjects(rest); return 0;
     case 'list': cmdList(); return 0;
     case 'show': cmdShow(rest); return 0;
-    case 'sync': cmdSync(); return 0;
+    case 'sync': return await cmdSync();
+    case 'push': return await cmdPush(rest);
     case 'doctor': return await cmdDoctor();
     case 'version': case '--version': case '-v': {
       say(`vibetrail ${VT_RUNTIME_VERSION}`);

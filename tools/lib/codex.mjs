@@ -647,13 +647,14 @@ export function runCodexHook(event, raw) {
     }
     default: break;
   }
+  return event === 'Stop' ? 'threshold' : event === 'SessionStart' || event === 'SessionEnd' ? 'force' : '';   // 交给 autoPush（D6）
 }
 
 // vibetrail.mjs 调进来：同步的 hook 读完 stdin 就丢后台、自己立刻退出（stdout 为空，SessionStart / UserPromptSubmit 的输出会进模型上下文）
 export async function hookEntry(cmd, event, payload, entry) {
   if (!agentEnabled('codex')) return;                  // init 时没选 Codex、条目却还在（手改过）：不采
   if (cmd === 'hook' && SYNC.has(event) && process.env.VIBETRAIL_FOREGROUND !== '1') { detach(entry, 'codex', event, payload); return; }
-  runCodexHook(event, payload);
+  return runCodexHook(event, payload);
 }
 
 // ---------- 安装 / 卸载 / 自检：~/.codex/hooks.json ----------

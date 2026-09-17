@@ -36,14 +36,14 @@
 
 | 功能 | 状态 | 形态 |
 |---|---|---|
-| 运行时移植到 Node 单文件 `.mjs`、去掉 jq | ✅ 2026-09-16（DESIGN D12） | 两个 ≤ 30 行的 sh 包装 + 每次 hook 一个 node 进程；`tools/lib/` 下 map / hook / cli / push / schema 五个 `.mjs`，只用内建模块、不构建；磁盘上的一切不变，golden 与 hook 回归原样验移植；移植期间 jq 版冻结只修 🔴；拆解见 TODO |
+| 运行时移植到 Node 单文件 `.mjs`、去掉 jq | ✅ 2026-09-16（DESIGN D12） | 两个 ≤ 30 行的 sh 包装 + 每次 hook 一个 node 进程；`tools/lib/` 下 map / hook / cli 与 09-17 的 push、G12 的 agents / codex / cursor 几个 `.mjs`（原计划的 schema.mjs 没写，见 TODO G7 push 一项），只用内建模块、不构建；磁盘上的一切不变，golden 与 hook 回归原样验移植；移植期间 jq 版冻结只修 🔴；拆解见 TODO |
 | push 之前对齐采集端协议 | ✅ 2026-09-16 | `project_id` 简单项目名（登记表 `projects add --name` > origin 仓库名 > 目录名）、`workspace_id` 第一次见到时生成并持久化在 `~/.vibetrail/workspaces/` 的 UUID、uninstall 留着（K17）；`tool.end` code succeeded / failed / cancelled、分类 `error` → `failure`（K18）；四路 `rule_version` 升到 v2 基线，test-map 钉着「输出变了没升版本就红」（K19）；Stop 时等答完标记落盘再关轮、拦停不提前发（K24，config `stop_wait` 默认 10 s）；用量 input 含缓存读、total = input + output、没给的不填（U12）。`vibetrail doctor` 报本仓的两个标识；清单见 DESIGN §4.1「协议文档里 schema 管不到的规矩」。本机 11 个会话 5,536 条事件重映射全部过 schema |
 | 全采与协议补齐 | ✅ 2026-09-16 | 排队的人话全采时发 `message.user`（delivery queued，K20）、按停止打断工具补 `tool.end(cancelled)`（K21）、`turn.end.files[]`（Edit / Write / Read 成功的结果，相对主 checkout 或 worktree 根，根外只计数，K22）、关掉全采时 `subagent.start` 不带 `task`（K23）；回归在 test-map 第 9 节、test-hook-flow 第 14 / 16 / 17 / 21 节。K11（workflow 子 agent）09-16 第二批也做了，见上面「从 transcript 推原先靠 hook 的事件」一行 |
-| `vibetrail push [--list \| --show]` | ❌ 用户 09-15 定往后放；09-16 定在 D12 移植之后用 JS 写 | token 从 `~/.vibetrail/token` 读（09-16 init 已引导填）；门槛默认值待定（U17）；端点没配不发；配了按协议打批、每条过 schema、`event_id` 幂等、ack 即删、门槛与退避（D6）；DESIGN §4。本地看待发内容现在用 `vibetrail list / show` |
+| `vibetrail push [--list \| --show [--json] \| --requeue]` | ✅ 2026-09-17（还没拿真实端点推本机积压，先定 OPEN-ISSUES U20） | `tools/lib/push.mjs`：端点读 config 的 `endpoint=`、token 读 `~/.vibetrail/token` 只进请求头；Stop 看门槛（满 1 小时或 100 条、一次最多 10 批），SessionStart 补做后 / SessionEnd / sync 不看门槛（限时 60 s），都看退避（1 分钟起翻倍到 1 小时）；全机混批 ≤ 100 条 / 16 MiB，批 ack 推进游标、块到头才删；被拒收只隔离那几条（422 按出错位置、409 / 413 按 event_id、INVALID_TIME 二分），`--requeue` 放回；端点 / token / 网络 / 5xx 只退避不动数据；doctor 报上次推送、失败原因、隔离计数。回归 `tools/test-push.sh`（68 项）；DESIGN §4、TODO G7 |
 | Codex / Cursor 采集（G12） | 🔁 09-17 第一版，还没实测 | `tools/lib/codex.mjs`：挂 5 个 hook（`~/.codex/hooks.json`，要人在 Codex 里信任），按 rollout 自己的记录类型映射轮次、打断（`turn_aborted`）、每次模型响应的 token、工具调用、子 agent（独立 rollout）、system prompt；人拒绝要「弹过审批框」与「输出 rejected by user」两条都有。`tools/lib/cursor.mjs`：挂 10 个 hook（`~/.cursor/hooks.json`），只用入参、不读 transcript，token 原样放 extensions。共用部分 `tools/lib/agents.mjs`；`vibetrail init --agents claude,codex,cursor` 选装哪几家（照 teamai），回归 `tools/test-agents.sh`。细节与待实测的假设见 [TODO.md G12](TODO.md) |
 | doctor 余项 | 🔁 | 已做的见上表；还缺最近会话的 `stop_hook_summary` 里有没有跑过我们的命令（未知记录类型 / 附件类型 09-16 第二批随完整性计数做了） |
 | 完整性钉子 | ✅ 运行时部分 2026-09-16 第二批 | 映射账本 `new` 计数 → `state/<sid>/integrity.json` 按文件累计 → doctor 汇总（恒等式、坏行、判据没认出的拒绝标记、不认识的类型、超 1 MiB 去正文、50 MB 截断）；扫描范围由 test-hook-flow 第 22 节钉住（G10）；还缺服务端拒收的计数（随 push） |
-| 补充回归场景 | 🔁 | 09-17 test-hook-flow 第 22 节补了轮次成对与 status、一轮多 commit、嵌套与 workflow 子 agent；后台子 agent 晚于父 Stop 09-16 由第 7 段钉住；还缺端点未配置 / 配置后断网（随 push） |
+| 补充回归场景 | 🔁 | 09-17 test-hook-flow 第 22 节补了轮次成对与 status、一轮多 commit、嵌套与 workflow 子 agent；后台子 agent 晚于父 Stop 09-16 由第 7 段钉住；端点未配置 / 配置后断网 09-17 由 test-push.sh 第 1、7 节钉住 |
 
 ### 退役（2026-09-14，D4；2026-09-15 代码归档到 `old/`，见 `old/README.md`）
 

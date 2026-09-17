@@ -43,6 +43,8 @@
             "turn.end",
             "message.user",
             "message.assistant",
+            "message.reasoning",
+            "instruction.loaded",
             "tool.request",
             "tool.start",
             "tool.end",
@@ -272,6 +274,33 @@
         "model": { "$ref": "#/$defs/id" }
       }
     },
+    "reasoningPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["representation"],
+      "properties": {
+        "text": { "type": "string" },
+        "representation": { "$ref": "#/$defs/code" },
+        "format": { "$ref": "#/$defs/code" },
+        "model": { "$ref": "#/$defs/id" }
+      }
+    },
+    "instructionPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "kind", "scope", "source"],
+      "properties": {
+        "instruction_id": { "$ref": "#/$defs/id" },
+        "role": { "$ref": "#/$defs/code" },
+        "kind": { "$ref": "#/$defs/code" },
+        "scope": { "$ref": "#/$defs/code" },
+        "source": { "$ref": "#/$defs/code" },
+        "name": { "$ref": "#/$defs/id" },
+        "source_ref": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "text": { "type": "string" },
+        "content_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
     "toolRequestPayload": {
       "type": "object",
       "additionalProperties": false,
@@ -428,12 +457,26 @@
         {
           "if": {
             "properties": {
+              "type": { "const": "instruction.loaded" },
+              "payload": {
+                "properties": { "scope": { "const": "turn" } },
+                "required": ["scope"]
+              }
+            },
+            "required": ["type", "payload"]
+          },
+          "then": { "required": ["turn_id"] }
+        },
+        {
+          "if": {
+            "properties": {
               "type": {
                 "enum": [
                   "turn.start",
                   "turn.end",
                   "message.user",
                   "message.assistant",
+                  "message.reasoning",
                   "tool.request",
                   "tool.start",
                   "tool.end",
@@ -468,6 +511,14 @@
             "properties": { "type": { "enum": ["message.user", "message.assistant"] } }
           },
           "then": { "properties": { "payload": { "$ref": "#/$defs/messagePayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "message.reasoning" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/reasoningPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "instruction.loaded" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/instructionPayload" } } }
         },
         {
           "if": { "properties": { "type": { "const": "tool.request" } } },
@@ -515,7 +566,11 @@
         },
         {
           "if": {
-            "properties": { "type": { "enum": ["message.user", "message.assistant"] } },
+            "properties": {
+              "type": {
+                "enum": ["message.user", "message.assistant", "message.reasoning", "instruction.loaded"]
+              }
+            },
             "not": {
               "properties": { "content_state": { "const": "omitted" } },
               "required": ["content_state"]

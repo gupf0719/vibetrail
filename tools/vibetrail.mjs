@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// vibetrail 运行时入口（DESIGN D12）：按 argv 分发。移植期间先只有 map 一个子命令，
-// hook / cli / push 随 ②③⑤ 依次搬进来。
+// vibetrail 运行时入口（DESIGN D12）：按 argv 分发——map / map-file（映射器）、hook / hook-run（hook 分发，跑完按触发点 push）、
+// 其余是 CLI 子命令（含 push）。
 //
 //   node vibetrail.mjs map --sid … --project-id … [--from-line N] … < <transcript 的字节切片>
 //
@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { mapRecords, RULE_VERSIONS } from './lib/map.mjs';
 import { runHook, detach, SYNC_EVENTS, mapFile, vtConf } from './lib/hook.mjs';
 import { cli } from './lib/cli.mjs';
+import { autoPush } from './lib/push.mjs';
 
 const argv = process.argv.slice(2);
 const cmd = argv.shift();
@@ -159,14 +160,17 @@ if (cmd === 'map') {
   let payload = '';
   try { payload = await readStdin(); } catch { process.exit(0); }
   try {
+    // 干完活的那个进程（丢后台的同步 hook 是子进程 hook-run）接着按触发点推：Stop 看门槛，SessionStart / SessionEnd 不看门槛（D6、lib/push.mjs）
+    let trigger = '';
     if (agentName) {
       const m = await import(agentName === 'codex' ? './lib/codex.mjs' : './lib/cursor.mjs');
-      await m.hookEntry(cmd, event, payload, fileURLToPath(import.meta.url));
+      trigger = await m.hookEntry(cmd, event, payload, fileURLToPath(import.meta.url));
     } else if (cmd === 'hook' && SYNC_EVENTS.has(event) && process.env.VIBETRAIL_FOREGROUND !== '1') {
       detach(fileURLToPath(import.meta.url), event, payload);
     } else {
-      runHook(event, payload);
+      trigger = runHook(event, payload);
     }
+    if (trigger) await autoPush(trigger);
   } catch { /* 失败只进 errors.log，永远 exit 0 */ }
   process.exit(0);
 } else {

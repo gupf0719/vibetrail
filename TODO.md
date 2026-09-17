@@ -94,41 +94,33 @@
   4. K24：Stop 时先等答完标记或拦停反馈落盘（config `stop_wait` 默认 10 s，本机实测标记晚 2～4 秒），拦停了不发；等不到才走 D7 老路。测试与演示 `VIBETRAIL_STOP_WAIT=0`。
   5. K19：四路 `rule_version` 升到 v2 基线（`RULE_VERSIONS`）；钉子 test-map 第 10 节：按 rule_version 算输出摘要记在 `expect/RULE-DIGESTS`，变了没升版本就红（`--update` 也红，`--accept-rule-digest` 才放）。
   本机 11 个会话重映射 5,536 条事件全部过 schema；两家三方都没做 K17 那一层（teamai 报完整路径加服务端数字 id，Pilot 报 owner/repo 加完整路径），U12 与 Pilot 同式。
-- [ ] push（用户 09-15：先不急着做）：`vibetrail push [--list | --show]`，端点从 `~/.vibetrail/config`、token 从 `~/.vibetrail/token` 读（09-16 init 已引导填；联调阶段 token 可省），端点没配不发；配了按协议打批（≤ 100 条 / 16 MiB）、每条先过 schema、`event_id` 幂等、accepted + duplicate 推进水位并删本机块、失败重发。
-  **门槛与兜底（D6，用户 09-15 定，DESIGN §4）**：Stop 落 spool 后查全机最早待发是否超 1 小时、全机待发是否满 100 条（`push_max_age` / `push_max_events` 可配），任一满足且不在退避期才推，
-  扫全部 spool 混批、循环发到发完、一次最多 10 批；SessionEnd 起脱离进程的后台 push、SessionStart 补做后 push，都不看门槛只看退避；机器级 mkdir 锁 `state/push/.lock`、陈旧阈值 600 s；
-  失败分暂时（退避 1 分钟起指数到 1 小时封顶，记在 `state/push/`）与永久（4xx 整块挪 `spool/.rejected/`、计数进 doctor）。
-  要测：门槛不满不发、满任一就发且发全机、兜底不看门槛、退避期兜底也不发、4xx 隔离不重试、两个 hook 同时推不重不丢、SessionEnd 的后台进程在 `-p` 与 desktop 关会话时活不活（没实测，DESIGN §3.1）。
-  测试对手先用一个只记录请求并按 schema 校验的桩端点（Pilot / teamai 实跑样例就是这么截的）。
-  **09-16 复核后的修正**（对照 teamai `team-push.ts` / `local-agent.ts`、Pilot `sls-flusher.ts` / `http-flusher.ts` 与本机真实 spool）：
-  - **批是 ack 单位，不是块**：本机 751 块里 310 块超过 100 条，最大一块 20,000 条（补采历史）。每块记一个已发行号的游标（`state/push/<块名>.cursor`），按批发、批 ack 推进游标，
-    游标到末尾才删块；进程在 ack 与推进游标之间被杀最多重发一批，event_id 幂等兜住。上面「ack 即删整块」按这个理解。
-  - **4xx 只隔离那一批**（≤ 100 条写进 `spool/.rejected/<块名>.<批号>.jsonl`），游标照推——一块 20,000 条不能因一条坏事件全丢。
-  - **门槛重估**（立为 OPEN-ISSUES U17，做 push 前定）：加了 trace 后一轮常常就超 100 条（本机 `message.assistant` + `tool.end` 占 95%），「满 100 条」等于每次 Stop 都推，D6 要的「每小时量级」不成立。
-    要么明说接受，要么 `push_max_events` 默认改到 1,000 左右；SessionStart / sync 的后台路径不限 10 批（本机现在积压 1,245 批，按 10 批要 125 次 hook 才发完），改成限时（如 60 s）不限批数。
-  - **「每条先过 schema」bash + jq 做不到**：改成手写结构校验 `lib/schema.mjs`（D12；必填键、`code` 正则、条件必填、`occurred_at` 以 Z 结尾、单条 ≤ 1 MiB、每批 ≤ 100 条 / 16 MiB），完整 schema 校验只留在测试里（python jsonschema）。
-  - **push 在 D12 移植之后用 JS 写**（`lib/push.mjs`）：分批与游标是数组切片加一个 JSON 状态文件，退避加抖动一行算式，重试分类对 `response.status` / `err.code` 做 switch，`fetch` 传 header 对象、token 不经过命令行。先用 bash 写再移植等于做两遍，不做。
-  - **可重试集合明写**（借 Pilot `sls-transport.ts`）：HTTP 408 / 429 / 500 / 502 / 503 / 504 与 curl 退出码 6 / 7 / 28 / 35 / 52 / 56 算暂时；401 / 403 算暂时但 doctor 单独点名「配置问题」；其余 4xx 永久。退避带抖动。
-    别学 Pilot 的 checkpoint 先于 ack（它 SLS 失败只留元数据、数据丢）和 HTTP flusher 失败无限内存重放，也别学 teamai 上报失败仍截断本地事件（`pull.ts:1501-1512`）。
-  - **token 不放 curl 命令行参数**（`ps` 看得见）：`--header @文件` 或 `-K` 配置文件，0600、用完删；debug 日志里不记请求头。
-  - `batch_id` 用首末 event_id 算 UUIDv5，重发同一批 id 不变，服务端排查方便；`client.device_id` 用 config 里的。
-  - 先修 K14（uninstall 留 spool 删 ids）再上 push，否则重装后待发翻倍。
-  - 要测再加：块超 100 条分批与游标续传、4xx 只丢一批、进程在 ack 与删块之间被杀不重不丢、token 不出现在进程列表。
+- [x] **push**（2026-09-17，`tools/lib/push.mjs`；回归 `tools/test-push.sh` 14 节 68 项，8 个变异各自变红；用户 09-15「先不急着做」，09-17「采集数据已经基本完成了……开始写push了」）：`vibetrail push [--list | --show [--json] | --requeue]`，
+  Stop 看门槛，SessionStart 补做后 / SessionEnd / `vibetrail sync` 不看门槛，都看退避（D6、DESIGN §4）；端点从 config 的 `endpoint=` 读（写到端口即可），token 从 `~/.vibetrail/token` 读、只进请求头。
+  09-16 复核的修正照做：批是 ack 单位（`state/push/state.json` 每块记已了结的行数，批 ack 推进、块到头才删）；token 不上命令行（用 node 的 `fetch`，没有子进程）；`batch_id` 用首末 event_id 算 UUIDv5；`client.device_id` 取 config；K14 已先修。
+  **与原计划不同的四处**（对照 collector 源码 `BatchValidator` / `IndexStore` / `CollectionErrorHandler` 与 09-17 对联调端点的实测）：
+  1. **被拒收只隔离那几条，不隔离整批**：422 `INVALID_EVENT` 的 message 列出错位置（`/events/N/…`，最多 10 处，实测是 JSON Pointer）、409 / 413 带 event_id，按它们挑出来、其余重发；不带位置的（`INVALID_TIME`）二分。批次外壳的错（`/client/…`）一条都不隔离、按暂时失败退避。
+  2. **可重试集合按 collector 实际返回改**：400（请求体没读完整）、408、429、5xx、连不上、超时算暂时；401 / 403 暂时但 doctor 点名 token；3xx、404、405、415 算配置问题、也只退避——原写的「其余 4xx 永久」在端点路径写错时会把数据全隔离掉。
+  3. **不写 `lib/schema.mjs`**：本地只挡服务端必拒又没法定位的（不是 JSON 对象、没有合法 event_id、单条超 1 MiB），其余交给服务端判、按位置隔离。手写一份会与服务端漂移（后端 09-16 刚加了 `message.reasoning` / `instruction.loaded`，OPEN-ISSUES K28）；完整 schema 校验留在测试里，`third-party/` 的 schema 原件 09-17 同步到后端最新版。
+  4. **同一批里同一个 event_id 只发第一条**：内容不同时服务端整批 409；本机 spool 里 09-16 的旧块与 09-17 重采的块有 3,007 个这样的 id（OPEN-ISSUES U20）。
+  门槛默认值（U17，仍暂不定）用现有取值：`push_max_age` 3600、`push_max_events` 100、Stop 一次最多 `push_max_batches` 10 批；后台兜底与 sync 按 09-16 的倾向不限批数、限时 `push_budget_s` 60 s。
+  已测：端点没配不发；混批、从最早的块发；按字节拆批；门槛不满不发、满条数 / 满时间就推全机、最多 N 批后下次续传；兜底不看门槛；503 退避、翻倍封顶、退避期内兜底也不发、手动 push 不看退避；401 / 连不上 / 超时 / 404 不动数据；
+  422 按位置、INVALID_TIME 二分、409、413、本地超 1 MiB、坏行都只隔离那几条；外壳错误不隔离；批内重复 id；ack 之后被杀只重发一批；两个 push 同时跑；`--requeue`；`--show --json` 过 schema；token 不落盘；sync 补完接着推。
+  **还没做**：拿真实端点推本机积压——先定 U20（09-16 的旧数据怎么处理），定之前别把新运行时装进 `~/.vibetrail/bin`（装了下一次 hook 就会推）；SessionEnd 的后台进程在 `-p` 与 desktop 关会话时活不活（DESIGN §3.1，没实测）；Codex / Cursor 的 hook 也接了 push，没有单独的回归。
 - [x] **全采与协议补齐**（2026-09-16 核出、同日做完 K20–K23，`a34bbf5`）：K20 排队的人话全采时发 `message.user`（`delivery: queued`，本机这台 35 条）；K21 按停止打断工具补 `tool.end(cancelled)`；K22 `turn.end.files[]`（量过：有改动的轮平均 3.5 个文件、最多 10 个、路径约 100 字节，每条 turn.end 不到 1 KB；根外的只计数）；K23 `capture_content=0` 时 `subagent.start` 不带 `task`。
   **还开着**：~~K11 workflow 子 agent~~（09-16 第二批做了）；~~K25 DESIGN 补全采的决策条目~~（09-17 补了 D14，另立 U18：单次读 50 MB 上限与 §3.3 相反，待定）；~~子 agent 自己改的文件没进任何 `files[]`~~（09-16 第二批做了，见 K22）。
 - [x] **分段读完、补采老会话最多两天**（2026-09-17 用户定，关 OPEN-ISSUES U18）：一段最多 50 MB，写完这一段的 spool 就接着读，一次 hook 读太久（默认 60 s）剩下的下次接着读，不再丢最早那段；
   每段开始前从 agents.json 重新取已知的子 agent。从没读过的会话只补最后修改在两天内的、从两天内的第一条记录读起（config `backfill_days`，`all` 不限）；在采的会话照读。
   本机 106 MB 的真实 transcript 每段 5 / 20 / 50 MB 与一次读完逐条一致（29,890 条）；回归 test-hook-flow 第 23 节。
 - [x] **09-16 第二批与 09-17 收尾**（`6cb3786` / `f81ff53` / `f9f8dd6` / `03847f8`）：K11 workflow 子 agent（递归扫 `subagents/`、按 runId 挂回 Workflow 调用、journal 判完成）；K22 的子 agent 部分（子 agent 自己改读的文件进它的 `subagent.end` 与那一轮的 `files[]`，hook 改成子 agent 文件先映射）；A11 运行时计数与 doctor；路径不出本机（`vibetrail.cwd` / `vibetrail.worktree` / `cwd_changed` 相对主 checkout，`instructions_loaded` 相对工作区根，根外换成 `~` 形）；rule_version 升到 diverge / turn / ext v3；坏行、空行占行号。09-17 收尾：test-hook-flow 的版本号改从 `RULE_VERSIONS` 读，新第 22 节走 hook 的端到端，修掉同一次 hook 里 spool 块互相覆盖（K26，会丢数据），登记 `auto_mode_exit`；沙箱里对本机 20 个会话真实补采，16,697 条全过 schema、没有错误日志。
-- [x] **完整性钉子**（运行时部分 2026-09-16 第二批 `6cb3786` / `f81ff53`，09-17 `03847f8` 补端到端）：映射账本加 `new` 计数，只数新读到的行，恒等式 seen = 进映射 + 坏行 + 不是对象 + 没 uuid + 回放副本 + 复制来的历史；hook 按文件累计进 `state/<sid>/integrity.json`（文件被重写时那份清零）；doctor 汇总读过多少条，点名恒等式破了、坏行、拒绝标记没认出、不认识的记录类型 / 附件类型 / system 子类型、超 1 MiB 去正文、单次读超 50 MB 截断。坏行、空行占行号（以前直接丢，中间有坏行时 checkpoint 换算成字节会错一行）。09-17 本机 20 个会话真实补采：54 份 transcript 恒等式全成立。**还没做**：服务端拒收的计数（随 push）；doctor 看最近会话的 `stop_hook_summary` 有没有跑过我们的命令。原记：完整性钉子：每类记录条数进出相等、映射后事件全部过 schema（这两条测试期已在 `test-map.sh` 钉住；运行时要进账本与 doctor）、超 1 MiB 被拒计数、未知记录类型 / 事件名告警（A11；G10、G6）。
+- [x] **完整性钉子**（运行时部分 2026-09-16 第二批 `6cb3786` / `f81ff53`，09-17 `03847f8` 补端到端）：映射账本加 `new` 计数，只数新读到的行，恒等式 seen = 进映射 + 坏行 + 不是对象 + 没 uuid + 回放副本 + 复制来的历史；hook 按文件累计进 `state/<sid>/integrity.json`（文件被重写时那份清零）；doctor 汇总读过多少条，点名恒等式破了、坏行、拒绝标记没认出、不认识的记录类型 / 附件类型 / system 子类型、超 1 MiB 去正文、单次读超 50 MB 截断。坏行、空行占行号（以前直接丢，中间有坏行时 checkpoint 换算成字节会错一行）。09-17 本机 20 个会话真实补采：54 份 transcript 恒等式全成立。**还没做**：~~服务端拒收的计数~~（09-17 随 push 做了，doctor 按 code 计数）；doctor 看最近会话的 `stop_hook_summary` 有没有跑过我们的命令。原记：完整性钉子：每类记录条数进出相等、映射后事件全部过 schema（这两条测试期已在 `test-map.sh` 钉住；运行时要进账本与 doctor）、超 1 MiB 被拒计数、未知记录类型 / 事件名告警（A11；G10、G6）。
   **09-16**：映射账本里 in / out / replayed / skipped_no_uuid / sentinel 已有，K8 修后再加 inherited；缺的是把它们按会话累计进 state、由 doctor 汇总（哪个会话 `marker_without_hit` > 0、`skipped_*` > 0、replayed 异常多），
   并在 test-hook-flow 里做成恒等式断言（记录数 = 出事件的 + 跳过的 + 不产事件的）——Pilot 的恒等式只写在文档里、测试 grep 不到，正是要避免的（G10）。
   **09-16 补**：D13 之后没有 hook 侧的类型化事件可以对账（DESIGN §3.2），「已知清单之外的记录类型 / attachment 类型」告警更要紧；超过 1 MiB 现在是去掉正文照发（`vibetrail.content_dropped` = size），条数进 doctor。
 - [ ] 回归（用户 09-15：先不急着做）：两路各有带断言的测试，输入用 [experiments/collect-demo/scenario.json](experiments/collect-demo/scenario.json) 回放，补上 SessionStart 补做、
   打断后无 Stop、后台子 agent 晚于父 Stop、一轮多 commit、端点未配置 / 配置后断网五个场景。分歧一路已有 `test-hook-flow.sh`，其中补做与打断后无 Stop 已覆盖；
   轮次元数据一路现在只有 demo.sh 端到端跑一遍、没有断言。（09-16 起本机装了 jsonschema，两套回归里的 schema 项不再跳过。）
-  **09-16 已补**：K8 / K12 / K13（test-map 第 7 段）、K14 / K16（test-hook-flow 第 17 段）、后台子 agent 晚于父 Stop（test-hook-flow 第 7 段，D13）。**09-16 / 09-17 又补**：答完标记与 Stop 两条路只留一条 turn.end（test-hook-flow 第 21 节，K24 改成 Stop 时等标记）；两轮 turn.start / turn.end 成对、status、一轮两次提交按顺序进 commits、嵌套与 workflow 子 agent、子 agent 改的文件（第 22 节）。**还缺**：端点未配置 / 配置后断网（随 push）；push 的见上。
-- [ ] 查询端只留 push 前本地预览（G9，读取不归本项目）：`vibetrail list / show` 已做（09-15），`push --list / --show` 随 push；然后 OPEN-ISSUES 关 G7。
+  **09-16 已补**：K8 / K12 / K13（test-map 第 7 段）、K14 / K16（test-hook-flow 第 17 段）、后台子 agent 晚于父 Stop（test-hook-flow 第 7 段，D13）。**09-16 / 09-17 又补**：答完标记与 Stop 两条路只留一条 turn.end（test-hook-flow 第 21 节，K24 改成 Stop 时等标记）；两轮 turn.start / turn.end 成对、status、一轮两次提交按顺序进 commits、嵌套与 workflow 子 agent、子 agent 改的文件（第 22 节）。~~**还缺**：端点未配置 / 配置后断网~~（09-17 由 `tools/test-push.sh` 第 1、7 节钉住）；push 的见上。
+- [ ] 查询端只留 push 前本地预览（G9，读取不归本项目）：`vibetrail list / show` 已做（09-15），`push --list / --show` 09-17 随 push 做了；然后 OPEN-ISSUES 关 G7。
   退役脚本 09-15 已按用户要求归档到 `old/`（`old/README.md`），审计线的几份随 U6 定去留。
   **09-16 加**：`vibetrail show --bodies` 只列 `content_state = included` 的事件（被拒调用的 `tool.request.input`、被打断的回复、之后人的下一句），
   就是 G9 原话「让开发放心没有侵犯隐私」要的那份「什么正文出了本机」，几十行。

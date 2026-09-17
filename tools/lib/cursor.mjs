@@ -253,6 +253,7 @@ export function runCursorHook(event, raw) {
     }
     default: break;
   }
+  return event === 'stop' ? 'threshold' : event === 'sessionStart' || event === 'sessionEnd' ? 'force' : '';   // 交给 autoPush（D6）
 }
 
 // Cursor 同步等每个 hook：先写应答（beforeSubmitPrompt 要 continue，其余空对象），再丢后台。
@@ -262,7 +263,7 @@ export async function hookEntry(cmd, event, payload, entry) {
   if (cmd === 'hook') { try { fs.writeSync(1, (RESPONSE[event] ?? '{}') + '\n'); } catch {} }
   if (!agentEnabled('cursor')) return;                 // init 时没选 Cursor、条目却还在（手改过）：不采
   if (cmd === 'hook' && process.env.VIBETRAIL_FOREGROUND !== '1') { detach(entry, 'cursor', event, payload); return; }
-  runCursorHook(event, payload);
+  return runCursorHook(event, payload);
 }
 
 // ---------- 安装 / 卸载 / 自检：~/.cursor/hooks.json（{version: 1, hooks: {事件: [{command, timeout}]}}） ----------

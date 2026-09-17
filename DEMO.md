@@ -1,6 +1,6 @@
 # vibetrail 演示：安装 → 选仓 → 采集 → 看本地数据
 
-> 2026-09-16。现在只落本机，push 还没做。原理与取舍见 [DESIGN.md](DESIGN.md)。
+> 2026-09-16；09-17 加了 push：配了端点（`~/.vibetrail/config` 的 `endpoint=`）就推，没配只落本机。原理与取舍见 [DESIGN.md](DESIGN.md)。
 
 ## 0. 使用前的准备
 
@@ -12,6 +12,7 @@
 | **系统** | macOS（实测）；Linux 应该能跑，没测过；Windows 不支持（入口是 POSIX sh 包装） | |
 | **hook 没被关掉** | 用户设置里没有 `disableAllHooks: true`；公司电脑的托管设置里没有 `allowManagedHooksOnly: true`。这两种情况下 hook 一次都不触发，而且看不出异常 | 装完跑 `vibetrail doctor`，会点名是哪份文件里的哪个键 |
 | **上报 token** | OnePaaS 的 API Access Token（push 时放进 `Onepaas-Api-Access-Token` 请求头）。联调阶段可以不填，服务端记到默认用户；正式接入前要填 | 在终端里跑 `init` 会问一次（输入不回显，回车跳过）；以后用 `~/.vibetrail/bin/vibetrail token` 填或换 |
+| **上报端点** | collector 地址，写进 `~/.vibetrail/config` 的 `endpoint=`（写到端口即可，联调地址 `http://10.78.73.4:8080`）；没写就只落本机、不发 | `vibetrail doctor` 报端点与上次推送结果；`vibetrail push --list` 看待发 |
 | 只有跑演示、测试才要 | `jq`（`demo.sh`、`report.sh` 与测试脚本；1.6 也行）；`python3` + `jsonschema`（测试里的协议 schema 校验，缺了跳过并提示） | `jq --version`；`python3 -c 'import jsonschema'` |
 
 ## 1. 先在沙箱里看一遍（不碰真实环境）
@@ -98,7 +99,7 @@ bash tools/vibetrail init
 
 **数据文件在** `~/.vibetrail/spool/<项目目录名>-<hash>/<会话 id>/`，每个文件是一次 hook 产出的一块，文件名 `<UTC 时间>-<pid>-<来源>.jsonl`（同一次 hook 同一秒写同一来源的第二块，pid 后加 `_2`），
 来源是 `hook-<事件名小写>`（hook 当场给的，如 `hook-userpromptsubmit`）、`main`（解析主会话 transcript 得出的）或 `agent-<id>`（子 agent 的 transcript）。每行一条 paas-coding-hook 协议 1.0 事件，直接 `cat` 就能看。
-这就是将来要 push 的全部内容。**2026-09-16 起默认全采正文**（用户定，推翻原先的「只带元数据」）：人的 prompt、模型输出、
+这就是 push 会发的全部内容（发出去的块随即删掉）。**2026-09-16 起默认全采正文**（用户定，推翻原先的「只带元数据」）：人的 prompt、模型输出、
 工具参数与结果原样进事件（`payload.text` / `payload.input` / `payload.output`），thinking 进 `extensions["vibetrail.reasoning"]`，
 **不脱敏**。**system prompt** 也采：它在 `attachment/prompt_snapshot` 里（≥ 2.1.258 的 transcript 自带），
 发成一条 `ext.claude.prompt_snapshot`（正文进 `extensions["vibetrail.system_prompt"]`，payload 只有 bytes 与 sha256），
@@ -161,4 +162,4 @@ bash experiments/collect-demo/report.sh -o experiments/collect-demo/out/report.m
   一律被忽略，用户设置里 `disableAllHooks: true` 则是所有 hook 都不跑（安全模式同理）。两种情况下 hook 一次都不触发，而且**看不出异常**——
   spool 不涨、也没有错误日志。先跑一次 `vibetrail doctor`，它会直接点名是哪份文件里的哪个键。
 - **只采登记过的仓**：没登记的仓里开会话什么都不采；要采就 `projects pick` 选上。
-- **还没有 push**：数据只在本机 spool，端点配置之后才会发。
+- **push**（09-17）：没配端点只落本机 spool；配了之后模型答完时按门槛推（全机最早待发超 1 小时或满 100 条），开会话、关会话时不看门槛推，发出去的块就删掉。`vibetrail push --list` 看待发与门槛，`vibetrail push` 立即推；服务端拒收的只隔离那几条，`vibetrail doctor` 会报。
