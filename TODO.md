@@ -94,16 +94,16 @@
   4. K24：Stop 时先等答完标记或拦停反馈落盘（config `stop_wait` 默认 10 s，本机实测标记晚 2～4 秒），拦停了不发；等不到才走 D7 老路。测试与演示 `VIBETRAIL_STOP_WAIT=0`。
   5. K19：四路 `rule_version` 升到 v2 基线（`RULE_VERSIONS`）；钉子 test-map 第 10 节：按 rule_version 算输出摘要记在 `expect/RULE-DIGESTS`，变了没升版本就红（`--update` 也红，`--accept-rule-digest` 才放）。
   本机 11 个会话重映射 5,536 条事件全部过 schema；两家三方都没做 K17 那一层（teamai 报完整路径加服务端数字 id，Pilot 报 owner/repo 加完整路径），U12 与 Pilot 同式。
-- [x] **push**（2026-09-17，`tools/lib/push.mjs`；回归 `tools/test-push.sh` 14 节 68 项，8 个变异各自变红；用户 09-15「先不急着做」，09-17「采集数据已经基本完成了……开始写push了」）：`vibetrail push [--list | --show [--json] | --requeue]`，
-  Stop 看门槛，SessionStart 补做后 / SessionEnd / `vibetrail sync` 不看门槛，都看退避（D6、DESIGN §4）；端点从 config 的 `endpoint=` 读（写到端口即可），token 从 `~/.vibetrail/token` 读、只进请求头。
+- [x] **push**（2026-09-17，`tools/lib/push.mjs`；回归 `tools/test-push.sh`（09-17 收尾时 17 节 77 项），各处变异各自变红；用户 09-15「先不急着做」，09-17「采集数据已经基本完成了……开始写push了」）：`vibetrail push [--list | --show [--json] | --requeue]`，
+  SessionStart 补做完、每轮 Stop、SessionEnd 跑完就推，都看退避（09-17 起 D15，推翻 D6 的门槛；DESIGN §4）；手动 `vibetrail push` / `sync` 不看退避；端点从 config 的 `endpoint=` 读（写到端口即可），token 从 `~/.vibetrail/token` 读、只进请求头。
   09-16 复核的修正照做：批是 ack 单位（`state/push/state.json` 每块记已了结的行数，批 ack 推进、块到头才删）；token 不上命令行（用 node 的 `fetch`，没有子进程）；`batch_id` 用首末 event_id 算 UUIDv5；`client.device_id` 取 config；K14 已先修。
   **与原计划不同的四处**（对照 collector 源码 `BatchValidator` / `IndexStore` / `CollectionErrorHandler` 与 09-17 对联调端点的实测）：
   1. **被拒收只隔离那几条，不隔离整批**：422 `INVALID_EVENT` 的 message 列出错位置（`/events/N/…`，最多 10 处，实测是 JSON Pointer）、409 / 413 带 event_id，按它们挑出来、其余重发；不带位置的（`INVALID_TIME`）二分。批次外壳的错（`/client/…`）一条都不隔离、按暂时失败退避。
   2. **可重试集合按 collector 实际返回改**：400（请求体没读完整）、408、429、5xx、连不上、超时算暂时；401 / 403 暂时但 doctor 点名 token；3xx、404、405、415 算配置问题、也只退避——原写的「其余 4xx 永久」在端点路径写错时会把数据全隔离掉。
   3. **不写 `lib/schema.mjs`**：本地只挡服务端必拒又没法定位的（不是 JSON 对象、没有合法 event_id、单条超 1 MiB），其余交给服务端判、按位置隔离。手写一份会与服务端漂移（后端 09-16 刚加了 `message.reasoning` / `instruction.loaded`，OPEN-ISSUES K28）；完整 schema 校验留在测试里，`third-party/` 的 schema 原件 09-17 同步到后端最新版。
   4. **同一批里同一个 event_id 只发第一条**：内容不同时服务端整批 409；本机 spool 里 09-16 的旧块与 09-17 重采的块有 3,007 个这样的 id（OPEN-ISSUES U20）。
-  门槛默认值（U17，仍暂不定）用现有取值：`push_max_age` 3600、`push_max_events` 100、Stop 一次最多 `push_max_batches` 10 批；后台兜底与 sync 按 09-16 的倾向不限批数、限时 `push_budget_s` 60 s。
-  已测：端点没配不发；混批、从最早的块发；按字节拆批；门槛不满不发、满条数 / 满时间就推全机、最多 N 批后下次续传；兜底不看门槛；503 退避、翻倍封顶、退避期内兜底也不发、手动 push 不看退避；401 / 连不上 / 超时 / 404 不动数据；
+  ~~门槛默认值（U17）~~ 09-17 随 D15 取消（用户：「用户发了50条，后面不再聊天，这个50条满1个小时会自动发吗？不会吧」，否掉常驻进程）：不攒门槛，三个 hook 跑完就推、一次限时 60 s；锁撞上了等、全机最多一个在等，不跳过。
+  已测：端点没配不发；混批、从最早的块发；按字节拆批；三个 hook 跑完就推、UserPromptSubmit / PermissionRequest 不推、限时推不完下次续传；锁撞上了等、已经有人在等就走、等锁的死了能接手；503 退避、翻倍封顶、退避期内兜底也不发、手动 push 不看退避；401 / 连不上 / 超时 / 404 不动数据；
   422 按位置、INVALID_TIME 二分、409、413、本地超 1 MiB、坏行都只隔离那几条；外壳错误不隔离；批内重复 id；ack 之后被杀只重发一批；两个 push 同时跑；`--requeue`；`--show --json` 过 schema；token 不落盘；sync 补完接着推。
   **09-17 第一次真推**（U20 定了①：09-16 的 125,083 条旧格式数据挪到 `~/.vibetrail/legacy/20260916-pre-k17/`、不推；先把 push 合进 main、Codex 分支随后合，再装新版）：本机原先填的 token 回 503 `IDENTITY_UNAVAILABLE`（Collector 调账户服务校验没成，按暂时失败退避、数据一条没动；为什么不是 401 见 OPEN-ISSUES U4），用户换成测试环境的 token 后先推 1 批（100 条全收）、再推完 93 批：**累计 9,398 条全部新收，重复 0、隔离 0、正文投递失败 0**，后 9,298 条用时 14.3 s；存下的一批原样重发回 accepted 0 / duplicate 100（接入指南的验收项）。同日补两处：`vibetrail doctor` 在选了 Codex 的机器上崩（codex-v4 删了 `toml`，`738e8bf`）；token 不出本机——写 spool 与 push 组批前把当前 token 换成占位（`2a97403`，起因是用户在对话里贴了 token，全采会原样进事件）；503 `IDENTITY_UNAVAILABLE` 的提示说明可能是 token 不属于这个环境、同一种错连着 3 次点名先换 token（用户会请后端改成 401，OPEN-ISSUES U4）。上一回合结束时 Stop hook 按门槛自动推了 2 批 131 条，全收——自动推送在真实环境里跑通。**还没做**：SessionEnd 的后台进程在 `-p` 与 desktop 关会话时活不活（DESIGN §3.1，没实测）；Codex / Cursor 的 hook 也接了 push，没有单独的回归。
 - [x] **全采与协议补齐**（2026-09-16 核出、同日做完 K20–K23，`a34bbf5`）：K20 排队的人话全采时发 `message.user`（`delivery: queued`，本机这台 35 条）；K21 按停止打断工具补 `tool.end(cancelled)`；K22 `turn.end.files[]`（量过：有改动的轮平均 3.5 个文件、最多 10 个、路径约 100 字节，每条 turn.end 不到 1 KB；根外的只计数）；K23 `capture_content=0` 时 `subagent.start` 不带 `task`。

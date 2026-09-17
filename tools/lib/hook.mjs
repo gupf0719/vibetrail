@@ -1141,8 +1141,9 @@ export function runHook(event, payload) {
     // 退役的 8 个事件（见 hookEvents 上面的说明）在入口就挡掉了：它们能给的已经从 transcript 推出来，再发就是两条
     default: break;
   }
-  // 过了门控才轮到 push（lib/push.mjs 的 autoPush）：Stop 看门槛；SessionStart 补做完、SessionEnd 不看门槛（D6）
-  return ev === 'Stop' ? 'threshold' : ev === 'SessionStart' || ev === 'SessionEnd' ? 'force' : '';
+  // 过了门控才轮到 push（lib/push.mjs 的 autoPush，用户 09-17 定，D15）：会话开始补做完、每轮答完、会话结束这三处跑完就推——数据都是在这三处写进 spool 的；
+  // UserPromptSubmit / PermissionRequest 只写一两条小事件，同一轮的 Stop 会带上。sync 的 CatchUp 自己推
+  return ev === 'SessionStart' || ev === 'Stop' || ev === 'SessionEnd' ? ev : '';
 }
 
 // 同步 hook（与可能被同步等的 PermissionRequest）：读完 stdin 就丢到脱离的子进程里，自己立刻退出

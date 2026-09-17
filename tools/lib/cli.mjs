@@ -444,8 +444,6 @@ export async function cmdInit(argv) {
   if (!vtConf('device_id', '')) confSet('device_id', crypto.randomUUID());
   if (!vtConf('turn_idle_close', '')) confSet('turn_idle_close', '3600');
   if (!vtConf('backfill_days', '')) confSet('backfill_days', '2');          // 补采老会话最多补两天（用户 09-17 定；all = 不限）
-  if (!vtConf('push_max_age', '')) confSet('push_max_age', '3600');
-  if (!vtConf('push_max_events', '')) confSet('push_max_events', '100');
   if (!(readText(path.join(VT_HOME, 'config')) || '').split('\n').some((l) => l.startsWith('endpoint='))) confSet('endpoint', '');
   try { fs.chmodSync(path.join(VT_HOME, 'config'), 0o600); } catch {}
   say(`✓ 配置 → ${VT_HOME}/config（scope=${vtConf('scope', 'project')}，node=${process.execPath}）`);

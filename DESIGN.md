@@ -109,11 +109,11 @@ Pilot 的拦截器路线（[对比 §6.3](third-party/teamai-cli-vs-vibetrail.md
 
 | 事件 | 动作 | 同步 / 异步 |
 |---|---|---|
-| `SessionStart` | 门控（按 scope，§5）→ 发 `session.start`（`source`、capabilities；model、git 状态进 extensions）→ **补做**：本仓（按 `git worktree list` 归属）所有 offset 落后于文件大小的 transcript，各补一次解析（分歧 + 轮次元数据；从没读过的会话只补最后修改在两天内的、从两天内的第一条记录读起，用户 09-17 定，§3.3）；同一会话 `resume`、别的会话空闲超过 `turn_idle_close`（默认 3600 s）时把它的最后一轮也关掉（D7）；然后 **push 全机待发、不看门槛**（只看退避期，§4；09-17 实现：不限批数、限时 `push_budget_s` 60 s）。startup / resume / clear / compact 都触发，频率不低，是最靠得住的兜底：agent 崩溃、被杀、`-p` 模式下 Stop / SessionEnd 都不来，全靠这一步 | 同步 hook，但读完 stdin 就把门控、记录、补做全丢进脱离的后台进程，自己约 0.02 s 退出（09-15 实现时定：不让人等） |
+| `SessionStart` | 门控（按 scope，§5）→ 发 `session.start`（`source`、capabilities；model、git 状态进 extensions）→ **补做**：本仓（按 `git worktree list` 归属）所有 offset 落后于文件大小的 transcript，各补一次解析（分歧 + 轮次元数据；从没读过的会话只补最后修改在两天内的、从两天内的第一条记录读起，用户 09-17 定，§3.3）；同一会话 `resume`、别的会话空闲超过 `turn_idle_close`（默认 3600 s）时把它的最后一轮也关掉（D7）；然后 **push 全机待发**（D15；只看退避期，一次限时 60 s，§4）。startup / resume / clear / compact 都触发，频率不低，是最靠得住的兜底：agent 崩溃、被杀、`-p` 模式下 Stop / SessionEnd 都不来，全靠这一步 | 同步 hook，但读完 stdin 就把门控、记录、补做全丢进脱离的后台进程，自己约 0.02 s 退出（09-15 实现时定：不让人等） |
 | `UserPromptSubmit` | 发 `turn.start`（`prompt_id` 作 turn_id、会话已知的 model、HEAD / 分支 / 脏否，提示来源 `source` 进 extensions），记轮起快照（§3.3 `turns/`）；上一轮没等到 Stop 的（打断、拒绝、崩溃），用此刻的快照给它补一份「止」（gap）。**不读 transcript**（U11，09-15 定）：这里解析的结果本来也不 push、云端看到的时间不变，同步 hook 却要让人等；Pilot、teamai 也都不在这里读 | 同上：丢后台、立刻退出；stdout 会进模型上下文，**必须为空** |
-| `Stop` | 记轮止快照与本轮 commit（§3.5；被别的 Stop hook 拦停后同一轮会再来一次 Stop，每次覆盖、`stops` 计次）→ 等 transcript 写稳 → 从本轮开头解析（§3.3）：分歧事件 + **本轮的 turn.end**——Stop 就是模型答完，当场关（D7；Claude Code 的答完标记 `stop_hook_summary` 落盘了就按它关、没有才按 Stop 关——09-16 在 desktop 2.1.270 上实测它与 Stop 同一秒落盘，见 D7 的 09-16 补记）；被别的 Stop hook 拦下时再来一次 Stop，再发一条更新的 → 落 spool，再**看门槛决定推不推**（D6，09-15 定，规则在 §4；09-17 实现：一次最多 `push_max_batches` 10 批）：全机最早待发事件超过 1 小时、或全机待发满 100 条，任一满足且不在退避期就推，推的是全机所有待发、不只本会话；都不满足就只落盘，本轮不发；端点未配置时只记账不发。同一会话一把 mkdir 锁（照 Pilot），已在跑就跳过，下一次 hook 补上；push 另持一把机器级锁（§4）。子 agent 起止、API 出错结束的轮、CLAUDE.md 加载、切目录也在这一次从 transcript 推出来（09-16 起，D13），`subagents/` 目录一起扫——后台子 agent 在父 Stop 之后才结束，它的完成通知落进父会话，下一次 Stop 读到 | `async: true`：不阻塞、不计 timeout |
+| `Stop` | 记轮止快照与本轮 commit（§3.5；被别的 Stop hook 拦停后同一轮会再来一次 Stop，每次覆盖、`stops` 计次）→ 等 transcript 写稳 → 从本轮开头解析（§3.3）：分歧事件 + **本轮的 turn.end**——Stop 就是模型答完，当场关（D7；Claude Code 的答完标记 `stop_hook_summary` 落盘了就按它关、没有才按 Stop 关——09-16 在 desktop 2.1.270 上实测它与 Stop 同一秒落盘，见 D7 的 09-16 补记）；被别的 Stop hook 拦下时再来一次 Stop，再发一条更新的 → 落 spool，**当场推全机待发**（D15，用户 09-17 定，推翻 D6 的门槛；只看退避期，一次限时 60 s，规则在 §4）；端点未配置时不发。同一会话一把 mkdir 锁（照 Pilot），已在跑就跳过，下一次 hook 补上；push 另持一把机器级锁（§4）。子 agent 起止、API 出错结束的轮、CLAUDE.md 加载、切目录也在这一次从 transcript 推出来（09-16 起，D13），`subagents/` 目录一起扫——后台子 agent 在父 Stop 之后才结束，它的完成通知落进父会话，下一次 Stop 读到 | `async: true`：不阻塞、不计 timeout |
 | `PermissionRequest` | 弹权限框时记一份证据进 `state/<sid>/perms/`（时间、工具名、agent_id、prompt_id、permission_mode，不带参数），发 `ext.claude.permission_request`。transcript 里没有「弹没弹过框」，K7 分「人拒绝」与「按停止打断工具」全靠它（D9）；Claude Code 可能同步等这类 hook，读完就丢后台 | 同步 hook，丢后台、立刻退出 |
-| `SessionEnd` | 发 `session.end`（`reason`、status），给最后一轮补「止」快照（没等到 Stop 的话）→ 解析并关掉最后一轮（`closed_by` = `session_end`）→ 起一个脱离当前进程的后台 push（09-17 实现：SessionEnd 本来整个在丢出去的后台进程里跑，push 接在后面），**不看门槛**、只看退避期，自己不等结果。预算 1.5 s（`CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` 可抬）只够落 spool 与 fork，一次网络请求不一定来得及；后台进程在 `-p` 下活不活、desktop 里长开几天的会话什么时候触发 SessionEnd，都没实测。所以它只是弱兜底，来不及的交给下一次 SessionStart 补做 | 同步 hook，全部丢后台、立刻退出（不受 1.5 s 预算限制） |
+| `SessionEnd` | 发 `session.end`（`reason`、status），给最后一轮补「止」快照（没等到 Stop 的话）→ 解析并关掉最后一轮（`closed_by` = `session_end`）→ 起一个脱离当前进程的后台 push（09-17 实现：SessionEnd 本来整个在丢出去的后台进程里跑，push 接在后面），只看退避期，自己不等结果。预算 1.5 s（`CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` 可抬）只够落 spool 与 fork，一次网络请求不一定来得及；后台进程在 `-p` 下活不活、desktop 里长开几天的会话什么时候触发 SessionEnd，都没实测。所以它只是弱兜底，来不及的交给下一次 SessionStart 补做 | 同步 hook，全部丢后台、立刻退出（不受 1.5 s 预算限制） |
 
 **只挂这 5 个**（用户 09-16 定，D13；原来 13 个）。另外 8 个能给的都改在 Stop 时从 transcript 推：`SubagentStart` / `SubagentStop` → 子 agent 文件第一条记录、
 父会话里 Agent 调用的结果与 `<task-notification>`；`StopFailure` → `isApiErrorMessage` 的合成回复；`InstructionsLoaded` → `attachment/instructions`、`nested_memory`；
@@ -128,7 +128,7 @@ hook payload 里的 `tool_input` / `tool_response` 也不另存一份——trans
 有新的就提取、就传（用户原话「hook触发的时候采集一下，有就传」），没有实时的要求。用户按停止打断时没有任何 hook（desktop 实测），打断记录等到下一个 hook 读到；
 offset 只在解析成功后前移，所以只是晚到，不会漏。`transcript_path` 是异步写的、可能落后于内存里的对话，Stop 时先等 `stop_hook_summary` 落盘再读（D7）。
 
-**什么时候推**（D6）：不是每轮推。Stop 落完 spool 看门槛，全机最早待发超过 1 小时或全机待发满 100 条才推；SessionEnd 与 SessionStart 补做不看门槛。规则、退避与锁在 §4。
+**什么时候推**（D15，09-17 推翻 D6 的门槛）：SessionStart 补做完、每轮 Stop、SessionEnd 跑完就推全机待发；UserPromptSubmit / PermissionRequest 不推（只写一两条小事件，同一轮的 Stop 带走）。规则、退避与锁在 §4。
 
 ### 3.2 分歧一路为什么还是要读 transcript
 
@@ -183,12 +183,12 @@ G6 的哨兵改由语料里「已知清单之外的 `type` / `attachment.type`�
 - 产物写临时文件 + 原子 rename；每个会话一个目录，多 worktree 并发不共享文件。同一会话的几次 hook 可能重叠（大会话首次整读约 12 s，
   轮次比它短），用 `state/<sid>/.lock`（mkdir 原子锁，照 Pilot；陈旧阈值 300 s）挡住，已在跑就跳过，下一次 hook 补上。
   失败日志 `logs/errors.log` 只留元数据（时间、事件、会话、阶段、退出码），不留 payload（teamai 上报失败把整份 context 连 prompt 摘要写盘，别学）。
-- **本机不是存档，spool 是过手的 outbox**：push 在产出数据的同一个 hook 里发（Stop 异步、按门槛；SessionEnd 与 SessionStart 补做不看门槛，§4），服务端 ack 即删；本机常驻只有
-  `state/`（offset、push 水位与退避记录，KB 级）与还没 ack 的块。任何一条事件在本机最多待约 1 小时加到下一次 hook 的间隔。端点未配置的现阶段它才是「全部」，文件可读、不压缩，就是用户要先看的「输出内容」。
+- **本机不是存档，spool 是过手的 outbox**：push 在产出数据的同一个 hook 里发（SessionStart 补做完、每轮 Stop、SessionEnd 跑完就推，D15，§4），服务端 ack 即删；本机常驻只有
+  `state/`（offset、push 水位与退避记录，KB 级）与还没 ack 的块。正常情况下一轮的事件在它自己的 Stop 里就推走，留在本机的只有推送失败正在退避的、按停止打断还没等到下一个 hook 的。端点未配置的现阶段它才是「全部」，文件可读、不压缩，就是用户要先看的「输出内容」。
 - 布局：`~/.vibetrail/spool/<项目键>/<sid>/` 下是**块文件**：每次 hook 产出一块 `<UTC 时间>-<pid>-<名>.jsonl`（协议形状的事件，每行一条；同一进程同一秒再写同一来源时 pid 后加 `_2`、`_3`——
   子 agent 文件一次 hook 里会映射两遍，以前第二块把第一块整个盖掉、第一块的事件就此丢了，K26），
   临时文件 + rename 写入，写入后不再改；push 按块发、ack 后整块删，不用改写一个不断增长的 `events.jsonl`（09-15 改，原写法是单个 events.jsonl + manifest.json）。
-  块名里的 UTC 时间就是门槛计时的依据（§4）：最早待发事件的时间直接从文件名取，不另记状态。
+  块名里的 UTC 时间决定推送顺序（从早到晚），doctor 按它报最早的待发等了多久，不另记状态。
   offset 等进度在 `state/`（上一条），不放 spool。项目键 = 主 checkout 目录名 + 路径 sha1 前 16 位。
   `project_id` 是简单项目名：登记表里显式写的（`projects add --name`）> `origin` 远端的仓库名（`git@host:team/payment-service.git` → `payment-service`）> 主 checkout 目录名，
   不含用户名与本机路径；`workspace_id` 是第一次见到主 checkout 时生成、持久化在 `~/.vibetrail/workspaces/<路径 sha1 前 16 位>` 的 UUID，worktree 共享，uninstall 留着、`--purge` 才删（§4.1；
@@ -247,9 +247,9 @@ flowchart LR
 | | 事件（分歧 + 轮次元数据，同一条通道） |
 |---|---|
 | 去向 | **云端已定**（§7 D5）：paas-coding-hook 事件协议 1.0 的 collector，`POST /api/v1/collection/batches`（[协议意见](third-party/paas-coding-hook-protocol-feedback.md)）。现阶段端点还没有：spool 里的事件就是将来 push 的内容，先让人看；push 动作第一版就在，端点未配置时不发只记账。**不进 git**；读取与分析不归本项目 |
-| push 怎么传 | **09-17 实现**（`tools/lib/push.mjs`，回归 `tools/test-push.sh`）。端点在 `~/.vibetrail/config` 的 `endpoint=` 配（写到端口即可，自动补 `/api/v1/collection/batches`；09-17 用户给的联调地址 `http://10.78.73.4:8080`）、token 在 `~/.vibetrail/token`（init 引导填，§5），只进 `Onepaas-Api-Access-Token` 请求头，不进命令行、日志与 state；事件正文里出现当前 token（人贴进对话、命令打了出来，全采会原样带上）时，写 spool 与组批前换成占位（09-17）；没配端点就不发（spool 完整保留，`vibetrail push --list` 看待发、门槛、退避与隔离，`--show [--json]` 看下一批）。配了：扫全机 spool、按块名里的时间从早到晚、混批，≤ 100 条 / 16 MiB（按实际字节算），单条 > 1 MiB 本地就隔离、不截断；同一批里同一个 `event_id` 只发第一条（内容不同时服务端整批 409）；`event_id` = UUIDv5(会话 id, 记录 uuid, 事件种类)，重发幂等；`batch_id` = 首末 event_id 算的 UUIDv5，重发同一组不变。**批是 ack 单位，不是块**：每块在 `state/push/state.json` 记已了结到第几行，批 ack（HTTP 200）就推进、块到头才删，ack 之后被杀最多重发一批（服务端记 duplicate）；accepted / duplicate / sdk_failed 累计进 state，`logs/push.log` 每次一行计数；失败留 spool，按下面两行的规则重发；失败日志只留元数据。索引在 MySQL 事务提交后才返回，正文 Span 尽力投递，接受偶发丢正文（分歧的事实在索引里）。请求暂不支持压缩（已提意见）。仍未定：端点地址、token 怎么发与续期（U4） |
-| push 什么时候发 | **不是每轮推**（D6，用户 09-15 定）。Stop 落完 spool 查两个门槛，任一满足就推：**全机最早待发事件超过 1 小时**，或**全机待发满 100 条**（正好一整批）。两个值在 `~/.vibetrail/config` 里可改（`push_max_age`，默认 3600 s；`push_max_events`，默认 100）。计时从最早待发事件算、不从上次推送算：保证的是「任何事件在本机最多待约 1 小时加到下一次 hook 的间隔」，时间就在块文件名上、不另记状态，空闲之后窗口从第一条事件起算、批更满。**按整台机器算、不按会话算**：一次 push 扫全部 `spool/<项目>/<sid>/`，合在一起打批（协议允许混批，§3.3）；并行开几个会话时各数各的谁都攒不满。待发超过 100 条就循环发，发完或失败为止，一次最多 10 批、剩下的下一次 hook 接着发（SessionStart 补做后常一次上千条）。**兜底不看门槛**：SessionEnd 起后台 push、SessionStart 补做后 push，都只看退避期。没有 daemon，「满 1 小时」的实际含义是「超过 1 小时后的第一个 hook 才推」，不是每小时推一次；人空闲时既没有新事件也没有 hook，攒下的最后几条要等下一次 hook 或下一次开会话——与 teamai 等到下一次 pull 才上报是同一类最坏情况，只在边角出现。push 持一把**机器级 mkdir 锁** `state/push/.lock`（与会话锁同款，已在跑就跳过），作用是省请求与账好对，不是保正确：块文件写入后不变、ack 后删块幂等，两个 hook 同时推同一块只会多发一次、服务端答 duplicate。锁的陈旧阈值单独定为 600 s：一次最多 10 批、每批 curl 超时 30 s，会话锁的 300 s 不够。**09-17 实现时的取值**（U17 仍暂不定，改 config 即可）：Stop 一次最多 `push_max_batches` 10 批；SessionStart 补做后、SessionEnd、`vibetrail sync` 按 09-16 复核的倾向不限批数、限时 `push_budget_s` 60 s；手动 `vibetrail push` 不看门槛也不看退避、发到完；锁每发一批刷新一次，跑得久的手动 push 不会被当成陈旧；每个请求超时 30 s，用 node 自带的 `fetch`、没有子进程 |
-| push 失败怎么办 | 分两类，照 agentsview 的思路（[调研](third-party/open-source-survey.md)）。**暂时失败**（连不上、超时、5xx，以及 401 / 403 这类配置问题）：块留 spool，失败时间与次数记在 `state/push/`，退避期内**所有触发点都不发，含 SessionEnd / SessionStart 的兜底**（resume、clear、compact 都触发 SessionStart，端点挂掉时不看退避就是每次 compact 打一次注定失败的请求）；退避从 1 分钟起指数增长、封顶 1 小时，与时间门槛同量级；客户端超时但服务端已收下的，重发得到 duplicate，正是 `event_id` 幂等要挡的情况。**永久失败**（4xx 里的内容问题：schema 不过、单条超 1 MiB）：拒单条还是拒整批协议资料没写，按拒整批准备——整块挪到 `spool/.rejected/`、计数、doctor 报出来，**不重试**；否则它卡在队头，后面所有事件都推不出去。401 / 403 也进 doctor。**09-17 实现时按 collector 源码（`BatchValidator` / `IndexStore` / `CollectionErrorHandler`）细化，只隔离被拒的那几条、不隔离整块**：只有 409 / 413 / 422 算内容问题——422 `INVALID_EVENT` 的 message 列出错位置（`/events/N/…`，最多 10 处）、409 `EVENT_CONFLICT` 与 413 `EVENT_TOO_LARGE` 带 event_id，按它们挑出来、其余重发，不带位置的（`INVALID_TIME`）二分找；隔离 = 原样追加进 `spool/.rejected/<项目>/<会话>/<块名>`，原因（状态码、code、出错位置、行号，不带正文）进 `state/push/rejected.jsonl`，doctor 按 code 计数，`vibetrail push --requeue` 放回待发。批次外壳出错（`/client/…`、config 的 device_id 坏了）一条都不隔离、按暂时失败退避。400（请求体没读完整）、408、429、5xx、连不上、超时算暂时——其中 503 `IDENTITY_UNAVAILABLE` 是 Collector 调账户服务校验 token 没成，「账户服务挂了」与「token 不属于这个环境」回的都是它，客户端分不出，照样退避，但提示里说明可能是 token，连着 3 次点名先换 token（09-17）；3xx、404、405、415 这类端点或客户端的问题也只退避、不动数据——原写的「其余 4xx 永久」在端点路径写错时会把数据全隔离掉 |
+| push 怎么传 | **09-17 实现**（`tools/lib/push.mjs`，回归 `tools/test-push.sh`）。端点在 `~/.vibetrail/config` 的 `endpoint=` 配（写到端口即可，自动补 `/api/v1/collection/batches`；09-17 用户给的联调地址 `http://10.78.73.4:8080`）、token 在 `~/.vibetrail/token`（init 引导填，§5），只进 `Onepaas-Api-Access-Token` 请求头，不进命令行、日志与 state；事件正文里出现当前 token（人贴进对话、命令打了出来，全采会原样带上）时，写 spool 与组批前换成占位（09-17）；没配端点就不发（spool 完整保留，`vibetrail push --list` 看待发、退避与隔离，`--show [--json]` 看下一批）。配了：扫全机 spool、按块名里的时间从早到晚、混批，≤ 100 条 / 16 MiB（按实际字节算），单条 > 1 MiB 本地就隔离、不截断；同一批里同一个 `event_id` 只发第一条（内容不同时服务端整批 409）；`event_id` = UUIDv5(会话 id, 记录 uuid, 事件种类)，重发幂等；`batch_id` = 首末 event_id 算的 UUIDv5，重发同一组不变。**批是 ack 单位，不是块**：每块在 `state/push/state.json` 记已了结到第几行，批 ack（HTTP 200）就推进、块到头才删，ack 之后被杀最多重发一批（服务端记 duplicate）；accepted / duplicate / sdk_failed 累计进 state，`logs/push.log` 每次一行计数；失败留 spool，按下面两行的规则重发；失败日志只留元数据。索引在 MySQL 事务提交后才返回，正文 Span 尽力投递，接受偶发丢正文（分歧的事实在索引里）。请求暂不支持压缩（已提意见）。仍未定：端点地址、token 怎么发与续期（U4） |
+| push 什么时候发 | **SessionStart 补做完、每轮 Stop、SessionEnd 这三个 hook 跑完就推**（D15，用户 09-17 定，推翻 D6 的「满 1 小时或 100 条才推」——没有常驻进程，门槛会让人不再聊天之后的最后几轮一直留在本机）。UserPromptSubmit / PermissionRequest 不推（只写一两条小事件，同一轮的 Stop 带走）；Codex 同，Cursor 是 sessionStart / stop / sessionEnd，每次调工具的那几个 hook 不推。**按整台机器推**：一次 push 扫全部 `spool/<项目>/<sid>/`、按块名时间从早到晚、混批（协议允许，§3.3），循环发到发完或失败；一次限时 60 s，推不完下一次接着推。手动 `vibetrail push` 与 `vibetrail sync` 不看退避、不限时。push 持一把**机器级 mkdir 锁** `state/push/.lock`，作用是省请求与账好对，不是保正确：块写入后不变、ack 后删块幂等，两个进程同时推同一批只会多发、服务端答 duplicate；陈旧阈值 600 s，每发一个请求刷新一次。**锁撞上了要等，不跳过**：锁里那个推送开始时就列好了块，看不到后写的，跳过的若正好是最后一轮的 Stop，这一轮就又落下了；拿不到锁的等它放开再推（最多 90 s），全机最多一个在等（`state/push/.waiter`，150 s 没刷新算死了、可以接手），已经有人在等就直接走——那人拿到锁之后才列块，一定带上。每个请求超时 30 s，用 node 自带的 `fetch`、没有子进程。仍会留在本机的：推送失败正在退避；按停止打断的那一轮（没有 hook，采集本来就等下一个 hook） |
+| push 失败怎么办 | 分两类，照 agentsview 的思路（[调研](third-party/open-source-survey.md)）。**暂时失败**（连不上、超时、5xx，以及 401 / 403 这类配置问题）：块留 spool，失败时间与次数记在 `state/push/`，退避期内**所有触发点都不发，含 SessionEnd / SessionStart 的兜底**（resume、clear、compact 都触发 SessionStart，端点挂掉时不看退避就是每次 compact 打一次注定失败的请求）；退避从 1 分钟起指数增长、封顶 1 小时；客户端超时但服务端已收下的，重发得到 duplicate，正是 `event_id` 幂等要挡的情况。**永久失败**（4xx 里的内容问题：schema 不过、单条超 1 MiB）：拒单条还是拒整批协议资料没写，按拒整批准备——整块挪到 `spool/.rejected/`、计数、doctor 报出来，**不重试**；否则它卡在队头，后面所有事件都推不出去。401 / 403 也进 doctor。**09-17 实现时按 collector 源码（`BatchValidator` / `IndexStore` / `CollectionErrorHandler`）细化，只隔离被拒的那几条、不隔离整块**：只有 409 / 413 / 422 算内容问题——422 `INVALID_EVENT` 的 message 列出错位置（`/events/N/…`，最多 10 处）、409 `EVENT_CONFLICT` 与 413 `EVENT_TOO_LARGE` 带 event_id，按它们挑出来、其余重发，不带位置的（`INVALID_TIME`）二分找；隔离 = 原样追加进 `spool/.rejected/<项目>/<会话>/<块名>`，原因（状态码、code、出错位置、行号，不带正文）进 `state/push/rejected.jsonl`，doctor 按 code 计数，`vibetrail push --requeue` 放回待发。批次外壳出错（`/client/…`、config 的 device_id 坏了）一条都不隔离、按暂时失败退避。400（请求体没读完整）、408、429、5xx、连不上、超时算暂时——其中 503 `IDENTITY_UNAVAILABLE` 是 Collector 调账户服务校验 token 没成，「账户服务挂了」与「token 不属于这个环境」回的都是它，客户端分不出，照样退避，但提示里说明可能是 token，连着 3 次点名先换 token（09-17）；3xx、404、405、415 这类端点或客户端的问题也只退避、不动数据——原写的「其余 4xx 永久」在端点路径写错时会把数据全隔离掉 |
 | 保留 | 端点未配置前 spool 积着（上限与超限策略 U5，倾向只警告不丢）。配置后 **ack 即删**，不留 N 天。云端索引保留 30 天，**够用**（用户 09-15：「超过一个月复盘意义不大」）。仍要在会话自己的 Stop / SessionEnd 里落 spool，SessionStart 补做只是兜底——transcript 清理可能先于 hook 把源删掉 |
 | 体积 | 分歧事件带被拒命令与被打断的回复，单条通常远小于 1 MiB。~~元数据每轮几条、百字节级，每会话 KB 级~~ **09-16 改**：D8 的调用 trace 让每轮变成几十到几百条——本机 45 个会话 120 MB、124,666 条，trace 占 95%，每会话 MB 级、最大的会话约 50,000 条（`5f069818`：23,147 次模型调用、26,307 次工具调用）。push 的门槛（D6）、spool 上限（U5）、云端 30 天的量都按这个算。上一版 700 MB 字节流的分块与压缩问题随 D5 消失。**09-16 再改（全采正文，推翻 D5 的「只带元数据」）**：本机 8 份真实 transcript（共 48 MB）实测——只带元数据 3 MB、**全采 11 MB，约原文的 1/4、只带元数据的 3.5 倍**，单个会话 0.5～3 MB（原文里还有大量提醒类附件、流式快照、thinking 签名，全采不发）。system prompt 按 sha256 去重、一个会话只发一次；单条超协议上限 1 MiB 的去掉正文转 `content_state=omitted`（这批里 0 条）。spool 上限（U5）、push 批次、云端存量都按全采的量估 |
 | 隐私 | 出本机的正文只剩：被拒调用的工具输入与拒绝原文、被打断的模型回复、打断后人的下一句。可能含命令里的密钥与代码片段。**暂不脱敏**（用户 09-14，K6），先原样传。云端「记录默认对公司已登录用户可见」（协议与 collector 文档），是目前唯一的闸而且是开的，已提意见 |
@@ -460,6 +460,24 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
   [Pilot 实跑](third-party/loongsuite-pilot-collection-sample.md)、[Pilot 原始输出](third-party/loongsuite-pilot-collection-output.md)。
 
 ## 7. 决策记录
+
+### D15 — push 时机：会话开始补做完、每轮答完、会话结束这三个 hook 跑完就推，不攒门槛、不起常驻进程（2026-09-17，现行；推翻 D6）
+
+用户原话：「用户发了50条，后面不再聊天，这个50条满1个小时会自动发吗？不会吧」「有一个常驻进程我觉得还不如改成每个hook触发了就推」
+「用锁会不会有问题，或者不要所有hook都推，比如只有end才推，这样会不会好一点」。定了什么：
+
+- **不攒门槛**：没有常驻进程时，D6 的「满 1 小时」要等下一次 hook 才兑现——人不再聊天，最后几轮就一直留在本机，正是 D7 里用户说的「排查的时候就会缺失最后一个turn」。
+  `push_max_age` / `push_max_events` / `push_max_batches` 不再用（init 不再写，老 config 里留着也不读）。
+- **只在这三个 hook 推**：SessionStart（补做完）、Stop、SessionEnd——数据都是在这三处写进 spool 的；UserPromptSubmit / PermissionRequest 只写一两条小事件，同一轮的 Stop 马上带走，推它们只是多请求。
+  Codex 同；Cursor 是 sessionStart / stop / sessionEnd，每次调工具的那几个 hook 不推。只在 SessionEnd 推不行：desktop 会话一开几天，SessionEnd 什么时候来、后台进程活不活都没保证。
+- **不起常驻进程**：「Stop 时挂一个到点再推的后台定时」与 launchd 定时任务都被用户否掉。
+- **一次限时 60 s**，推不完下一次接着推；退避照旧，退避期内这三处都不推；手动 `vibetrail push` / `sync` 不看退避。
+- **锁撞上了要等，不跳过**：锁里那个推送开始时就列好了块，看不到后写的；跳过的若正好是最后一轮的 Stop，这一轮又留在本机。拿不到锁的等它放开再推（最多 90 s）；
+  全机最多一个在等（`state/push/.waiter`，150 s 没刷新算死了、可接手），已经有人在等就直接走——那人拿到锁之后才列块，一定带上。锁本身只防两个进程同时推同一批：
+  没有它也不丢数据，只会重复发、服务端记 duplicate；持锁的进程被杀，最多卡 600 s 自动回收。
+
+代价写明：请求数从「攒满 100 条一次」变成大致每轮一次（加了调用 trace 之后一轮常常就超过 100 条，差得不多），每个请求 Collector 都去账户服务校验一次 token。
+仍会留在本机的只有：推送失败正在退避；按停止打断的那一轮（本来没有 hook，采集也要等下一个 hook）。回归 `tools/test-push.sh` 第 4、17 节。
 
 ### D14 — 全采正文：prompt、模型输出、thinking、工具参数与结果、system prompt 原样进事件，默认开、不脱敏（2026-09-16，现行；推翻 D5 的「正文只随分歧走」，09-17 补记）
 
@@ -732,7 +750,7 @@ Claude 在同一个 promptId 下接着干活、再来一次 Stop（`stop_hook_ac
 等不到才走上面的老路（按 Stop 当场关、被拦下后补一条 `stops` 更大的）。上限 config `stop_wait`，默认 10 s；本机实测（11 个会话 52 轮）标记比最后一条回复晚 p50 1.9 s、最大 3.9 s——「与 Stop 同一秒」的说法是按 hook 触发时刻看的，按记录时间它晚 2～4 秒。
 我们的 Stop hook 是 async、不拖慢别的 hook，多等这几秒人感觉不到；标记本来就在（重跑 Stop）不等。测试与沙箱演示用 `VIBETRAIL_STOP_WAIT=0` 关掉（它们的标记是事后追加的），K24 一节按真实时序（后台 Stop、1 秒后追加标记）钉着。
 
-### D6 — push 门槛：满 1 小时或 100 条才推，SessionEnd / SessionStart 兜底不看门槛（2026-09-15，现行）
+### D6 — push 门槛：满 1 小时或 100 条才推，SessionEnd / SessionStart 兜底不看门槛（2026-09-15；09-17 被 D15 推翻）
 
 用户原话：「时间和数量都要，比如满1小时就推一次或者攒够固定数量比如100，最后SessionEnd 和 SessionStart 补做时不看门槛，做兜底」。定了什么：
 
@@ -829,13 +847,12 @@ D2 的「正文与指针分开」在 D5 后反转：分歧事件自带能判责�
 | A7 | 装卸对称 | uninstall 后 `~/.claude/settings.json` 里的条目、`~/.vibetrail/bin` 与 state 还原；`--purge` 才删 spool |
 | A8 | **仓里零写入** | 装完、采完、卸完，被观测仓的工作树与 `.git/` 都不多任何文件（`git status` 与 `.git/hooks` 前后一致） |
 | A9 | **本机可看、但不留存** | 端点未配置：spool 里的文件人能直接打开读，且就是 push 会发的内容，`vibetrail push --list` 列出每一份与大小。配置后：ack 即删，spool 里只剩没传成的 |
-| A10 | push 不重不漏、按门槛发 | 端点未配置：不发、不删。配置后：每批 accepted + duplicate 等于发出的条数，每条事件先过协议 schema（09-17 实现改成：本地只挡不是 JSON 对象、没有合法 event_id、超 1 MiB 的，其余由服务端校验、按出错位置逐条隔离；完整 schema 校验在测试里）；断网期间的数据在网络恢复、退避期过后由后续 hook 补传，重发不产生重复（`event_id` 幂等）。门槛与兜底（D6）：不满 1 小时且不满 100 条的 Stop 不发；满任一条就发，且发的是全机待发；SessionEnd / SessionStart 不看门槛；退避期内所有触发点都不发；4xx 的块进隔离目录、不再重发、计数在 doctor 可见；两个 hook 同时推不产生重复也不丢块 |
+| A10 | push 不重不漏、及时发 | 端点未配置：不发、不删。配置后：每批 accepted + duplicate 等于发出的条数，每条事件先过协议 schema（09-17 实现改成：本地只挡不是 JSON 对象、没有合法 event_id、超 1 MiB 的，其余由服务端校验、按出错位置逐条隔离；完整 schema 校验在测试里）；断网期间的数据在网络恢复、退避期过后由后续 hook 补传，重发不产生重复（`event_id` 幂等）。推送时机（D15，推翻 D6 的门槛）：SessionStart / Stop / SessionEnd 跑完就推全机待发，UserPromptSubmit / PermissionRequest 不推；退避期内都不发；被拒收的只隔离那几条、不再重发、计数在 doctor 可见；锁撞上了等、全机最多一个在等，后写的块不被落下；两个进程同时推不丢块（重复由 event_id 幂等兜住） |
 | A11 | 完整性钉子 | 元数据 = 每类记录条数进出相等；分歧 = fixtures 全绿且映射后每条过 schema；hook = scenario.json 回放；未知记录类型 / 事件名告警；超过 1 MiB 被拒的事件计数（09-16 运行时部分做了：映射账本的 `new` 计数 → `integrity.json` → doctor，test-map 第 9b 节、test-hook-flow 第 22 节钉着；服务端拒收的计数随 push） |
 
 ## 10. 未定项
 
 只记在 [OPEN-ISSUES.md](OPEN-ISSUES.md)：U2 登记方式 · U4 端点 / token / 谁能看 · U5 spool 上限 ·
 U6 审计线去向 · U7 自建还是改造 Pilot · U8 类型化信号成不成 kind · U12 token 口径 · U13 自定义取值待 collector 确认 ·
-U17 push 门槛默认值 ·
 另有 K6 脱敏（暂缓）、G5（升为前置）、
 G8 / G9 / G6 / G11（G10 09-17 已钉）/ G12（Codex / Cursor，09-17 第一版已实现、待实测）。**push 之前要先改的**（09-16 对照采集端协议文档核出）**同日改完**：K17 `project_id` / `workspace_id`、K18 状态值、K19 `rule_version`、K24 拦停时不提前发 turn.end、U12 用量口径（§4.1 表里逐条标 ✅）；全采与协议补齐 K20–K23 也已做；全采正文的决策 09-17 补成 D14（K25）。U1 已定（scope 可配，默认 `project`）；U3 / U10 / K1 已由 D5 关闭。

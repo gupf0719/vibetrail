@@ -253,7 +253,7 @@ export function runCursorHook(event, raw) {
     }
     default: break;
   }
-  return event === 'stop' ? 'threshold' : event === 'sessionStart' || event === 'sessionEnd' ? 'force' : '';   // 交给 autoPush（D6）
+  return ['sessionStart', 'stop', 'sessionEnd'].includes(event) ? `cursor:${event}` : '';   // 这三处跑完就推（autoPush，D15）；调工具的那几个 hook 不推
 }
 
 // Cursor 同步等每个 hook：先写应答（beforeSubmitPrompt 要 continue，其余空对象），再丢后台。

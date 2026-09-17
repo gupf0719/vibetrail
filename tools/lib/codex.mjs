@@ -761,7 +761,7 @@ export function runCodexHook(event, raw) {
     }
     default: break;
   }
-  return event === 'Stop' ? 'threshold' : event === 'SessionStart' || event === 'SessionEnd' ? 'force' : '';   // 交给 autoPush（D6）
+  return ['SessionStart', 'Stop', 'SessionEnd'].includes(event) ? `codex:${event}` : '';   // 这三处跑完就推（autoPush，D15，同 Claude）
 }
 
 // vibetrail.mjs 调进来：同步的 hook 读完 stdin 就丢后台、自己立刻退出（stdout 为空，SessionStart / UserPromptSubmit 的输出会进模型上下文）

@@ -162,4 +162,4 @@ bash experiments/collect-demo/report.sh -o experiments/collect-demo/out/report.m
   一律被忽略，用户设置里 `disableAllHooks: true` 则是所有 hook 都不跑（安全模式同理）。两种情况下 hook 一次都不触发，而且**看不出异常**——
   spool 不涨、也没有错误日志。先跑一次 `vibetrail doctor`，它会直接点名是哪份文件里的哪个键。
 - **只采登记过的仓**：没登记的仓里开会话什么都不采；要采就 `projects pick` 选上。
-- **push**（09-17）：没配端点只落本机 spool；配了之后模型答完时按门槛推（全机最早待发超 1 小时或满 100 条），开会话、关会话时不看门槛推，发出去的块就删掉。`vibetrail push --list` 看待发与门槛，`vibetrail push` 立即推；服务端拒收的只隔离那几条，`vibetrail doctor` 会报。
+- **push**（09-17）：没配端点只落本机 spool；配了之后每轮答完、开会话（补做完）、关会话时就把全机待发的推上去，发出去的块就删掉，失败了按退避再试。`vibetrail push --list` 看待发，`vibetrail push` 立即推；服务端拒收的只隔离那几条，`vibetrail doctor` 会报。

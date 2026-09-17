@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// vibetrail 运行时入口（DESIGN D12）：按 argv 分发——map / map-file（映射器）、hook / hook-run（hook 分发，跑完按触发点 push）、
+// vibetrail 运行时入口（DESIGN D12）：按 argv 分发——map / map-file（映射器）、hook / hook-run（hook 分发，会话开始 / 每轮答完 / 会话结束跑完就 push，D15）、
 // 其余是 CLI 子命令（含 push）。
 //
 //   node vibetrail.mjs map --sid … --project-id … [--from-line N] … < <transcript 的字节切片>
@@ -160,7 +160,7 @@ if (cmd === 'map') {
   let payload = '';
   try { payload = await readStdin(); } catch { process.exit(0); }
   try {
-    // 干完活的那个进程（丢后台的同步 hook 是子进程 hook-run）接着按触发点推：Stop 看门槛，SessionStart / SessionEnd 不看门槛（D6、lib/push.mjs）
+    // 干完活的那个进程（丢后台的同步 hook 是子进程 hook-run）接着推：会话开始补做完、每轮答完、会话结束（D15、lib/push.mjs）
     let trigger = '';
     if (agentName) {
       const m = await import(agentName === 'codex' ? './lib/codex.mjs' : './lib/cursor.mjs');

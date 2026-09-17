@@ -1,5 +1,7 @@
-// vibetrail push：把本机 spool 按协议 1.0 批量推给 collector（DESIGN §4、D6；TODO G7 的 push 一项）。
+// vibetrail push：把本机 spool 按协议 1.0 批量推给 collector（DESIGN §4、D15；TODO G7 的 push 一项）。
 //
+// - 什么时候推（用户 09-17 定，D15，推翻 D6 的门槛）：会话开始补做完、每轮答完（Stop）、会话结束这三个 hook 跑完就推，不攒、不另起常驻进程——
+//   攒门槛会让最后几轮一直留在本机。一次限时 60 s，推不完下一次接着推；锁被占着就等它放开，已经有人在等就直接走（autoPush）。
 // - 批是 ack 单位，不是块（09-16 复核）：每块在 state/push/state.json 里记已了结到第几行（cursors），按批发、批 ack 推进，
 //   到末尾才删块；进程在 ack 与推进之间被杀最多重发一批，event_id 幂等兜住（服务端记 duplicate）。
 // - 一批最多 100 条、请求体不超 16 MiB，可以混多个项目、多个会话；从最早的块发起。同一批里同一个 event_id 只发第一条——
@@ -19,6 +21,10 @@ const envNum = (k, d) => (Number(process.env[k]) > 0 ? Number(process.env[k]) : 
 const MAX_REQUEST_BYTES = envNum('VIBETRAIL_PUSH_MAX_REQUEST_BYTES', 16 * 1024 * 1024);   // 协议：整个请求 ≤ 16 MiB；测试调小
 const TIMEOUT_MS = envNum('VIBETRAIL_PUSH_TIMEOUT_MS', 30000);  // 每个请求 30 s（DESIGN §4）；测试调小
 const DIE_AFTER_ACK = envNum('VIBETRAIL_PUSH_DIE_AFTER_ACK', 0); // 测试：第 N 次 ack 之后、记账之前直接退出，模拟被杀
+const BUDGET_MS = envNum('VIBETRAIL_PUSH_BUDGET_MS', 60000);    // hook 触发的一次推送最多跑多久；测试调小
+const LOCK_WAIT_MS = envNum('VIBETRAIL_PUSH_LOCK_WAIT_MS', 90000); // 锁被占着时最多等多久：限时 60 s + 一个请求的超时 30 s
+const WAITER_STALE_S = 150;                                     // 等锁的人的标记多久没刷新就算死了
+const STALE_PENDING_MS = 3600 * 1000;                           // doctor：待发的最早一块超过这么久就告警（说明一直没有 hook 触发或一直失败）
 const LOCK_STALE_S = 600;                                       // 机器级锁的陈旧阈值（DESIGN §4）；每发一个请求刷新一次，跑得久的手动 push 不会被当成陈旧
 const BACKOFF_BASE_S = 60, BACKOFF_CAP_S = 3600;
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
@@ -31,7 +37,6 @@ const readdir = (d) => { try { return fs.readdirSync(d).sort(); } catch { return
 const mkdirp = (p) => { try { fs.mkdirSync(p, { recursive: true }); return true; } catch { return false; } };
 const objOr = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
 const num = (v, d = 0) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : d);
-const confNum = (k, d) => { const s = vtConf(k, ''); const n = Number(s); return s !== '' && Number.isFinite(n) && n >= 0 ? n : d; };
 const isoNow = () => new Date().toISOString();
 export const maskToken = (t) => (t.length >= 16 ? `末 4 位 ${t.slice(-4)}` : `${t.length} 个字符`);   // 短的一位都不露
 
@@ -109,6 +114,19 @@ function pushLock() {
 }
 const touchLock = () => { try { const t = new Date(); fs.utimesSync(path.join(pushDir(), '.lock'), t, t); } catch {} };
 const pushUnlock = () => { try { fs.rmdirSync(path.join(pushDir(), '.lock')); } catch {} };
+// 等锁的人也用一把 mkdir 锁，全机最多一个在等：Cursor 每次调工具都有 hook，一串 hook 撞上一次慢推送时不会堆出一串等着的 node 进程
+function waiterLock() {
+  if (!mkdirp(pushDir())) return false;
+  const l = path.join(pushDir(), '.waiter');
+  try { fs.mkdirSync(l); return true; } catch {}
+  let age = 0;
+  try { age = (Date.now() - fs.statSync(l).mtimeMs) / 1000; } catch { return false; }
+  if (age > WAITER_STALE_S) { try { fs.rmdirSync(l); fs.mkdirSync(l); return true; } catch {} }
+  return false;
+}
+const touchWaiter = () => { try { const t = new Date(); fs.utimesSync(path.join(pushDir(), '.waiter'), t, t); } catch {} };
+const waiterUnlock = () => { try { fs.rmdirSync(path.join(pushDir(), '.waiter')); } catch {} };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 按块、按行往后读；游标到头还没删的块（上次删之前被杀）与空块记进 stale，随下一次记账删掉
 class Queue {
@@ -324,11 +342,13 @@ function logRun(rec) {                                          // logs/push.log
 }
 
 // 一次 push：扫全机 spool、混批、循环发。maxBatches / budgetMs 管这一次发多少（DESIGN §4、OPEN-ISSUES U17）
-export async function pushRun({ trigger = 'manual', maxBatches = Infinity, budgetMs = Infinity, ignoreBackoff = false, onBatch = null } = {}) {
+// onLocked：拿到锁之后、列块之前调（autoPush 的等锁人在这里放开等锁标记，保证之后写的块都在它列的范围里）
+export async function pushRun({ trigger = 'manual', maxBatches = Infinity, budgetMs = Infinity, ignoreBackoff = false, onBatch = null, onLocked = null } = {}) {
   const ep = pushEndpoint();
   if (!ep.url) return { result: ep.error ? 'bad_endpoint' : 'no_endpoint', error: ep.error };
   if (!ignoreBackoff && loadPushState().next_at > Date.now()) return { result: 'backoff' };
   if (!pushLock()) return { result: 'locked' };
+  if (onLocked) onLocked();
   const t0 = Date.now();
   const run = { url: ep.url, token: vtToken(), client: clientOf(), requests: 0, acks: 0,
     sum: { batches: 0, events: 0, accepted: 0, duplicate: 0, rejected: 0, sdk_failed: 0, count_mismatch: 0 } };
@@ -367,33 +387,26 @@ export async function pushRun({ trigger = 'manual', maxBatches = Infinity, budge
   return { result: stop ? 'stopped' : 'ok', stop, sum: run.sum, ms: Date.now() - t0 };
 }
 
-// 门槛（D6）：全机最早待发的块超过 push_max_age，或全机待发满 push_max_events 条。块名里的时间就是依据，不另记状态
-function thresholdReached(maxAgeMs, maxEvents) {
-  const blocks = listBlocks();
-  if (blocks.length === 0) return false;
-  if (Date.now() - blocks[0].at >= maxAgeMs) return true;
-  const cursors = loadPushState().cursors;
-  let n = 0;
-  for (let i = blocks.length - 1; i >= 0; i--) {                 // 从新的数起，数够就停，不把整个 spool 读一遍
-    n += Math.max(countLines(blocks[i].abs) - num(cursors[blocks[i].rel]), 0);
-    if (n >= maxEvents) return true;
-  }
-  return false;
-}
-
-// hook 跑完之后调：threshold = Stop（看门槛、一次最多 push_max_batches 批）；force = SessionStart 补做后、SessionEnd（不看门槛，限时 push_budget_s）。
-// 两种都看退避；端点没配就什么都不做
-export async function autoPush(trigger) {
-  if (trigger !== 'threshold' && trigger !== 'force') return;
+// hook 跑完之后调（D15：SessionStart / Stop / SessionEnd，trigger 是触发它的 hook 名，只进 push.log）。端点没配、在退避期、spool 里没有块就什么都不做。
+// 锁被占着：已经有人在等就直接走——那人拿到锁之后才列块，我们刚写的块一定在里面；没人等就自己等到锁放开再推，
+// 不然最后一轮的 Stop 撞上别的会话正在推，这一轮又留在本机（锁里那个推送开始时就列好了块，看不到后写的）
+export async function autoPush(trigger = 'hook') {
   try {
     if (!pushEndpoint().url) return;
     if (loadPushState().next_at > Date.now()) return;
-    if (trigger === 'threshold') {
-      if (!thresholdReached(confNum('push_max_age', 3600) * 1000, confNum('push_max_events', 100))) return;
-      await pushRun({ trigger, maxBatches: confNum('push_max_batches', 10) || 10 });
-    } else {
-      await pushRun({ trigger, budgetMs: (confNum('push_budget_s', 60) || 60) * 1000 });
-    }
+    if (listBlocks().length === 0) return;
+    const first = await pushRun({ trigger, budgetMs: BUDGET_MS });
+    if (first.result !== 'locked' || !waiterLock()) return;
+    let released = false;
+    const release = () => { if (!released) { released = true; waiterUnlock(); } };
+    try {
+      for (const until = Date.now() + LOCK_WAIT_MS; Date.now() < until;) {
+        await sleep(200);
+        touchWaiter();
+        const r = await pushRun({ trigger: `${trigger}(等锁)`, budgetMs: BUDGET_MS, onLocked: release });
+        if (r.result !== 'locked') return;
+      }
+    } finally { release(); }
   } catch { vtLogError('push', '', `push:${trigger}`, 1); }
 }
 
@@ -463,8 +476,7 @@ export function pushDoctor({ ok, note }) {
   }
   if (ep.url) {
     const p = pendingBySession();
-    const maxAge = confNum('push_max_age', 3600) * 1000;
-    if (p.events > 0 && Date.now() - p.oldest > 3 * maxAge) note(`待发 ${p.events} 条，最早的已等 ${fmtAgo(p.oldest)}（门槛 ${Math.round(maxAge / 60000)} 分钟）——一直失败或没有 hook 触发；立即推：vibetrail push`);
+    if (p.events > 0 && Date.now() - p.oldest > STALE_PENDING_MS) note(`待发 ${p.events} 条，最早的已等 ${fmtAgo(p.oldest)}——之后一直失败，或者再没有答完过一轮、开关过会话（这几处才推）；立即推：vibetrail push`);
     else if (p.events > 0) say(`  · 待发 ${p.events} 条，最早的 ${fmtAgo(p.oldest)} 前（vibetrail push --list）`);
   }
   const r = rejectedSummary();
@@ -485,10 +497,7 @@ function pushList() {
       say(`  ${pad(s.pkey.replace(/-[0-9a-f]{16}$/, ''), 28)} ${pad(s.sid.slice(0, 8), 10)} ${String(s.blocks).padStart(5)} ${String(s.events).padStart(8)} ${fmtBytes(s.bytes).padStart(9)}  ${fmtAt(s.oldest)}`);
     }
     say(`  共 ${p.sessions.length} 个会话、${p.blocks} 块、${p.events} 条`);
-    const maxAge = confNum('push_max_age', 3600) * 1000, maxEvents = confNum('push_max_events', 100);
-    const hit = Date.now() - p.oldest >= maxAge || p.events >= maxEvents;
-    say(`门槛：最早的 ${fmtAgo(p.oldest)} 前（push_max_age ${Math.round(maxAge / 60000)} 分钟）、待发 ${p.events} 条（push_max_events ${maxEvents}）`
-      + `→ ${!ep.url ? '端点没配，不推' : st.next_at > Date.now() ? `退避中，${fmtAt(st.next_at)} 之前自动触发都不推` : hit ? '下一次 Stop 会推' : '还没到，Stop 不推；开会话、关会话时照推'}`);
+    say(`最早的 ${fmtAgo(p.oldest)} 前写的 → ${!ep.url ? '端点没配，不推' : st.next_at > Date.now() ? `退避中，${fmtAt(st.next_at)} 之前 hook 都不推` : '下一次答完一轮、开会话或关会话就推（D15）'}`);
   }
   if (st.failures > 0 && st.last_error) say(`退避：连续失败 ${st.failures} 次（${describeStop(st.last_error)}），${st.next_at > Date.now() ? `${fmtAt(st.next_at)} 之前自动触发都不推` : '已过退避期'}`);
   if (identityHint(st)) say(`  ${identityHint(st)}`);

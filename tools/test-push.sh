@@ -1,5 +1,5 @@
 #!/bin/bash
-# 回归：push（TODO G7 的 push 一项、DESIGN §4 / D6）。临时目录当 ~/.vibetrail，对手是 tools/push-stub.mjs（只听 127.0.0.1）。
+# 回归：push（TODO G7 的 push 一项、DESIGN §4 / D15）。临时目录当 ~/.vibetrail，对手是 tools/push-stub.mjs（只听 127.0.0.1）。
 # spool 块直接按协议形状手搭（gen），hook 触发点用真实的 hook 入口跑（Stop / SessionStart / SessionEnd，登记过的临时仓）。
 # 断言尽量用 node，不依赖 jq。
 export LC_ALL=C
@@ -72,14 +72,14 @@ echo "════ 0. 准备：init、登记临时仓 ════"
 vt init --agents claude >/dev/null 2>&1
 ( cd "$REPO" && vt projects add >/dev/null 2>&1 )
 check "init 装了 lib/push.mjs、MANIFEST 列着它" '[ -f "$VT/bin/lib/push.mjs" ] && grep -q " lib/push.mjs$" "$VT/bin/MANIFEST"'
-check "config 有 device_id 与两个门槛，endpoint 为空" 'grep -q "^device_id=" "$VT/config" && grep -q "^push_max_age=3600$" "$VT/config" && grep -q "^push_max_events=100$" "$VT/config" && grep -q "^endpoint=$" "$VT/config"'
+check "config 有 device_id、endpoint 为空，不再写 D6 的两个门槛" 'grep -q "^device_id=" "$VT/config" && grep -q "^endpoint=$" "$VT/config" && ! grep -q "^push_max_" "$VT/config"'
 
 echo "════ 1. 端点没配：不发，spool 原样 ════"
 gen --pkey pa-0000000000000001 --sid sess-a --stamp "$(stamp_ago 7200)" --n 150
 out=$(vt push 2>&1); rc=$?
 check "vibetrail push：退出码 1、说端点没配置" '[ $rc -eq 1 ] && grep -q "端点没配置" <<<"$out"'
 hook Stop sess-hook
-check "Stop（门槛早就满了）也不发：spool 还是 150 条、没有 state/push" '[ "$(pending)" = 150 ] && [ ! -e "$VT/state/push/state.json" ]'
+check "Stop 也不发：spool 还是 150 条、没有 state/push" '[ "$(pending)" = 150 ] && [ ! -e "$VT/state/push/state.json" ]'
 out=$(vt push --list 2>&1)
 check "push --list：待发 150 条、「端点没配，不推」" 'grep -q "共 1 个会话、1 块、150 条" <<<"$out" && grep -q "端点没配，不推" <<<"$out"'
 out=$(vt doctor 2>&1)
@@ -109,30 +109,31 @@ gen --pkey pa-0000000000000001 --sid sess-a --stamp "$(now)" --n 40 --patch "$(n
 VIBETRAIL_PUSH_MAX_REQUEST_BYTES=20000 vt push >/dev/null 2>&1
 check "40 条全收到、每个请求 ≤ 20000 字节、至少 3 批" '[ "$(got)" = 40 ] && [ "$(rq "R.every((r)=>r.bytes<=20000)&&R.length>=3")" = true ]'
 
-echo "════ 4. Stop 看门槛：不满不发；全机满 100 条或最早的超 1 小时就推全机；一次最多 push_max_batches 批 ════"
+echo "════ 4. 会话开始 / 每轮答完 / 会话结束跑完就推（D15，推翻 D6 的门槛）：刚写的几条也推；UserPromptSubmit、PermissionRequest 不推，同一轮的 Stop 带上；一次限时，推不完下一次接着推 ════"
 restart_stub; reset_push
-gen --pkey pa-0000000000000001 --sid sess-a --stamp "$(now)" --n 60
+gen --pkey pa-0000000000000001 --sid sess-a --stamp "$(now)" --n 3
 hook Stop sess-hook
-check "60 条、刚写的：Stop 不发" '[ "$(reqs)" = 0 ] && [ "$(pending)" = 60 ]'
-gen --pkey pb-0000000000000002 --sid sess-b --stamp "$(now)" --n 40
+check "Stop：刚写的 3 条也推，不攒" '[ "$(got)" = 3 ] && [ "$(pending)" = 0 ]'
+gen --pkey pb-0000000000000002 --sid sess-b --stamp "$(now)" --n 2 --seed ups
+hook UserPromptSubmit sess-hook
+gen --pkey pb-0000000000000002 --sid sess-b --stamp "$(now)" --n 2 --seed perm
+hook PermissionRequest sess-hook
+check "UserPromptSubmit、PermissionRequest 跑完不推：请求数不变，事件留着（连它们自己写的 turn.start 与 permission_request）" '[ "$(reqs)" = 1 ] && [ "$(pending)" = 6 ]'
 hook Stop sess-hook
-check "两个项目合起来满 100 条：Stop 推，全发完" '[ "$(got)" = 100 ] && [ "$(pending)" = 0 ]'
-restart_stub
-gen --pkey pa-0000000000000001 --sid sess-a --stamp "$(stamp_ago 7200)" --n 3
+check "同一轮的 Stop 把它们一起推走" '[ "$(got)" = 9 ] && [ "$(pending)" = 0 ] && grep -q "ext.claude.permission_request" "$S/events.jsonl" && grep -q "\"turn.start\"" "$S/events.jsonl"'
+restart_stub; reset_push
+gen --pkey pa-0000000000000001 --sid sess-a --stamp "$(now)" --n 250
+printf 'slow\nslow\nslow\n' > "$S/plan"
+export VIBETRAIL_PUSH_BUDGET_MS=500
 hook Stop sess-hook
-check "只有 3 条、但最早的块是两小时前：Stop 推" '[ "$(got)" = 3 ] && [ "$(pending)" = 0 ]'
-restart_stub
-set_conf push_max_events 1000; set_conf push_max_batches 2
-gen --pkey pa-0000000000000001 --sid sess-a --stamp "$(stamp_ago 7200)" --n 250
-hook Stop sess-hook
-check "push_max_batches=2：Stop 只发两批，游标停在 200、块还在" '[ "$(got)" = 200 ] && [ "$(reqs)" = 2 ] && [ "$(st "Object.values(S.cursors).join()")" = 200 ] && [ "$(pending)" = 250 ]'
+unset VIBETRAIL_PUSH_BUDGET_MS
+check "一次限时（测试调到 0.5 s、每个请求 0.3 s）：发两批就停，游标停在 200、块还在" '[ "$(got)" = 200 ] && [ "$(reqs)" = 2 ] && [ "$(st "Object.values(S.cursors).join()")" = 200 ] && [ "$(pending)" = 250 ]'
 out=$(vt push --list 2>&1)
-check "push --list 只算没发的 50 条" 'grep -q "共 1 个会话、1 块、50 条" <<<"$out"'
+check "push --list 只算没发的 50 条，说下一次答完一轮、开关会话就推" 'grep -q "共 1 个会话、1 块、50 条" <<<"$out" && grep -q "下一次答完一轮、开会话或关会话就推" <<<"$out"'
 hook Stop sess-hook
-check "下一次 Stop 从 200 接着发，剩下 50 条收齐、块删掉、没有重复" '[ "$(got)" = 250 ] && [ "$(pending)" = 0 ] && [ "$(rq "R.reduce((s,r)=>s+r.count,0)")" = 250 ]'
-set_conf push_max_events 100; set_conf push_max_batches 10
+check "下一次 Stop 从 200 接着推完，块删掉、没有重复" '[ "$(got)" = 250 ] && [ "$(pending)" = 0 ] && [ "$(rq "R.reduce((s,r)=>s+r.count,0)")" = 250 ]'
 
-echo "════ 5. SessionStart / SessionEnd 兜底不看门槛 ════"
+echo "════ 5. SessionStart（补做完）/ SessionEnd 跑完也推 ════"
 restart_stub; reset_push
 gen --pkey pa-0000000000000001 --sid sess-a --stamp "$(now)" --n 3
 hook SessionStart sess-5
@@ -141,8 +142,7 @@ gen --pkey pa-0000000000000001 --sid sess-a --stamp "$(now)" --n 2 --seed sess-a
 hook SessionEnd sess-5
 check "SessionEnd：2 条 + session.end 都推了" '[ "$(got)" = 7 ] && [ "$(pending)" = 0 ] && grep -q "\"session.end\"" "$S/events.jsonl"'
 check "hook 发出的事件也过 schema" 'schema_ok < "$S/events.jsonl"'
-hook UserPromptSubmit sess-5
-check "UserPromptSubmit 不触发 push" '[ "$(reqs)" = 2 ]'
+
 
 echo "════ 6. 暂时失败：记失败与退避、数据不动；退避期内兜底也不发；手动 push 不看退避；成功后清零 ════"
 restart_stub; reset_push
@@ -331,6 +331,32 @@ echo 503 > "$S/plan"; vt push >/dev/null 2>&1
 check "换成别的错（503 INDEX_UNAVAILABLE）：从 1 重新数，不再点名换 token" '[ "$(st "S.same_error+\",\"+S.failures")" = "1,4" ] && ! grep -q "先换 token" <<<"$(vt doctor 2>&1)"'
 vt push >/dev/null 2>&1
 check "推成功：计数与失败次数清零、5 条收下" '[ "$(st "S.same_error+\",\"+S.failures")" = "0,0" ] && [ "$(got)" = 5 ]'
+
+echo "════ 17. 锁被占着：hook 等正在推的那个跑完再推（不然最后一轮会落下）；已经有人在等就直接走；等锁的标记死了能接手 ════"
+restart_stub; reset_push
+gen --pkey pa-0000000000000001 --sid sess-a --stamp "$(stamp_ago 60)" --n 300
+printf 'slow\nslow\nslow\n' > "$S/plan"
+( vt push > "$T/long.out" 2>&1 ) & lp=$!
+for _ in $(seq 100); do [ -d "$VT/state/push/.lock" ] && break; sleep 0.02; done
+gen --pkey pb-0000000000000002 --sid sess-b --stamp "$(now)" --n 4 --seed late
+hook Stop sess-late
+wait "$lp"
+check "Stop 撞上正在推的：等锁放开后把后写的 4 条推了，共 304 条、没有重复、spool 清空、等锁标记收走" '[ "$(got)" = 304 ] && [ "$(rq "R.reduce((s,r)=>s+r.count,0)")" = 304 ] && [ "$(pending)" = 0 ] && [ ! -d "$VT/state/push/.waiter" ]'
+restart_stub; reset_push
+gen --pkey pa-0000000000000001 --sid sess-a --stamp "$(stamp_ago 60)" --n 300
+printf 'slow\nslow\nslow\n' > "$S/plan"
+( vt push > "$T/long.out" 2>&1 ) & lp=$!
+for _ in $(seq 100); do [ -d "$VT/state/push/.lock" ] && break; sleep 0.02; done
+mkdir -p "$VT/state/push/.waiter"
+gen --pkey pb-0000000000000002 --sid sess-b --stamp "$(now)" --n 2 --seed late2
+t0=$(node -e 'console.log(Date.now())'); hook Stop sess-late2; t1=$(node -e 'console.log(Date.now())')
+wait "$lp"
+check "已经有人在等：这个 hook 不等、马上走（< 0.7 s），它的 2 条留给在等的那个" '[ $((t1 - t0)) -lt 700 ] && [ "$(pending)" = 2 ] && [ "$(got)" = 300 ]'
+mkdir -p "$VT/state/push/.lock"; touch -t 202001010000 "$VT/state/push/.waiter"
+( sleep 0.6; rmdir "$VT/state/push/.lock" ) & rl=$!
+hook Stop sess-late2
+wait "$rl"
+check "锁被占着、等锁的标记很久没刷新（那个进程死了）：接手等锁，锁一放开就把 2 条推了、标记收走" '[ "$(got)" = 302 ] && [ "$(pending)" = 0 ] && [ ! -d "$VT/state/push/.waiter" ] && [ ! -d "$VT/state/push/.lock" ]'
 
 echo
 [ "$skipped_schema" -gt 0 ] && echo "（没装 python jsonschema，跳过 $skipped_schema 项 schema 校验）"
