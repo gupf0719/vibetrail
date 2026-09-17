@@ -16,8 +16,8 @@
 ## 0. 一句话
 
 **机器级装一次**，之后每个 Claude Code 会话由 hook 自动采两路数据——**人机分歧**（打断、拒绝，带能判责的最小正文）和**轮次元数据**
-（会话 / 轮次 / 子 agent 的起止、每轮起止的 HEAD 与 commit、状态、token 用量，不带正文）——映射成 paas-coding-hook 事件协议 1.0 的事件，
-写进本机 outbox，经 HTTP push 到云端，ack 即删。**不传 transcript 原文件**，非分歧的消息与工具正文、thinking 都不传（§7 D5）。
+（会话 / 轮次 / 子 agent 的起止、每轮起止的 HEAD 与 commit、状态、token 用量、每次模型调用与工具调用的 trace）——映射成 paas-coding-hook 事件协议 1.0 的事件，
+写进本机 outbox，经 HTTP push 到云端，ack 即删。**2026-09-16 起默认全采正文**：人的 prompt、模型输出、thinking、工具参数与结果、system prompt、CLAUDE.md 原样进事件，不脱敏；`capture_content=0` 回到只带元数据（§7 D14，推翻 D5 的「正文只随分歧走」）。**不传 transcript 原文件**（§7 D5）：正文是按协议事件逐条带的，不是整份文件。
 被观测仓里**零写入**：不进 git、不写它的 settings、不装 git hook、不放运行时。
 
 用户原话，按时间：
@@ -28,6 +28,7 @@
 - 09-14：「项目级和用户级都要，可配置的，参考teamai，不存git了，不要clone一次装一次，未来会push云端，暂时先缓存本地文件让我看输出内容，保留push动作。然后和teamai一样，装一次就行」
 - 09-14：「我们应该也不把hook写进仓，之前的做法不需要」「现在我们的目标就是通过hook把数据传上去，尽量本地不要存太多东西」「如果不是常驻进程，用不到go吧」
 - 09-14：「它没说transcript正文要进表吧？你在哪看到的」
+- 09-16：「我们也改成要采，全采，prompt、输出、thinking、工具参数与结果 全文零截断 开、不脱敏」（D14）
 - 09-15：「不用传全量的transcript文本，有必要吗」「正文的话，人机分歧先看看能不能带正文吧，其他的先不考虑，不然数据量有点大。如果后面有必要再补充」「数据30天没问题，超过一个月复盘意义不大」「读取不是我们读，我们只负责采，读取分析由其他服务完成」「turn.end 推荐 code，其实是自定义的，不是枚举的，interrupted我们可以直接加」「U1 默认 scope 取 project。意思是项目级别还是用户级别，这个是可配置项把，默认项目级别。参考teamai」
 
 ## 1. 要解决的问题
@@ -43,21 +44,21 @@ Claude Code 已经把每轮对话、thinking 全文、每次 Edit 的 diff、每
 复盘要回答两问：**这个 commit 是怎么来的**；**出问题时人和 agent 在哪一步对不上**。答案都在 transcript 里，所以要做的是把答这两问要的那部分
 （分歧及其上下文、每轮的 commit 关系）可靠地采出来、送到能查的地方，而不是自建一层采集；读取与分析由别的服务做（用户 09-15）。
 
-## 2. 采什么：分歧带正文，其余只有元数据
+## 2. 采什么：两路数据，09-16 起默认全采正文
 
 | 路 | 采什么 | 正文 | 形态 |
 |---|---|---|---|
 | **人机分歧** | [spec/diverge-v1.md](spec/diverge-v1.md) 的 5 类 kind，映射成协议事件（§4.1） | **带**能判责的最小上下文：被拒调用的工具输入（命令 / 编辑内容）与拒绝原文；被打断的那条模型回复与打断后人的下一句 | 事件，每条 KB 级 |
-| **轮次元数据** | session / turn / subagent 的起止事件；每轮起止的 HEAD、分支、脏否与 `rev-list` 出的 commit（§3.5）；轮次状态、model、token 用量；**调用 trace**（09-15 加，D8）：每次模型调用一条（model、这次的 token、stop_reason、调了哪些工具、请求起止），每次工具调用一条（工具名、成功 / 出错 / 取消、耗时）；`InstructionsLoaded` / `CwdChanged` / `StopFailure` 等 hook 事件头（事件名、时间、`tool_use_id`、错误类型、reason、`agent_id`） | **不带**：非分歧轮次的消息、工具输入输出、thinking、system prompt、CLAUDE.md 正文都不传 | 事件，每轮几条到几十条、每条百字节级 |
+| **轮次元数据** | session / turn / subagent 的起止事件；每轮起止的 HEAD、分支、脏否与 `rev-list` 出的 commit（§3.5）；轮次状态、model、token 用量；**调用 trace**（09-15 加，D8）：每次模型调用一条（model、这次的 token、stop_reason、调了哪些工具、请求起止），每次工具调用一条（工具名、成功 / 出错 / 取消、耗时）；API 出错、CLAUDE.md 加载、切目录（09-16 起从 transcript 推，D13；原先是 `InstructionsLoaded` / `CwdChanged` / `StopFailure` 等 hook 事件头） | **09-16 起默认带**（D14）：人的 prompt、每次模型调用的输出与 thinking、工具参数与结果、system prompt、CLAUDE.md 正文；`capture_content=0` 时不带（D5 的口径） | 事件，每轮几条到几十条、每条百字节级 |
 
 **不传 transcript 原文件**（§7 D5）。两路按会话 id 关联——transcript 文件名与 hook 的 `session_id` 是同一个值——走同一条通道。分歧一路的提取仍是
 diverge-v1 那份 jq，转成事件是它之后的一步。「后面有必要再补充」的口子留着：协议的 message.* / tool.* 与 ext.* 事件都在，要补正文时只是多映射几类记录，
-采集端不用换形态。
+采集端不用换形态。09-16 这个口子用上了：全采正文（D14）就是多映射了这几类，形态没换。
 
 ### 2.1 「采全」的定义：人类侧一条不漏，靠条数对账
 
 上一版把「采全」定义成 transcript 逐字节复制上云，为的是躲 Pilot 的坑；2026-09-15 用户否掉（数据量大，两问用不上），见 §7 D5。
-现在「全」只对分歧成立：**人类侧每一条打断、拒绝都进事件**，钉子是每类 transcript 记录进多少条、出多少条事件（A2、A11），不是字节相等。
+现在「全」只对分歧成立（09-16 全采正文之后，正文也按记录全带，但「全」的钉子仍是条数对账，D14）：**人类侧每一条打断、拒绝都进事件**，钉子是每类 transcript 记录进多少条、出多少条事件（A2、A11），不是字节相等。
 Pilot 的坑照样要防：它把 transcript 规范化成事件，模型与工具一侧全、人类一侧漏——打断 265 条只进 5 条，每轮第一条人类输入
 1,599 条丢 154 条（[Pilot 采集清单 §1.2b](third-party/loongsuite-pilot-collection.md)）。根因是它按 promptId 分轮、只读 `user` / `assistant`
 两种记录，而原始 transcript 里的记录类型远不止这两种。解析器要按记录逐条走、不按轮分组。本机清单（2026-09-14，40 个主会话 / 676 个子 agent 文件 / 700 MB，
@@ -170,7 +171,7 @@ G6 的哨兵改由语料里「已知清单之外的 `type` / `attachment.type`�
   保住「从本轮开头读」的代价；没有新字节时只比 inode、不算哈希（一个会话几十个子 agent 文件）。代价写明：只改了中间、大小又不变的原地改写查不出来。
   transcript 目前是 append-only，但 `file-history-snapshot` 带 `isSnapshotUpdate` 字段，不能假设永远是。
 - 首次全读、无单次上限。Pilot 首次只读最后一轮、单次超过 50 MB 只读尾部，那份 111 MB 的会话前段整个丢掉，4 条拒绝没了；
-  teamai 超过 50 MB 整份不扫。两种上限都会丢分歧，不学。
+  teamai 超过 50 MB 整份不扫。两种上限都会丢分歧，不学。**现状与这条相反**：09-16 全采那一批照 Pilot 加了单次 50 MB 上限（`hook.mjs` 的 `MAX_READ_BYTES`，超了从尾部读、对齐行首，截掉的字节进 A11 计数、doctor 点名），要不要保留待定（OPEN-ISSUES U18）。
 - 子 agent 文件按 `<sid>/subagents/` 目录扫，不只信 hook 递来的那一个路径——teamai 栽在这里，58% 的人拒在子 agent 文件里
   （[对比 §3.2](third-party/teamai-cli-vs-vibetrail.md)）。
 - 产物写临时文件 + 原子 rename；每个会话一个目录，多 worktree 并发不共享文件。同一会话的几次 hook 可能重叠（大会话首次整读约 12 s，
@@ -454,6 +455,44 @@ hook 的输入里没有 system prompt（2.1.260 的 33 种 hook 事件、34 处�
 
 ## 7. 决策记录
 
+### D14 — 全采正文：prompt、模型输出、thinking、工具参数与结果、system prompt 原样进事件，默认开、不脱敏（2026-09-16，现行；推翻 D5 的「正文只随分歧走」，09-17 补记）
+
+用户原话，09-16 按时间：「看下pilot有没有采input,output」「我们也改成要采，全采，prompt、输出、thinking、工具参数与结果 全文零截断 开、不脱敏」
+「出到 OTel 语义约定时对应 gen_ai.input.messages / gen_ai.input.messages_delta / gen_ai.output.messages（含 reasoning），另有 gen_ai.system_instructions、gen_ai.tool.call.arguments、gen_ai.tool.call.result。这个也是」；
+问到放在哪、已经采过的要不要重采、默认开不开时，答「放"payload"可以吗，还是extensions更合适」、选了「不重采，只对新会话生效」与「默认开，config 留 capture_content 开关」；另说「全采的问题可以看下pilot」。
+
+背景：D5（09-15）定「正文只在分歧事件上带」，理由是数据量。Pilot 的 `captureMessageContent` 默认就是 true、全采不脱敏（[采集清单 §5](third-party/loongsuite-pilot-collection.md)）。
+
+**定了什么**：
+
+| 内容 | OTel 语义约定 | 协议事件与字段 |
+|---|---|---|
+| 人的 prompt | `gen_ai.input.messages` | `message.user.payload.text`（模型干活时排队插进来的，`delivery` = queued，K20） |
+| 模型输出 | `gen_ai.output.messages` | 每次模型调用一条 `message.assistant`，`payload.text` 是这次的输出 |
+| thinking | `gen_ai.output.messages` 里的 reasoning | `message.assistant.extensions["vibetrail.reasoning"]`——协议「不得把 reasoning 伪装成普通 Assistant 文本」，payload 又不许加字段 |
+| 工具参数 | `gen_ai.tool.call.arguments` | `tool.request.payload.input`（每次调用一条） |
+| 工具结果 | `gen_ai.tool.call.result` | `tool.end.payload.output` |
+| system prompt | `gen_ai.system_instructions` | `ext.claude.prompt_snapshot`：payload 只有 bytes 与 sha256，正文进 `extensions["vibetrail.system_prompt"]`，按 sha256 去重（一个会话快照几十次只发一条；≥ 2.1.258 的 transcript 才有，`c18e52d`） |
+| CLAUDE.md 与 auto memory | —— | `ext.claude.instructions_loaded`，正文进 `extensions["vibetrail.instructions"]`（D13） |
+| 子 agent 的任务与最后的回答 | —— | `subagent.start.payload.task`、`subagent.end.payload.last_message` |
+
+`gen_ai.input.messages_delta`（每次调用新增的输入）不另拼：transcript 里每条记录只发一次，按轮次、调用 id 与时间能还原每次调用看到了什么。
+
+- **放哪**：协议有字段的放 payload（text / input / output / task / last_message）；协议没有字段的（thinking、system prompt、CLAUDE.md）进 extensions 或扩展事件——
+  标准 payload 是 `additionalProperties: false`，自造字段会被 schema 拒。
+- **默认开**，`~/.vibetrail/config` 写 `capture_content=0` 回到 D5 的只带元数据（分歧事件照旧带最小正文）；init 与 doctor 都说当前是哪种。
+- **不重采**：开关只影响之后读到的记录，已经读过的不回头（offset 只往前走）。
+- **不脱敏**：`policy_version` 仍填 `none-0`，K6 暂缓不变。
+- **单条超限**：协议单条 1 MiB。序列化后超过 1 MiB − 1 KiB 的事件去掉正文（text / input / output / task / last_message、reasoning / system_prompt / instructions、raw），
+  标 `content_state` = omitted 与 `vibetrail.content_dropped` = size，事件本身照发；条数进 A11 计数、doctor 汇总。
+- **体积**：本机 8 份真实 transcript 共 48 MB，全采 11 MB、只带元数据 3 MB（§4 体积行，K15⑤）。
+- **单次读上限**：同一批改动照 Pilot 加了「单次最多读 50 MB，超了从尾部读、对齐行首」（`hook.mjs` 的 `MAX_READ_BYTES`），与 §3.3 原先「首次全读、无单次上限，Pilot 的上限不学」相反；
+  截掉的字节进 A11 计数、doctor 点名。要不要保留待定（OPEN-ISSUES U18）。
+
+代价：出本机的是全部正文（K6：云端默认全公司可见，已提意见）；spool 体积约是只带元数据的 3～4 倍（U5）。
+实现：`763e566`（四样进协议字段、thinking 进扩展、默认开）、`c18e52d`（system prompt）、D13（CLAUDE.md）、`a34bbf5`（K20 排队的人话、K23 关掉全采时不带 task）。
+回归：test-map 第 6 节（四类正文、thinking、1 MiB、开关走 config、system prompt）。
+
 ### D13 — 只挂 5 个 hook：另外 8 个能给的改在 Stop 时从 transcript 推（2026-09-16，现行）
 
 用户原话，按时间：「U16 要定的是 PermissionDenied / StopFailure / InstructionsLoaded / CwdChanged 这四个默认登不登记。这四个重要吗」
@@ -702,13 +741,13 @@ Claude 在同一个 promptId 下接着干活、再来一次 Stop（`stop_hook_ac
 代价写明：最坏情况是最后一个会话剩下不到 100 条、又不到 1 小时、SessionEnd 没推成，要等下一次开会话才推；与 teamai 等下一次 pull 一样，只在边角出现。
 换来的是请求数从每轮一次降到每小时量级、批更满。多出三样东西：机器级锁、退避记录、两个配置项。
 
-### D5 — 不传 transcript 原文件；正文只随人机分歧事件走；云端定为 paas-coding-hook 协议 1.0；保留 30 天够用（2026-09-15，现行）
+### D5 — 不传 transcript 原文件；正文只随人机分歧事件走；云端定为 paas-coding-hook 协议 1.0；保留 30 天够用（2026-09-15；「正文只随分歧走」09-16 被 D14 推翻，其余现行）
 
 用户原话见 §0。定了什么：
 
 - **全量一路改为轮次元数据。** 09-14 写进 §2 的「原始 transcript 逐字节副本上云」撤销：用户当天已质疑「它没说 transcript 正文要进表吧」，09-15 明确
   「不用传全量的 transcript 文本」。理由是数据量，两问也用不上。
-- **正文只在分歧事件上带**：被拒调用的输入与拒绝原文、被打断的回复与打断后的人话。其余（非分歧消息、工具输入输出、thinking、system prompt、CLAUDE.md）
+- ~~**正文只在分歧事件上带**~~（09-16 被 D14 推翻，现在默认全采，`capture_content=0` 才是这里的口径）：被拒调用的输入与拒绝原文、被打断的回复与打断后的人话。其余（非分歧消息、工具输入输出、thinking、system prompt、CLAUDE.md）
   不传，「如果后面有必要再补充」——协议的 message.* / tool.* 事件留着这个口子。
 - **云端就是 paas-coding-hook 的 collector**，采集端映射成协议事件（§4.1）。`turn.end` 的 status.code 是自定义值，`interrupted` 直接用，不等服务端。
   U3 关闭，U4 只剩端点与 token。
@@ -791,6 +830,6 @@ D2 的「正文与指针分开」在 D5 后反转：分歧事件自带能判责�
 
 只记在 [OPEN-ISSUES.md](OPEN-ISSUES.md)：U2 登记方式 · U4 端点 / token / 谁能看 · U5 spool 上限 ·
 U6 审计线去向 · U7 自建还是改造 Pilot · U8 类型化信号成不成 kind · U9 Codex / Cursor · U12 token 口径 · U13 自定义取值待 collector 确认 ·
-U17 push 门槛默认值 ·
+U17 push 门槛默认值 · U18 单次读 50 MB 上限要不要留 ·
 另有 K6 脱敏（暂缓）、G5（升为前置）、
-G8 / G9 / G6 / G10 / G11。**push 之前要先改的**（09-16 对照采集端协议文档核出）**同日改完**：K17 `project_id` / `workspace_id`、K18 状态值、K19 `rule_version`、K24 拦停时不提前发 turn.end、U12 用量口径（§4.1 表里逐条标 ✅）；全采与协议补齐 K20–K23 也已做；本文还没记全采正文的决策：K25。U1 已定（scope 可配，默认 `project`）；U3 / U10 / K1 已由 D5 关闭。
+G8 / G9 / G6 / G11（G10 09-17 已钉）。**push 之前要先改的**（09-16 对照采集端协议文档核出）**同日改完**：K17 `project_id` / `workspace_id`、K18 状态值、K19 `rule_version`、K24 拦停时不提前发 turn.end、U12 用量口径（§4.1 表里逐条标 ✅）；全采与协议补齐 K20–K23 也已做；全采正文的决策 09-17 补成 D14（K25）。U1 已定（scope 可配，默认 `project`）；U3 / U10 / K1 已由 D5 关闭。
