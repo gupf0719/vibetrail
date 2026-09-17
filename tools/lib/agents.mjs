@@ -165,6 +165,25 @@ export const isOurs = (cmd) => String(cmd ?? '').includes('vibetrail-hook');
 const canon = (v) => JSON.stringify(v, (k, x) => (isObj(x) ? Object.fromEntries(Object.keys(x).sort().map((y) => [y, x[y]])) : x));
 export const sameJson = (a, b) => canon(a) === canon(b);
 
+// 改用户的文本配置（Codex 的 config.toml）：写前后各核一次没被别人改过、改前备份（0600）、临时文件 + rename、保留原来的权限
+export function writeTextGuarded(file, before, next, tag) {
+  const bk = path.join(VT_HOME, 'backup');
+  mkdirp(bk); mkdirp(path.dirname(file));
+  if ((readText(file) ?? '') !== before) return false;
+  let mode = 0o600; try { mode = fs.statSync(file).mode & 0o777; } catch {}
+  if (before !== '') {
+    const orig = path.join(bk, `${tag}.before-vibetrail`);
+    if (!fs.existsSync(orig)) fs.writeFileSync(orig, before, { mode: 0o600 });
+    fs.writeFileSync(path.join(bk, `${tag}.${new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z')}-${process.pid}`), before, { mode: 0o600 });
+  }
+  const tmp = `${file}.vibetrail.tmp`;
+  fs.writeFileSync(tmp, next, { mode });
+  try { fs.chmodSync(tmp, mode); } catch {}
+  if ((readText(file) ?? '') !== before) { try { fs.unlinkSync(tmp); } catch {} return false; }
+  fs.renameSync(tmp, file);
+  return true;
+}
+
 export function readHostJson(file) {                   // 没有文件是 {}；读不懂返回 null（不去改一份读不懂的配置）
   if (!isFile(file) || fs.statSync(file).size === 0) return {};
   const v = readJson(file, undefined);

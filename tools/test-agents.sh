@@ -79,6 +79,20 @@ check "doctor 按哈希核信任：Stop 的记录与当前条目对不上 → �
 mk_trust ""; out=$(vt doctor 2>&1)
 check "doctor：5 条哈希都对上 → 报都已信任" 'grep -q "5 条 hook 都已信任，哈希与当前条目一致" <<<"$out"'
 
+# init 引导信任（用户 09-17 定）：不在终端里、没带参数只提示；--trust-codex-hooks 才写，只加我们的表、用户原来的内容留着；不再选 Codex 时删掉
+printf '# 我的 Codex 配置\nmodel = "gpt-5"\n\n[projects."/tmp/x"]\ntrust_level = "trusted"\n' > "$T/codex/config.toml"
+out=$(vt init 2>&1)
+check "init 不在终端里、没带 --trust-codex-hooks：不写 config.toml，提示去设置里信任" 'grep -q "还没信任，不会跑" <<<"$out" && ! grep -q "hooks.state" "$T/codex/config.toml"'
+out=$(vt init --trust-codex-hooks 2>&1)
+check "init --trust-codex-hooks：只加我们的 5 张信任表，用户原来的注释与设置原样留着；doctor 按哈希核全对" \
+  'grep -q "记为已信任" <<<"$out" && [ "$(grep -c "^\[hooks\.state\." "$T/codex/config.toml")" = 5 ] && grep -q "^# 我的 Codex 配置" "$T/codex/config.toml" && grep -q "^trust_level = \"trusted\"" "$T/codex/config.toml" && grep -q "5 条 hook 都已信任" <<<"$(vt doctor 2>&1)"'
+sum3=$(cksum < "$T/codex/config.toml"); out=$(vt init --trust-codex-hooks 2>&1)
+check "再跑一次：都已信任，config.toml 一个字节都不改" '[ "$(cksum < "$T/codex/config.toml")" = "$sum3" ] && grep -q "Codex 的 hook 都已信任" <<<"$out"'
+out=$(vt init --agents claude,cursor 2>&1)
+check "不再选 Codex：删掉我们的 5 张信任表与 hooks.json 里的条目，用户自己的配置留着" \
+  '[ "$(grep -c "^\[hooks\.state\." "$T/codex/config.toml")" = 0 ] && grep -q "^# 我的 Codex 配置" "$T/codex/config.toml" && ! grep -q vibetrail-hook "$T/codex/hooks.json"'
+vt init --agents claude,codex,cursor >/dev/null 2>&1
+
 echo "════ 2. Codex：未登记的仓零写入 ════"
 SID0=019a0000-0000-7000-8000-00000000aaaa
 hook codex SessionStart "$(jq -n -c --arg cwd "$OTHER" --arg sid "$SID0" '{session_id: $sid, cwd: $cwd, transcript_path: "", hook_event_name: "SessionStart", model: "gpt-5-codex", source: "startup"}')"
@@ -105,8 +119,18 @@ add '{"timestamp":"2026-09-17T02:00:02.700Z","type":"response_item","payload":{"
 add '{"timestamp":"2026-09-17T02:00:03.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"call_2","input":"*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch"}}'
 add '{"timestamp":"2026-09-17T02:00:03.200Z","type":"token_usage_record","payload":{"turn_id":"t1","response_id":"resp_2","usage":{"input_tokens":1200,"cached_input_tokens":1000,"output_tokens":30,"reasoning_output_tokens":0},"turn_token_usage":{"input_tokens":2200,"cached_input_tokens":1800,"output_tokens":80,"reasoning_output_tokens":20}}}'
 add '{"timestamp":"2026-09-17T02:00:03.500Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_2","output":{"content":"Success. Updated the following files:\nA a.txt","success":true}}}'
+add '{"timestamp":"2026-09-17T02:00:03.600Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{\"task_name\":\"explorer\",\"message\":\"看看 a.txt 写对没有\"}","call_id":"call_s1"}}'
+add '{"timestamp":"2026-09-17T02:00:03.700Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_s1","output":"{\"task_name\":\"/root/explorer\"}"}}'
+add '{"timestamp":"2026-09-17T02:00:03.800Z","type":"response_item","payload":{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"codex hooks"}}}'
 # 子 agent：独立 rollout，source 指回父线程，root_turn_id 是父会话这一轮
-printf '%s\n' "$(jq -n -c --arg id "$CHILD" --arg sid "$SID" --arg cwd "$REPO" '{timestamp: "2026-09-17T02:00:04.000Z", type: "session_meta", payload: {id: $id, cwd: $cwd, originator: "codex_cli_rs", cli_version: "0.154.0", history_mode: "paginated", source: {subagent: {thread_spawn: {parent_thread_id: $sid, depth: 1, agent_role: "explorer"}}}}}')" > "$RC"
+printf '%s\n' "$(jq -n -c --arg id "$CHILD" --arg sid "$SID" --arg cwd "$REPO" '{timestamp: "2026-09-17T02:00:04.000Z", type: "session_meta", payload: {id: $id, cwd: $cwd, originator: "codex_cli_rs", cli_version: "0.154.0", history_mode: "paginated", source: {subagent: {thread_spawn: {parent_thread_id: $sid, depth: 1, agent_role: "explorer", agent_path: "/root/explorer"}}}}}')" > "$RC"
+# 桌面版多 agent 的子 agent 文件：自己的 session_meta 后面抄了一份父会话的 meta 与历史（Pilot 夹具的结构），这些不能再发一遍（codex-v4）
+printf '%s\n' "$(jq -n -c --arg sid "$SID" --arg cwd "$REPO" '{timestamp: "2026-09-17T02:00:00.000Z", type: "session_meta", payload: {id: $sid, cwd: $cwd, originator: "codex_cli_rs", cli_version: "0.154.0", history_mode: "paginated", source: "cli", base_instructions: "You are Codex."}}')" >> "$RC"
+for l in '{"timestamp":"2026-09-17T02:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}' \
+         '{"timestamp":"2026-09-17T02:00:01.300Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"t1","item":{"type":"UserMessage","id":"u1","content":[{"type":"text","text":"加一个 a.txt"}]}}}' \
+         '{"timestamp":"2026-09-17T02:00:02.100Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"ls\"]}","call_id":"call_1"}}' \
+         '{"timestamp":"2026-09-17T02:00:02.200Z","type":"token_usage_record","payload":{"turn_id":"t1","response_id":"resp_1","usage":{"input_tokens":1000,"output_tokens":50}}}' \
+         '{"timestamp":"2026-09-17T02:00:02.700Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"README"}}'; do printf '%s\n' "$l" >> "$RC"; done
 for l in '{"timestamp":"2026-09-17T02:00:04.100Z","type":"event_msg","payload":{"type":"task_started","turn_id":"c1"}}' \
          '{"timestamp":"2026-09-17T02:00:04.200Z","type":"turn_context","payload":{"turn_id":"c1","root_turn_id":"t1","model":"gpt-5-codex-mini"}}' \
          '{"timestamp":"2026-09-17T02:00:04.300Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"c1","item":{"type":"UserMessage","id":"cu1","content":[{"type":"text","text":"看看 a.txt 写对没有"}]}}}' \
@@ -125,13 +149,14 @@ check "t1：turn.end completed，用量取 turn_token_usage（input 含缓存、
 check "t1：轮中那次提交进 commits，apply_patch 新建的 a.txt 进 files（evidence tool_result）" \
   '[ "$(jq -c "map([(.commits | length), .files])" <<<"$T1END")" = "[[1,[{\"path\":\"a.txt\",\"operation\":\"create\",\"evidence\":\"tool_result\"}]]]" ]'
 check "t1：三次模型响应各一条 message.assistant，带用量与调了哪些工具；reasoning 进 extensions 不当正文" \
-  '[ "$(q "map(select(.type == \"message.assistant\" and .turn_id == \"t1\" and .agent_instance_id == \"main\")) | map([.extensions[\"vibetrail.call\"].usage.input_tokens, .extensions[\"vibetrail.call\"].tool_calls, (.payload.text // null), (.extensions[\"vibetrail.reasoning\"] // null)])")" = "[[1000,[\"shell\"],null,\"先看看目录\"],[1200,[\"apply_patch\"],null,null],[1300,[],\"加好了\",null]]" ]'
+  '[ "$(q "map(select(.type == \"message.assistant\" and .turn_id == \"t1\" and .agent_instance_id == \"main\")) | map([.extensions[\"vibetrail.call\"].usage.input_tokens, .extensions[\"vibetrail.call\"].tool_calls, (.payload.text // null), (.extensions[\"vibetrail.reasoning\"] // null)])")" = "[[1000,[\"shell\"],null,\"先看看目录\"],[1200,[\"apply_patch\"],null,null],[1300,[\"spawn_agent\",\"web_search\"],\"加好了\",null]]" ]'
 check "t1：人话只认 UserMessage（注入的 environment_context 不算），delivery direct" \
   '[ "$(q "map(select(.type == \"message.user\" and .agent_instance_id == \"main\" and .turn_id == \"t1\")) | map([.payload.author_type, .payload.delivery, .payload.text])")" = "[[\"human\",\"direct\",\"加一个 a.txt\"]]" ]'
-check "t1：两次工具调用各一条 tool.request（全采带参数）与 tool.end（succeeded）" \
-  '[ "$(q "[(map(select(.type == \"tool.request\" and .turn_id == \"t1\")) | length), (map(select(.type == \"tool.end\" and .turn_id == \"t1\" and .agent_instance_id == \"main\")) | map(.payload.status.code))]")" = "[2,[\"succeeded\",\"succeeded\"]]" ]'
-check "子 agent：挂父会话、实例是子线程 id、父实例 main、轮次是父会话的 t1，类型取 agent_role，派活是 injected" \
-  '[ "$(q "map(select(.agent_instance_id == \"'"$CHILD"'\")) | map(select(.type | test(\"^subagent|message.user\"))) | map([.type, .session_id == \"'"$SID"'\", .parent_agent_instance_id, .turn_id, (.payload.agent_type // .payload.delivery)])")" = "[[\"subagent.start\",true,\"main\",\"t1\",\"explorer\"],[\"message.user\",true,\"main\",\"t1\",\"injected\"],[\"subagent.end\",true,\"main\",\"t1\",\"explorer\"]]" ]'
+check "web_search_call 没有单独的结果记录：照发 tool.end succeeded，不编耗时（codex-v4）" '[ "$(q "map(select(.type == \"tool.end\" and .payload.call_id == \"ws_1\")) | map([.payload.tool_name, .payload.status.code, (.payload.duration_ms // null)])")" = "[[\"web_search\",\"succeeded\",null]]" ]'
+check "t1：四次工具调用（含 spawn_agent 与 web_search_call）各一条 tool.request（全采带参数）与 tool.end（succeeded）" \
+  '[ "$(q "[(map(select(.type == \"tool.request\" and .turn_id == \"t1\")) | length), (map(select(.type == \"tool.end\" and .turn_id == \"t1\" and .agent_instance_id == \"main\")) | map(.payload.status.code))]")" = "[4,[\"succeeded\",\"succeeded\",\"succeeded\",\"succeeded\"]]" ]'
+check "子 agent：挂父会话、父实例 main、轮次 t1、类型取 agent_role、派活 injected；parent_call_id 按 agent_path 对上 spawn_agent 调用；抄来的父会话历史一条不发（codex-v4）" \
+  '[ "$(q "map(select(.agent_instance_id == \"'"$CHILD"'\")) | map([.type, .session_id == \"'"$SID"'\", .parent_agent_instance_id, .turn_id, (.parent_call_id // null), (.payload.agent_type // .payload.delivery // .payload.author_type)])")" = "[[\"subagent.start\",true,\"main\",\"t1\",\"call_s1\",\"explorer\"],[\"message.user\",true,\"main\",\"t1\",\"call_s1\",\"injected\"],[\"message.assistant\",true,\"main\",\"t1\",\"call_s1\",\"agent\"],[\"subagent.end\",true,\"main\",\"t1\",\"call_s1\",\"explorer\"]]" ]'
 check "system prompt：ext.codex.base_instructions 一条，带 sha256 与正文" \
   '[ "$(q "map(select(.type == \"ext.codex.base_instructions\" and .agent_instance_id == \"main\")) | map([.provenance.source_event, (.payload.sha256 | length), .extensions[\"codex.base_instructions\"]])")" = "[[\"session_meta\",64,\"You are Codex.\"]]" ]'
 n1=$(spool | wc -l | tr -d ' ')
@@ -208,6 +233,21 @@ VIBETRAIL_BACKFILL_DAYS=2 VIBETRAIL_READ_MAX_BYTES=200 hook codex Stop "$(jq -n 
 check "第一次读：十天前那一轮不补，一小时前那一轮读到（turn.start / message.user / turn.end 各一条）" \
   '[ "$(q "map(select(.session_id == \"'"$SIDB"'\")) | map([.type, .turn_id])")" = "[[\"turn.start\",\"new1\"],[\"message.user\",\"new1\"],[\"turn.end\",\"new1\"]]" ]'
 check "state 记了跳过的老字节数，分段读到了文件末尾" '[ "$(jq -c "[(.skipped_old_bytes > 0), (.consumed_bytes == $(wc -c < "$RB" | tr -d " "))]" "$VT/state/$SIDB/codex-main.json")" = "[true,true]" ]'
+
+echo "════ 3c. fork 出来的会话：开头抄了父会话的历史（forked_from_id），只发自己的轮（codex-v4，照 Pilot 按 turn id 的 UUIDv7 时刻判） ════"
+U7(){ node -e 'const h=Number(process.argv[1]).toString(16).padStart(12,"0");console.log(h.slice(0,8)+"-"+h.slice(8,12)+"-7abc-8def-0123456789ab")' -- "$1"; }
+FORK=019a0000-0000-7000-8000-00000000f0f0; RF=$DAY/rollout-2026-09-17T11-00-00-$FORK.jsonl
+T0=$(node -e 'console.log(Date.parse("2026-09-17T03:00:00.000Z"))'); OLDT=$(U7 $((T0 - 60000))); NEWT=$(U7 $((T0 + 30000)))
+{ jq -n -c --arg id "$FORK" --arg sid "$SID" --arg cwd "$REPO" '{timestamp: "2026-09-17T03:00:00.000Z", type: "session_meta", payload: {id: $id, forked_from_id: $sid, cwd: $cwd, originator: "codex_cli_rs", cli_version: "0.154.0", history_mode: "paginated", source: "cli"}}'
+  jq -n -c --arg sid "$SID" --arg cwd "$REPO" '{timestamp: "2026-09-17T02:00:00.000Z", type: "session_meta", payload: {id: $sid, cwd: $cwd, originator: "codex_cli_rs", cli_version: "0.154.0", history_mode: "paginated", source: "cli"}}'
+  for tid in "$OLDT" "$NEWT"; do   # 两轮的记录时间一样，只有 turn id 里的时刻不同：钉的是「按 UUIDv7 时刻判」
+    jq -n -c --arg t "$tid" '{timestamp: "2026-09-17T03:00:31.000Z", type: "event_msg", payload: {type: "task_started", turn_id: $t}}'
+    jq -n -c --arg t "$tid" '{timestamp: "2026-09-17T03:00:31.100Z", type: "event_msg", payload: {type: "item_completed", turn_id: $t, item: {type: "UserMessage", id: ("u-" + $t), content: [{type: "text", text: ("这一轮是 " + $t)}]}}}'
+    jq -n -c --arg t "$tid" '{timestamp: "2026-09-17T03:00:32.000Z", type: "event_msg", payload: {type: "task_complete", turn_id: $t}}'
+  done; } > "$RF"
+hook codex Stop "$(jq -n -c --arg sid "$FORK" --arg tp "$RF" --arg cwd "$REPO" --arg t "$NEWT" '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "Stop", turn_id: $t}')"
+check "fork：抄来的父会话那一轮（turn id 的时刻早于自己的 session_meta）不发，只发自己的那一轮" \
+  '[ "$(q "map(select(.session_id == \"$FORK\")) | map([.type, .turn_id])")" = "[[\"turn.start\",\"$NEWT\"],[\"message.user\",\"$NEWT\"],[\"turn.end\",\"$NEWT\"]]" ]'
 
 echo "════ 4. Cursor：只用 hook 入参；应答、会话 / 轮次 / 工具 / 子 agent / 文件 / commit；不带邮箱 ════"
 CONV=cccccccc-0000-4000-8000-000000000001

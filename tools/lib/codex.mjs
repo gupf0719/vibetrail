@@ -12,10 +12,11 @@ import { displayDir } from './map.mjs';
 import {
   readText, readJson, isFile, isDir, mkdirp, nowIso, epochSec, isObj, opt, sha256, capture, validSid, sleepSync, codeify, agentEnabled,
   gate, baseEvent, emit, vcsOf, commitsOf, turnStart, turnStop, turnGap, turnEvidence, relFile, noteFile, filesOf,
-  detach, hookCommand, isOurs, readHostJson, writeHostJson, sameJson,
+  detach, hookCommand, isOurs, readHostJson, writeHostJson, sameJson, writeTextGuarded,
 } from './agents.mjs';
 
-export const RULE = 'codex-v3';                          // v2（09-17）：拒绝只认整条输出；v3（同日）：弹框证据按时间窗、一对一配拒绝，轮结束后到来的记录不挂上去
+export const RULE = 'codex-v4';                          // v2（09-17）：拒绝只认整条输出；v3：弹框证据按时间窗、一对一配拒绝，轮结束后到来的记录不挂上去；
+                                                         // v4（同日，照 Pilot）：跳过子 agent / fork 文件里抄来的父会话历史、子 agent 补 parent_call_id、认两种搜索调用
 export const CODEX_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd', 'PermissionRequest'];
 // 超时与 async 定死不改：Codex 按整组配置算信任哈希，改一个字就要人重新信任（G12 §3 问题 1）
 // SessionEnd 最多 3 秒（hooks/src/events/session_end.rs:23，超了 Codex 在设置里报「clamping SessionEnd hook timeout to 3s」，用户 09-17 截图）
@@ -40,19 +41,36 @@ export const surfaceOf = (originator) => {
 };
 
 // ---------- 读 rollout ----------
-function firstRecord(file) {                           // 第一行是 session_meta，带 base_instructions，可能几十 KB
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+const sidOfPath = (file) => { const m = path.basename(String(file)).match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i); return m ? m[1].toLowerCase() : null; };
+// 这份文件自己的 session_meta（codex-v4）：子 agent 与 fork 出来的会话，文件开头是自己的 session_meta、再抄一条父会话的、再抄父会话的历史
+// （Pilot 照桌面版多 agent 的真实记录做的夹具与 selectOwnerSessionMetaOffset）。开头连续的几条 session_meta 里取 id 等于文件名线程 id 的那条
+export function metaOf(file) {
+  const want = sidOfPath(file);
+  let first = null;
   try {
     const fd = fs.openSync(file, 'r');
-    const buf = Buffer.alloc(4 * 1024 * 1024);
+    const buf = Buffer.alloc(2 * 1024 * 1024);
     const n = fs.readSync(fd, buf, 0, buf.length, 0);
     fs.closeSync(fd);
-    const i = buf.subarray(0, n).indexOf(0x0a);
-    if (i < 0) return null;
-    const r = JSON.parse(buf.subarray(0, i).toString('utf8'));
-    return isObj(r) ? r : null;
-  } catch { return null; }
+    let pos = 0;
+    for (let i = 0; i < 16 && pos < n; i++) {
+      const nl = buf.indexOf(0x0a, pos);
+      if (nl < 0 || nl >= n) break;
+      let r; try { r = JSON.parse(buf.subarray(pos, nl).toString('utf8')); } catch { break; }
+      pos = nl + 1;
+      if (!isObj(r) || r.type !== 'session_meta' || !isObj(r.payload)) break;
+      const p = { ...r.payload, timestamp: r.payload.timestamp ?? r.timestamp };
+      if (!first) first = p;
+      if (!want || String(p.id ?? p.session_id ?? '').toLowerCase() === want) return p;
+    }
+  } catch {}
+  return first;
 }
-export const metaOf = (file) => { const r = firstRecord(file); return r && r.type === 'session_meta' && isObj(r.payload) ? r.payload : null; };
+// 会抄父会话历史的文件：fork 出来的（forked_from_id）、子 agent（source 是 subagent 或 thread_source 是 subagent）
+const copiesHistory = (m) => isObj(m) && Boolean(m.forked_from_id || spawnOf(m) || String(m.thread_source ?? '').toLowerCase() === 'subagent');
+// Codex 的 turn id 是 UUIDv7，前 48 位是创建时刻（毫秒）
+const uuidV7Ms = (id) => { const m = String(id).match(/^([0-9a-f]{8})-([0-9a-f]{4})-7[0-9a-f]{3}-/i); return m ? parseInt(m[1] + m[2], 16) : null; };
 // SessionSource::SubAgent(ThreadSpawn{parent_thread_id, depth, agent_path, agent_nickname, agent_role})；序列化后的键名待实测，几种写法都认
 export const spawnOf = (meta) => {
   const s = meta?.source;
@@ -64,6 +82,7 @@ export const spawnOf = (meta) => {
 const compactMeta = (m) => (isObj(m) ? {
   ...opt('id', m.id ?? m.session_id), ...opt('cwd', m.cwd), ...opt('originator', m.originator), ...opt('cli_version', m.cli_version),
   ...opt('history_mode', m.history_mode), ...(m.source !== undefined ? { source: m.source } : {}),
+  ...opt('timestamp', m.timestamp), ...opt('forked_from_id', m.forked_from_id), ...opt('thread_source', m.thread_source),
 } : null);
 
 // 从 from 读到最后一个换行符，分段读完、不丢最老的一段（U18，用户 09-17 定，同 hook.mjs）；每段不超过 VIBETRAIL_READ_MAX_BYTES（默认 50 MB）
@@ -173,22 +192,32 @@ export function mapRollout(lines, o) {
   let usageRecords = o.usageRecords === true || lines.some((l) => l.raw.includes('"token_usage_record"'));
   const turns = new Map();
   let cur = null, lastAt = null;
-  const ledger = { records: 0, bad_json: 0, types: {}, unknown: {}, orphan_items: 0 };
+  const ledger = { records: 0, bad_json: 0, types: {}, unknown: {}, orphan_items: 0, copied_meta: 0, copied_events: 0 };
   const paginated = () => String(meta?.history_mode ?? '').toLowerCase() === 'paginated';
   const agent = () => ({ name: 'codex', version: meta?.cli_version ?? null, surface: surfaceOf(meta?.originator) });
   const turnIdOf = (t) => (o.child ? (t.root ?? o.parentTurn ?? t.id) : t.id);
-  const mk = (type, at, t, prov = { kind: 'transcript', rule_version: RULE }) => baseEvent(agent(), o.ctx, {
-    sid: o.sid, type, at, turn: t ? turnIdOf(t) : null,
-    instance: o.child ? o.child.instance : 'main', parentInstance: o.child ? o.child.parentInstance : null, provenance: prov,
-  });
-  const push = (e, key) => { if (keys.has(key)) return; keys.add(key); e._key = key; out.push(e); };
+  const mk = (type, at, t, prov = { kind: 'transcript', rule_version: RULE }) => {
+    const e = baseEvent(agent(), o.ctx, {
+      sid: o.sid, type, at, turn: t ? turnIdOf(t) : null,
+      instance: o.child ? o.child.instance : 'main', parentInstance: o.child ? o.child.parentInstance : null,
+      parentCall: o.child ? (o.child.parentCall ?? null) : null, provenance: prov,
+    });
+    if (t && t.copied) e._copied = true;
+    return e;
+  };
+  const push = (e, key) => { if (e._copied) { ledger.copied_events++; return; } if (keys.has(key)) return; keys.add(key); e._key = key; out.push(e); };
+  // 抄来的父会话历史（codex-v4，照 Pilot 的 isCopiedParentTurnByTime）：turn id 的 UUIDv7 时刻（不是 UUIDv7 就用这一轮第一条记录的时间）早于这份文件自己 session_meta 的，
+  // 是父会话的轮，不再发一遍
+  const ownerMs = o.ownerCopies ? Date.parse(o.ownerCreatedAt ?? '') : NaN;
+  const copiedTurn = (id, at) => Number.isFinite(ownerMs) && (uuidV7Ms(id) ?? Date.parse(at)) < ownerMs;
+  const spawns = [];
 
   const turnOf = (id, off, at) => {
     if (typeof id !== 'string' || id === '') return cur;
     let t = turns.get(id);
     if (!t) {
       t = { id, off, at, root: null, model: null, approval: null, cwd: null, users: 0, userKinds: new Map(), calls: new Map(), items: new Map(),
-        files: {}, usage: null, acc: null, buf: null, closed: false, subStarted: false, task: null };
+        files: {}, usage: null, acc: null, buf: null, closed: false, subStarted: false, task: null, copied: copiedTurn(id, at) };
       turns.set(id, t);
     }
     cur = t;
@@ -203,6 +232,7 @@ export function mapRollout(lines, o) {
     const inc = o.cap && typeof t.task === 'string' && t.task.length > 0;
     e.content_state = inc ? 'included' : 'omitted';
     e.payload = { agent_type: o.child.agentType || 'unknown', ...(inc ? { task: t.task } : {}) };
+    e.extensions = { ...e.extensions, ...opt('codex.agent_path', o.child.agentPath), ...opt('codex.agent_nickname', o.child.nickname), ...opt('vibetrail.parent_link', o.child.link) };
     push(e, `${o.fileKey}|${t.id}|subagent.start`);
   };
 
@@ -271,7 +301,7 @@ export function mapRollout(lines, o) {
     const failed = itemStatus === 'failed' || (isObj(output) && output.success === false) || (exit !== null && exit !== 0);
     const reported = durationMs(item?.duration)
       ?? (item && typeof item.completed_at_ms === 'number' && typeof item.started_at_ms === 'number' ? item.completed_at_ms - item.started_at_ms : null);
-    const wall = c.at ? Date.parse(at) - Date.parse(c.at) : NaN;
+    const wall = c.at && c.at !== at ? Date.parse(at) - Date.parse(c.at) : NaN;   // 调用与结果是同一条记录（web_search_call）时没有耗时
     const d = reported ?? (Number.isFinite(wall) && wall >= 0 ? wall : null);
     const e = mk('tool.end', at, t);
     e.content_state = o.cap ? 'included' : 'omitted';
@@ -281,6 +311,14 @@ export function mapRollout(lines, o) {
     if (exit !== null) e.extensions['codex.exit_code'] = exit;
     push(e, `${cid}|tool.end`);
     if (!failed) for (const [p, op] of patchFiles(c.name, c.input)) noteFile(t.files, relFile(p, o.ctx.roots, t.cwd ?? meta?.cwd ?? ''), op);
+    // 派子 agent 的调用（codex-v4）：记下它返回的子线程 id（源码里 SpawnAgentResult 是 {agent_id, nickname}）与 agent_path
+    // （桌面版多 agent v2 返回 {task_name: "/root/…"}，Pilot 夹具），映射子 agent 文件时用来补 parent_call_id
+    if (!failed && !t.copied && c.name === 'spawn_agent') {
+      let j = null; try { j = JSON.parse(text); } catch {}
+      spawns.push({ call_id: cid, turn_id: turnIdOf(t), by: o.child ? o.child.instance : 'main',
+        ...opt('agent_path', typeof j?.task_name === 'string' ? j.task_name : null),
+        ids: [...new Set((text.match(UUID_RE) || []).map((x) => x.toLowerCase()))] });
+    }
   };
 
   const closeTurn = (t, reason, at, p = {}, by = null) => {
@@ -346,6 +384,8 @@ export function mapRollout(lines, o) {
     ledger.types[kind] = (ledger.types[kind] ?? 0) + 1;
     switch (r.type) {
       case 'session_meta': {
+        const mid = String(p.id ?? p.session_id ?? '').toLowerCase();
+        if (o.ownerId && mid && mid !== o.ownerId) { ledger.copied_meta++; break; }   // 抄来的父会话 meta：不换 meta、不发（codex-v4）
         meta = p;
         const bi = typeof p.base_instructions === 'string' ? p.base_instructions : typeof p.base_instructions?.text === 'string' ? p.base_instructions.text : '';
         if (bi) {                                       // system prompt：按 sha256 去重，正文只在全采时带（同 Claude 的 prompt_snapshot）
@@ -428,6 +468,28 @@ export function mapRollout(lines, o) {
           case 'function_call_output': case 'custom_tool_call_output':
             toolEnd(t, String(p.call_id ?? ''), p.output, at);
             break;
+          // 两种搜索调用（codex-v4，照 Pilot 的 codex-aborted-turn-extractor）：web_search_call 没有单独的结果记录，状态就在调用上；
+          // tool_search_call 与 tool_search_output 按 call_id 配
+          case 'web_search_call': case 'tool_search_call': {
+            const cid = String(p.call_id ?? p.id ?? `${o.fileKey}@${off}`);
+            const name = p.type === 'web_search_call' ? 'web_search' : 'tool_search';
+            const input = p.type === 'web_search_call' ? (p.action ?? null) : (p.arguments ?? null);
+            if (!t.calls.has(cid)) t.calls.set(cid, { name, input, at, done: false });
+            const b = bufOf(t, at);
+            b.tools.push(name); b.ids.push(cid);
+            if (o.cap && input !== null && input !== undefined) {
+              const e = mk('tool.request', at, t);
+              e.content_state = 'included';
+              e.payload = { tool_name: name, call_id: cid, input };
+              push(e, `${cid}|tool.request`);
+            }
+            const st = String(p.status ?? '').toLowerCase();
+            if (p.type === 'web_search_call' && /^(completed|failed|incomplete)$/.test(st)) toolEnd(t, cid, { content: '', success: st === 'completed' }, at);
+            break;
+          }
+          case 'tool_search_output':
+            toolEnd(t, String(p.call_id ?? ''), { content: JSON.stringify(p.tools ?? []), success: String(p.status ?? '').toLowerCase() !== 'failed' }, at);
+            break;
           default: break;
         }
         break;
@@ -439,10 +501,10 @@ export function mapRollout(lines, o) {
 
   // 兜底关轮：会话结束、同会话恢复、空闲超过 turn_idle_close 时，没有终态记录的轮按 unknown 关
   if (o.close) for (const t of turns.values()) if (!t.closed) closeTurn(t, 'unknown', lastAt ?? nowIso(), {}, o.close);
-  const open = [...turns.values()].filter((t) => !t.closed);
+  const open = [...turns.values()].filter((t) => !t.closed && !t.copied);   // 抄来的历史截在半轮也不卡住读取进度
   return {
     events: out, meta,
-    ledger: { ...ledger, usage_records: usageRecords, open_off: open.length ? Math.min(...open.map((t) => t.off)) : null, open_turn: open.length ? open[open.length - 1].id : null },
+    ledger: { ...ledger, spawns, usage_records: usageRecords, open_off: open.length ? Math.min(...open.map((t) => t.off)) : null, open_turn: open.length ? open[open.length - 1].id : null },
   };
 }
 
@@ -475,9 +537,16 @@ export function processFile(sid, ctx, file, fileKey, { child = null, close = '',
     const k = i < 0 ? slice.lines.length : i;
     if (k > 0) { skippedOld = (k < slice.lines.length ? slice.lines[k].off : slice.end) - slice.lines[0].off; slice.lines = slice.lines.slice(k); }
   }
-  const meta = st.meta ?? metaOf(file);
-  const res = mapRollout(slice.lines, { sid, ctx, meta, fileKey, child, perms: permsOf(sid), parentTurn, close, cap: capture(), usageRecords: st.usage_records === true, newFrom: consumed });
+  const meta = st.meta?.timestamp ? st.meta : (metaOf(file) ?? st.meta ?? null);   // v4 之前的 state 里 meta 不带 timestamp：重取一次
+  const res = mapRollout(slice.lines, { sid, ctx, meta, fileKey, child, perms: permsOf(sid), parentTurn, close, cap: capture(), usageRecords: st.usage_records === true, newFrom: consumed,
+    ownerId: sidOfPath(file), ownerCopies: copiesHistory(meta), ownerCreatedAt: meta?.timestamp ?? null });
   if (!emit(ctx.pkey, sid, `codex-${fileKey}`, res.events, ev)) return null;
+  if (res.ledger.spawns.length) {                      // 派子 agent 的调用，给子 agent 文件补 parent_call_id 用
+    const spF = path.join(SD, 'codex-spawns.json');
+    const all = readJson(spF, {});
+    for (const s of res.ledger.spawns) all[s.call_id] = s;
+    vtWriteJson(spF, all);
+  }
   const nst = {
     consumed_bytes: slice.end, checkpoint_byte: res.ledger.open_off ?? slice.end, fprint: vtFprint(file, slice.end) ?? '',
     meta: compactMeta(res.meta ?? meta), usage_records: res.ledger.usage_records, open_turn: res.ledger.open_turn,
@@ -509,7 +578,8 @@ function childRollouts(sid, mainFile) {
         const m = metaOf(f);
         if (!m) continue;                               // 第一行还没写完：下次再看
         const sp = spawnOf(m);
-        idx.checked[f] = sp ? { id: String(m.id ?? m.session_id ?? ''), parent: String(sp.parent_thread_id), role: sp.agent_role ?? sp.agent_type ?? null } : null;
+        idx.checked[f] = sp ? { id: String(m.id ?? m.session_id ?? ''), parent: String(sp.parent_thread_id), role: sp.agent_role ?? sp.agent_type ?? m.agent_role ?? null,
+          path: sp.agent_path ?? m.agent_path ?? null, nickname: sp.agent_nickname ?? m.agent_nickname ?? null } : null;
         changed = true;
       }
       if (idx.checked[f]) cands.push([f, idx.checked[f]]);
@@ -521,7 +591,7 @@ function childRollouts(sid, mainFile) {
     for (const [f, c] of cands) {
       if (c.id && !known.has(c.id) && known.has(c.parent)) {
         known.add(c.id);
-        idx.children[c.id] = { file: f, parent: c.parent === sid ? 'main' : c.parent, role: c.role };
+        idx.children[c.id] = { file: f, parent: c.parent === sid ? 'main' : c.parent, role: c.role, path: c.path ?? null, nickname: c.nickname ?? null };
         grew = true; changed = true;
       }
     }
@@ -530,15 +600,30 @@ function childRollouts(sid, mainFile) {
   return Object.entries(idx.children).map(([id, c]) => ({ id, ...c })).filter((c) => isFile(c.file));
 }
 
+// 子 agent ↔ 派它的 spawn_agent 调用（codex-v4，照 Pilot 的 codex-subagent-linker：只认可靠的两种，对上多个就不认）：
+// 子线程 id 只出现在一次 spawn 的结果里；或者子 agent 的 agent_path 只等于一次 spawn 返回的 task_name。按时间先后猜的不用
+function linkSpawn(spawns, c) {
+  const pool = spawns.filter((s) => (s.by ?? 'main') === c.parent);
+  const byId = pool.filter((s) => Array.isArray(s.ids) && s.ids.includes(String(c.id).toLowerCase()));
+  if (byId.length === 1) return { call_id: byId[0].call_id, turn_id: byId[0].turn_id ?? null, how: 'explicit_id' };
+  if (byId.length > 1 || !c.path) return null;
+  const byPath = pool.filter((s) => s.agent_path === c.path);
+  return byPath.length === 1 ? { call_id: byPath[0].call_id, turn_id: byPath[0].turn_id ?? null, how: 'agent_path' } : null;
+}
+
 export function processSession(sid, ctx, mainFile, { close = '', ev = '' } = {}) {
   const SD = path.join(VT_HOME, 'state', sid);
   if (!mkdirp(SD) || !vtLock(SD)) return;               // 同一会话已在跑：跳过，下一次 hook 补上
   try {
-    const parentTurn = (readText(path.join(SD, 'last_turn')) || '').trim() || null;
-    for (const c of childRollouts(sid, mainFile)) {
-      processFile(sid, ctx, c.file, `agent-${c.id}`, { child: { instance: c.id, parentInstance: c.parent, agentType: c.role ?? 'unknown' }, close, ev, parentTurn });
-    }
+    // 先主会话、再子 agent（codex-v4）：子 agent 的 parent_call_id 要用主会话里 spawn_agent 调用的结果
     processFile(sid, ctx, mainFile, 'main', { close, ev });
+    const parentTurn = (readText(path.join(SD, 'last_turn')) || '').trim() || null;
+    const spawns = Object.values(readJson(path.join(SD, 'codex-spawns.json'), {})).filter(isObj);
+    for (const c of childRollouts(sid, mainFile)) {
+      const link = linkSpawn(spawns, c);
+      processFile(sid, ctx, c.file, `agent-${c.id}`, { child: { instance: c.id, parentInstance: c.parent, agentType: c.role ?? 'unknown',
+        parentCall: link?.call_id ?? null, link: link?.how ?? null, agentPath: c.path ?? null, nickname: c.nickname ?? null }, close, ev, parentTurn: link?.turn_id ?? parentTurn });
+    }
   } finally { vtUnlock(SD); }
 }
 
@@ -725,6 +810,71 @@ function trustStateOf(toml, key) {                    // [hooks.state."<key>"] �
   const th = txt.match(/^\s*trusted_hash\s*=\s*"([^"]*)"/m), en = txt.match(/^\s*enabled\s*=\s*(true|false)/m);
   return { ...(th ? { trusted_hash: th[1] } : {}), ...(en ? { enabled: en[1] === 'true' } : {}) };
 }
+// 我们在 hooks.json 里每一条在 Codex 里的信任状态：trusted / untrusted / modified（信任过、条目改过）/ disabled（在 Codex 里被关掉）
+export function codexTrustStatus() {
+  const doc = readHostJson(hooksFile());
+  if (!doc || !isObj(doc.hooks)) return [];
+  const toml = readText(path.join(codexHome(), 'config.toml')) || '';
+  const out = [];
+  for (const [ev, groups] of Object.entries(doc.hooks)) {
+    (Array.isArray(groups) ? groups : []).forEach((g, gi) => (Array.isArray(g?.hooks) ? g.hooks : []).forEach((h, hi) => {
+      if (!isOurs(h?.command)) return;
+      const key = codexTrustKey(ev, gi, hi), hash = codexHookHash(ev, g, h), st = trustStateOf(toml, key);
+      out.push({ ev, key, hash, command: h.command,
+        state: st.enabled === false ? 'disabled' : !st.trusted_hash ? 'untrusted' : st.trusted_hash === hash ? 'trusted' : 'modified' });
+    }));
+  }
+  return out;
+}
+
+// init 引导信任（用户 09-17 定：选了 Codex 就在 init 里问，同意了才写）。只加或替换我们自己那几张 [hooks.state."<key>"] 表里的 trusted_hash，
+// config.toml 其余内容与注释原样留着。表头的写法认不出来（带注释、写成内联表）就不写——宁可不写，也不能写出重复的键把 Codex 的配置弄坏
+const tomlHeader = (key) => `[hooks.state."${key}"]`;
+function tomlTable(text, key) {                        // 表头那一行到下一个表头之前
+  const lines = text.split('\n');
+  const i = lines.findIndex((l) => l.trim() === tomlHeader(key));
+  let j = i + 1;
+  if (i >= 0) while (j < lines.length && !/^\s*\[/.test(lines[j])) j++;
+  return { lines, i, j };
+}
+export function codexWriteTrust(entries) {
+  const file = path.join(codexHome(), 'config.toml');
+  const before = readText(file) ?? '';
+  let text = before;
+  for (const x of entries) {
+    const { lines, i, j } = tomlTable(text, x.key);
+    if (i < 0) {
+      if (text.includes(`"${x.key}"`)) return { ok: false, file, msg: `${file} 里 ${x.ev} 的信任记录写法认不出来，没写；到「设置 → 钩子」里信任` };
+      text = `${text}${text === '' || text.endsWith('\n') ? '' : '\n'}\n${tomlHeader(x.key)}\ntrusted_hash = "${x.hash}"\n`;
+      continue;
+    }
+    const k = lines.slice(i + 1, j).findIndex((l) => /^\s*trusted_hash\s*=/.test(l));
+    if (k >= 0) lines[i + 1 + k] = `trusted_hash = "${x.hash}"`; else lines.splice(i + 1, 0, `trusted_hash = "${x.hash}"`);
+    text = lines.join('\n');
+  }
+  if (text === before) return { ok: true, changed: false, file };
+  if (!writeTextGuarded(file, before, text, 'codex-config.toml')) return { ok: false, file, msg: `${file} 在这期间被改过（Codex 开着时也会写它），没写；再跑一次` };
+  return { ok: true, changed: true, file };
+}
+// 卸载或不再选 Codex 时删掉我们的信任记录：只删哈希与我们当前条目对得上的那几张表，要在删 hooks.json 条目之前调
+export function codexRemoveTrust() {
+  const file = path.join(codexHome(), 'config.toml');
+  const before = readText(file);
+  if (before === null) return { ok: true, changed: false, file };
+  let text = before;
+  for (const x of codexTrustStatus()) {
+    if (x.state !== 'trusted') continue;
+    const { lines, i, j } = tomlTable(text, x.key);
+    if (i < 0) continue;
+    const from = i > 0 && lines[i - 1].trim() === '' ? i - 1 : i;
+    lines.splice(from, j - from);
+    text = lines.join('\n');
+  }
+  if (text === before) return { ok: true, changed: false, file };
+  if (!writeTextGuarded(file, before, text, 'codex-config.toml')) return { ok: false, file, msg: `${file} 在这期间被改过，没改；再跑一次` };
+  return { ok: true, changed: true, file };
+}
+
 export function codexDoctor({ ok, bad, note }) {
   if (!codexPresent()) return;
   const f = hooksFile();
@@ -741,14 +891,9 @@ export function codexDoctor({ ok, bad, note }) {
   if (drift.length) note(`Codex：${drift.length} 条命令或超时与这一版不同（改过的条目要在 Codex 里重新信任）`);
   // 信任（hooks/src/engine/discovery.rs:655-700）：config.toml 的 [hooks.state."<hooks.json 路径>:<事件>:<组>:<条>"] 里 trusted_hash 与当前条目的哈希一致、
   // 且没被关掉（enabled = false）才跑。哈希照 Codex 自己的算法算（codexHookHash），不再只看「有没有记录」（Codex 09-17 意见 3）
-  const toml = readText(path.join(codexHome(), 'config.toml')) || '';
-  const disabled = [], untrusted = [], modified = [];
-  for (const m of mine) {
-    const st = trustStateOf(toml, codexTrustKey(m.ev, m.gi, m.hi));
-    if (st.enabled === false) disabled.push(m.ev);
-    else if (!st.trusted_hash) untrusted.push(m.ev);
-    else if (st.trusted_hash !== codexHookHash(m.ev, doc.hooks[m.ev][m.gi], m.h)) modified.push(m.ev);
-  }
+  const status = codexTrustStatus();
+  const pick = (s) => status.filter((x) => x.state === s).map((x) => x.ev);
+  const disabled = pick('disabled'), untrusted = pick('untrusted'), modified = pick('modified');
   if (disabled.length) bad(`Codex：${disabled.join(' ')} 在 Codex 里被关掉了（enabled = false），不会跑`);
   if (untrusted.length) bad(`Codex：${untrusted.join(' ')} 还没在 Codex 里信任，不会跑——桌面版在「设置 → 钩子」里逐条点「信任」，CLI 里用 /hooks`);
   if (modified.length) bad(`Codex：${modified.join(' ')} 信任之后条目改过（哈希对不上），Codex 不会跑——到「设置 → 钩子」重新信任`);

@@ -11,7 +11,7 @@ import {
   vtPermPeriods, formatPermPeriods, tokenPath, vtToken, vtProjectName, vtWorkspaceId, workspaceIdPath,
 } from './hook.mjs';
 import { KNOWN_AGENTS, selectedAgents } from './agents.mjs';
-import { codexHome, codexPresent, codexInstall, codexUninstall, codexDoctor } from './codex.mjs';
+import { codexHome, codexPresent, codexInstall, codexUninstall, codexDoctor, codexTrustStatus, codexWriteTrust, codexRemoveTrust } from './codex.mjs';
 import { cursorHome, cursorInstall, cursorUninstall, cursorDoctor } from './cursor.mjs';
 import { cmdPush, pushDoctor, pushRun, pushEndpoint, maskToken, pendingBySession, describeStop } from './push.mjs';
 
@@ -394,12 +394,13 @@ function showRegistered() {
 
 // ---- init ----
 export async function cmdInit(argv) {
-  let scope = '', mode = 'auto', agentsFlag = '';
+  let scope = '', mode = 'auto', agentsFlag = '', trustFlag = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--scope') { scope = argv[++i] ?? ''; }
     else if (a === '--events') { mode = argv[++i] ?? ''; }
     else if (a === '--agents') { agentsFlag = argv[++i] ?? ''; }
+    else if (a === '--trust-codex-hooks') { trustFlag = true; }
     else if (a === '--no-register' || a === '--no-pick') { /* 老参数，留着不报错 */ }
     else die(`init 不认识的参数：${a}`);
   }
@@ -513,12 +514,43 @@ export async function cmdInit(argv) {
       if (on) say(`⚠ ${AGENT_LABEL[name]}：VIBETRAIL_HOME 在临时目录，却要改 ${home}（多半是测试漏设了 VIBETRAIL_${name.toUpperCase()}_HOME），没写`);
       continue;
     }
+    if (!on && name === 'codex') {                         // 不再选 Codex：先删我们的信任记录（要按还在的条目算哈希），再删条目
+      const t = codexRemoveTrust();
+      if (!t.ok) say(`⚠ Codex：${t.msg}`); else if (t.changed) say(`✓ 没选 Codex：已从 ${t.file} 删掉 vibetrail 那几条 hook 的信任记录`);
+    }
     const r = on ? install() : uninstall();
     if (!r.ok) { say(`⚠ ${AGENT_LABEL[name]}：${r.msg}`); continue; }
     if (on) say(r.changed ? `✓ ${AGENT_LABEL[name]} 的 hook 条目 → ${r.file}` : `✓ ${AGENT_LABEL[name]} 的 hook 条目已是最新（${r.file} 没动）`);
     else if (r.changed) say(`✓ 没选 ${AGENT_LABEL[name]}：已从 ${r.file} 去掉 vibetrail 的条目`);
   }
-  if (agents.includes('codex')) say('  Codex 要先信任这 5 条 hook 才会跑：桌面版在「设置 → 钩子」里逐条点「信任」，CLI 里用 /hooks；条目改过就要重新信任');
+  // 3d. Codex 的信任（用户 09-17 定：选了 Codex 就在 init 里引导）。没信任 / 条目改过的：终端里问一次，默认不写、敲 y 才写；
+  // 脚本里带 --trust-codex-hooks 才写；不写就提示去设置里信任。在 Codex 里被关掉的不碰
+  if (agents.includes('codex') && !(underTmp(VT_HOME) && !underTmp(codexHome()))) {
+    const st = codexTrustStatus();
+    const need = st.filter((x) => x.state === 'untrusted' || x.state === 'modified');
+    const off = st.filter((x) => x.state === 'disabled');
+    if (off.length) say(`  ⚠ Codex：${off.map((x) => x.ev).join(' ')} 在 Codex 里被关掉了，没动；要采就到「设置 → 钩子」打开`);
+    if (st.length && !need.length && !off.length) say('✓ Codex 的 hook 都已信任（哈希与当前条目一致）');
+    if (need.length) {
+      let yes = trustFlag;
+      if (!yes && process.stdin.isTTY && process.stdout.isTTY) {
+        say('');
+        say(`Codex 要先信任下面 ${need.length} 条 hook 才会跑。Codex 自己的提醒：hook 在 Codex 的沙箱外运行，请确认命令是你要的：`);
+        for (const x of need) say(`  · ${x.ev}${x.state === 'modified' ? '（信任过，但条目改过）' : ''}：${x.command}`);
+        const ans = String((await ask(`现在替你在 ${path.join(codexHome(), 'config.toml')} 里记为已信任？[y/N] `)) ?? '').trim().toLowerCase();
+        yes = ans === 'y' || ans === 'yes';
+      }
+      if (yes) {
+        const r = codexWriteTrust(need);
+        const left = codexTrustStatus().filter((x) => x.state !== 'trusted').map((x) => x.ev);
+        if (!r.ok) say(`⚠ Codex：${r.msg}`);
+        else if (left.length === 0) say(`✓ 已在 ${r.file} 记为已信任（改之前的备份在 ${VT_HOME}/backup/）；Codex 开着时没生效的话，到「设置 → 钩子」刷新一下或新开会话`);
+        else say(`⚠ Codex：写了信任记录，但核对时 ${left.join(' ')} 还不对，到「设置 → 钩子」里看一下`);
+      } else {
+        say(`  Codex 的 ${need.map((x) => x.ev).join(' ')} 还没信任，不会跑：到桌面版「设置 → 钩子」里逐条点「信任」，CLI 里用 /hooks；或重跑 vibetrail init --trust-codex-hooks`);
+      }
+    }
+  }
 
   // 3b. 上报 token（用户 09-16：init 要引导填）。终端里没填过就问一次，回车跳过；不在终端里（脚本、测试）不问，只提示怎么填
   say('');
@@ -552,6 +584,10 @@ export function cmdUninstall(argv) {
   }
   for (const [name, uninstall, home] of [['Codex', codexUninstall, codexHome()], ['Cursor', cursorUninstall, cursorHome()]]) {   // TODO G12
     if (underTmp(VT_HOME) && !underTmp(home)) continue;   // 测试里不碰真实配置
+    if (name === 'Codex') {                                // 先删我们的信任记录（要按还在的条目算哈希），再删条目
+      const t = codexRemoveTrust();
+      if (!t.ok) say(`⚠ Codex：${t.msg}`); else if (t.changed) say(`✓ 已从 ${t.file} 删掉 vibetrail 那几条 hook 的信任记录`);
+    }
     const r = uninstall();
     if (!r.ok) say(`⚠ ${name}：${r.msg}`); else if (r.changed) say(`✓ 已从 ${r.file} 去掉 vibetrail 的 hook 条目`);
   }
@@ -1032,7 +1068,7 @@ export async function cmdDoctor() {
 
 export const USAGE = `vibetrail：机器级安装、登记与本地查看（DESIGN §5）
 
-  vibetrail init [--scope project|user] [--events auto|core|all] [--agents claude,codex,cursor|auto]
+  vibetrail init [--scope project|user] [--events auto|core|all] [--agents claude,codex,cursor|auto] [--trust-codex-hooks]
   vibetrail token [--status | --clear]
   vibetrail uninstall [--purge]
   vibetrail projects [list | add [目录] [--name 项目名] | remove [目录] [--drop] | pick]
