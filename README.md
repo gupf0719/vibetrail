@@ -73,7 +73,7 @@ hook 分发入口（`tools/vibetrail-hook`：会话 / 轮次起止、git 状态�
 push 与五个补充回归场景按用户 09-15 的要求往后放。09-16 拿本机 124,666 条真实事件复核了已完成的部分，待修项立在 OPEN-ISSUES K8、K12–K16，push 方案的修正在 TODO。同日定只挂 5 个 hook（SessionStart / UserPromptSubmit / Stop / SessionEnd / PermissionRequest，DESIGN D13）：子 agent 起止、API 出错、CLAUDE.md 加载、切目录改在 Stop 时从 transcript 推。同日定运行时换成 Node 单文件 `.mjs`、去掉 jq，bash 只留 sh 包装（DESIGN D12），并已移植完毕：运行时是 `tools/vibetrail.mjs` + `tools/lib/{map,hook,cli}.mjs`，唯一依赖 node ≥ 20；老的 bash + jq 版归档在 `old/jq/`。G7 之前的代码与测试已归档到 `old/`。已有并沿用的是人机分歧判据（755 会话实测精确率 100%，裸 grep 只有 10.5%）。
 同日 push 前对齐采集端协议：`project_id` 改成简单项目名、`workspace_id` 改成本机生成并持久化的 UUID（K17），状态 code / 分类换成协议推荐值（K18），四路 `rule_version` 升到 v2 基线并加钉子（K19），
 用量口径改成「入含缓存读、总数 = 入 + 出、没给的不填」（U12），Stop 时先等答完标记再关轮（K24）；全采补齐：排队的人话发 `message.user`（K20）、按停止打断工具补 `tool.end(cancelled)`（K21）、`turn.end.files[]`（K22）、关掉全采时 `subagent.start` 不带 task（K23）。
-09-17 做完 push（`tools/lib/push.mjs`：门槛与退避照 D6、批是 ack 单位、被拒收只隔离那几条，回归 `tools/test-push.sh`）；09-16 K17 之前格式的旧数据按用户定的 U20 ① 挪出 spool、不推；拿真实端点的第一次推送等 Codex 分支合进 main、装上新版之后做。
+09-17 做完 push（`tools/lib/push.mjs`：门槛与退避照 D6、批是 ack 单位、被拒收只隔离那几条，回归 `tools/test-push.sh`）；09-16 K17 之前格式的旧数据按用户定的 U20 ① 挪出 spool、不推；同日装上新版，第一次真推 9,398 条全部收下。
 上一版设计（留痕投影进被观测仓、git hook 写 trailer）已退役，理由与替代见 [DESIGN.md §7](DESIGN.md)。
 
 已实测确立的地基（`experiments/` 可复现）：Claude Code 的 hook 在 **desktop app 下正常触发且热加载**，stdin 直接给出 `transcript_path`；
