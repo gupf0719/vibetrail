@@ -140,6 +140,9 @@ add '{"timestamp":"2026-09-17T02:02:00.000Z","type":"event_msg","payload":{"type
 add '{"timestamp":"2026-09-17T02:02:00.100Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"t3","item":{"type":"UserMessage","id":"u4","content":[{"type":"text","text":"改名"}]}}}'
 add '{"timestamp":"2026-09-17T02:02:01.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"call_5","input":"*** Begin Patch\n*** Delete File: README\n*** End Patch"}}'
 add '{"timestamp":"2026-09-17T02:02:02.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_5","output":{"content":"patch rejected by user","success":false}}}'
+# 09-17 桌面版实测的误判：读源码的输出里夹着拒绝的字样，不是拒绝（codex-v2 只认整条输出）
+add '{"timestamp":"2026-09-17T02:02:02.500Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_6","input":"sed -n 1,20p tools/lib/codex.mjs"}}'
+add '{"timestamp":"2026-09-17T02:02:02.600Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_6","output":"Script completed\nOutput:\n// 输出是 exec command rejected by user 时算拒绝\nwriting outside of the project; rejected by user approval settings"}}'
 add '{"timestamp":"2026-09-17T02:02:03.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t3"}}'
 hook codex Stop "$(P '{hook_event_name: "Stop", turn_id: "t3", stop_hook_active: false}')"
 check "t2：人拒绝发 permission.decision（decided_by user、is_divergence、证据两条），被拒的调用不发 tool.end" \
@@ -149,6 +152,7 @@ check "t2：打断 → turn.end interrupted + is_divergence，vcs 取下一轮�
   '[ "$(q "[(map(select(.type == \"turn.end\" and .turn_id == \"t2\")) | map([.payload.status.code, .payload.status.category, .is_divergence, (.payload.vcs.head_sha | length)])), (map(select(.type == \"tool.end\" and .payload.call_id == \"call_4\")) | map(.payload.status.code))]")" = "[[[\"interrupted\",\"cancellation\",true,40]],[\"cancelled\"]]" ]'
 check "t3：没有弹框证据的拒绝 decided_by unknown、不标分歧；拒掉的补丁不进 files" \
   '[ "$(q "[(map(select(.type == \"permission.decision\" and .payload.call_id == \"call_5\")) | map([.payload.decided_by, (.is_divergence // false)])), (map(select(.type == \"turn.end\" and .turn_id == \"t3\")) | map(.files // null))]")" = "[[[\"unknown\",false]],[null]]" ]'
+check "输出里夹着拒绝字样的成功调用（读源码）不算拒绝：照发 tool.end succeeded，不发 permission.decision" '[ "$(q "[(map(select(.type == \"tool.end\" and .payload.call_id == \"call_6\")) | map(.payload.status.code)), (map(select(.type == \"permission.decision\" and .payload.call_id == \"call_6\")) | length)]")" = "[[\"succeeded\"],0]" ]'
 check "PermissionRequest 发 ext.codex.permission_request（不带参数）" '[ "$(q "map(select(.type == \"ext.codex.permission_request\")) | map([.turn_id, .payload.tool_name, (.payload.tool_input // null)])")" = "[[\"t2\",\"Bash\",null]]" ]'
 hook codex SessionEnd "$(jq -n -c --arg sid "$SID" --arg tp "$R" --arg cwd "$REPO" '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "SessionEnd", reason: "other"}')"
 check "会话：session.start / session.end 各一条，agent 是 codex 0.154.0、surface cli" \

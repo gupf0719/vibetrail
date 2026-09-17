@@ -15,7 +15,7 @@ import {
   detach, hookCommand, isOurs, readHostJson, writeHostJson, sameJson,
 } from './agents.mjs';
 
-export const RULE = 'codex-v1';
+export const RULE = 'codex-v2';                          // v2（09-17）：拒绝只认整条输出，不在输出里搜字符串
 export const CODEX_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd', 'PermissionRequest'];
 // 超时与 async 定死不改：Codex 按整组配置算信任哈希，改一个字就要人重新信任（G12 §3 问题 1）
 // SessionEnd 最多 3 秒（hooks/src/events/session_end.rs:23，超了 Codex 在设置里报「clamping SessionEnd hook timeout to 3s」，用户 09-17 截图）
@@ -151,8 +151,10 @@ export function patchFiles(name, input) {
 
 // 拒绝（G12 §3 问题 2）：审批请求不落 rollout，只有输出文字与 paginated 下 CommandExecution / FileChange 的 declined；
 // 源码自己说一部分非用户的失败也走这条（core/src/tools/events.rs:436-441），所以人拒还要这一轮有 PermissionRequest hook 的证据
-const REJECTED = /\b(exec command|patch) rejected by user\b|^rejected by user$/i;
-const POLICY = /rejected by user approval settings/i;
+// 只认「整条输出就是这句话」（codex-v2）。09-17 桌面版实测：模型 sed 读 vibetrail 自己的源码，输出里夹着这串字，
+// v1 在整段输出里搜，判成了策略拒绝、这次成功调用的 tool.end 也丢了——正是 diverge-v1「只读字段、不 grep 原文」的老坑
+const REJECTED = /^(exec command rejected by user|patch rejected by user|rejected by user)$/i;
+const POLICY = /^[^\n]{1,200}; rejected by user approval settings$/i;   // core/src/safety.rs 的两句
 const TURN_STATUS = {
   completed: { code: 'completed', category: 'success' },
   interrupted: { code: 'interrupted', category: 'cancellation' },
@@ -245,15 +247,16 @@ export function mapRollout(lines, o) {
     const text = outputText(output);
     const item = t.items.get(cid);
     const itemStatus = String(item?.status ?? '').toLowerCase();
-    if (POLICY.test(text) || REJECTED.test(text.trim().slice(0, 300)) || itemStatus === 'declined') {
-      const policy = POLICY.test(text);
+    const whole = text.trim();
+    if (POLICY.test(whole) || REJECTED.test(whole) || itemStatus === 'declined') {
+      const policy = POLICY.test(whole);
       const human = !policy && o.perms.some((x) => x.turn_id === t.id || (t.root && x.turn_id === t.root));
       const e = mk('permission.decision', at, t);
       e.payload = { permission_id: cid, tool_name: c.name, call_id: cid, decision: 'deny',
         decided_by: policy ? 'policy' : human ? 'user' : 'unknown', ...opt('reason', text.slice(0, 4096)) };
       if (human) e.is_divergence = true;
       e.extensions['vibetrail.denial_evidence'] = [...(itemStatus === 'declined' ? ['item_declined'] : []),
-        ...(REJECTED.test(text) || POLICY.test(text) ? ['output_text'] : []), ...(human ? ['permission_request_hook'] : [])];
+        ...(REJECTED.test(whole) || POLICY.test(whole) ? ['output_text'] : []), ...(human ? ['permission_request_hook'] : [])];
       push(e, `${cid}|permission.decision`);
       return;
     }
